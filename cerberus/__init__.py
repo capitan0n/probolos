@@ -1,3 +1,3 @@
 """Cerberus — a USB authorization gate that judges devices, not just IDs."""
 
-__version__ = "0.4.1"
+__version__ = "0.4.3"

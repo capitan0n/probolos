@@ -182,6 +182,12 @@ under-reports every USB 3 device by a factor of four. The multiplier is now
 selected from `bcdUSB` and pinned by tests, and the report prints the raw byte
 next to the milliamps so the two can be checked against each other.
 
+One rule was written here and deleted three days later, after it fired on an
+ordinary internal Bluetooth radio that declares both the self-powered flag and
+a 500 mA maximum. The premise turned out to be wrong on re-reading the
+specification. The deletion is recorded in a comment in `rules.py` and pinned
+by a test named after the device, so the idea does not get reinvented.
+
 **These are declarations, not measurements.** A computer cannot measure what a
 USB device actually draws: there is no current sensor on the port, and the
 battery gauge is swamped by CPU frequency changes. Anyone who clones a

@@ -278,15 +278,18 @@ def _power_findings(dev, cfg: RuleConfig) -> List[Finding]:
             "current, and ordinary drives declare far more than this. A device "
             "that expects to spend nothing may have nothing to spend it on.")
 
-    # (c) "I have my own power supply, and also give me half an amp."
-    # Drawing a little bus power while self-powered is normal; drawing a lot
-    # is a contradiction. The threshold is deliberately high to stay quiet.
-    if first.self_powered and declared >= 250:
-        add("self-powered-but-demands-bus-power", Severity.NOTICE,
-            "Claims its own power supply yet demands most of the bus",
-            f"The configuration sets the self-powered flag but still asks for "
-            f"{declared} mA. Self-powered devices normally draw little or "
-            "nothing from the bus.")
+    # (c) REMOVED: "self-powered yet demanding bus power".
+    #
+    # This rule existed briefly and was deleted after it fired on an internal
+    # Realtek Bluetooth radio (0bda:4853) that declares self-powered and
+    # bMaxPower=250. On re-reading the specification the premise was simply
+    # wrong: bMaxPower states the maximum a device MAY draw, a self-powered
+    # device is not forbidden from drawing bus power, and countless products
+    # declare the maximum regardless. There was no contradiction to detect.
+    #
+    # Left as a comment rather than deleted silently, so that the next person
+    # who thinks of it -- including a later version of its author -- finds the
+    # reason it does not work before writing it again.
 
     # (d) Weakest of the four, and marked as such. Multiple configurations may
     # legitimately have different power needs, so only a wide gap is mentioned.

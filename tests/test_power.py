@@ -117,6 +117,23 @@ class TestOrdinaryDevicesStaySilent(unittest.TestCase):
         dev = Dev(build(1, [(0x09, 0x00, 0x00)], attrs=0xC0))   # 2 mA
         self.assertEqual(rules._power_findings(dev, rules.DEFAULT_CONFIG), [])
 
+    def test_realtek_bluetooth_self_powered_at_500ma_is_silent(self):
+        """
+        Field data: 0bda:4853, an internal Realtek Bluetooth radio, declares
+        the self-powered flag AND bMaxPower=250 (500 mA).
+
+        A rule that flagged this shipped briefly and was removed. bMaxPower
+        states the maximum a device MAY draw; a self-powered device is not
+        forbidden from drawing bus power, and declaring the maximum regardless
+        is common. This test is the tripwire against writing it again.
+        """
+        dev = Dev(build(250, [(0xE0, 0x01, 0x01), (0xE0, 0x01, 0x01)],
+                        attrs=0xC0),
+                  manufacturer="Realtek", product="Bluetooth Radio",
+                  speed="12")
+        self.assertEqual(rules._power_findings(dev, rules.DEFAULT_CONFIG), [])
+        self.assertEqual(rules.evaluate(dev), [])
+
     def test_superspeed_device_is_not_flagged_by_the_old_bug(self):
         """
         bMaxPower=100 on USB 3 is 800 mA: legal. Under the old 2 mA assumption
@@ -145,10 +162,6 @@ class TestPowerContradictions(unittest.TestCase):
     def test_storage_that_costs_nothing_to_run(self):
         dev = Dev(build(10, [(0x08, 0x06, 0x50)]))          # 20 mA
         self.assertIn("storage-declares-negligible-power", self.ids(dev))
-
-    def test_self_powered_yet_demanding_the_bus(self):
-        dev = Dev(build(250, [(0x03, 0x01, 0x01)], attrs=0xC0))  # 500 mA
-        self.assertIn("self-powered-but-demands-bus-power", self.ids(dev))
 
     def test_power_findings_stay_low_severity(self):
         """

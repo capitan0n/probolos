@@ -132,8 +132,10 @@ def main(argv=None) -> None:
                              "OFF by default: this records key content, and "
                              "only ever from devices never authorized")
     parser.add_argument("--ledger", type=Path, metavar="FILE",
-                        default=ledger_mod.DEFAULT_PATH,
-                        help="device history file for drift detection")
+                        default=None,
+                        help="device history file for drift detection "
+                             "(default: XDG state dir, or /var/lib/cerberus "
+                             "as root)")
     parser.add_argument("--no-ledger", action="store_true",
                         help="keep no history between runs")
     parser.add_argument("--allow-port", action="append", default=[],
@@ -189,7 +191,8 @@ def main(argv=None) -> None:
                  json_log=args.log, rule_config=rule_config,
                  observe=args.observe,
                  policy=policy,
-                 ledger_path=None if args.no_ledger else args.ledger,
+                 ledger_path=None if args.no_ledger
+                             else (args.ledger or ledger_mod.default_path()),
                  capture_payload=args.capture_payload,
                  watchdog_timeout=args.watchdog)
 

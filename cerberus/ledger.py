@@ -37,7 +37,25 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-DEFAULT_PATH = Path("/var/lib/cerberus/ledger.json")
+def default_path() -> Path:
+    """
+    Where the ledger lives.
+
+    Under root (systemd service) this is /var/lib/cerberus. Run by hand as a
+    normal user it is the XDG state dir, so a --dry-run or a --list never trips
+    over a permission error on a directory only root can write. Falling back to
+    a writable location is not laziness: a history file the user cannot write
+    is the same as no history, and it should fail that way quietly rather than
+    erroring on every device.
+    """
+    import os
+    if os.geteuid() == 0:
+        return Path("/var/lib/cerberus/ledger.json")
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "cerberus" / "ledger.json"
+
+
+DEFAULT_PATH = default_path()
 
 SCHEMA_VERSION = 1
 

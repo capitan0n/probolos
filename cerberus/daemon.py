@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import select
+import threading
 import sys
 import time
 from dataclasses import dataclass
@@ -60,7 +61,8 @@ class Cerberus:
                  policy: Optional[safety.SafetyPolicy] = None,
                  ledger: Optional[object] = None,
                  capture_payload: bool = False,
-                 watchdog: Optional[safety.Watchdog] = None):
+                 watchdog: Optional[safety.Watchdog] = None,
+                 stop_event=None):
         self.dry_run = dry_run
         self.timeout = timeout          # 0 == wait forever
         self.json_log = json_log
@@ -70,6 +72,7 @@ class Cerberus:
         self.ledger = ledger
         self.capture_payload = capture_payload
         self.watchdog = watchdog
+        self.stop_event = stop_event
         self.known: Set[str] = set()    # devices present at startup
 
     # ------------------------------------------------------------------
@@ -112,6 +115,14 @@ class Cerberus:
         while True:
             # poll() with a timeout instead of a blocking iterator, so signals
             # are delivered promptly and shutdown stays responsive.
+            # Once the safety net has opened the gate, carrying on would be
+            # worse than stopping: every new device is already live, yet the
+            # daemon would still print a prompt as though it were holding one.
+            # A tool that looks like it is protecting you while it is not is
+            # more dangerous than one that has plainly stopped.
+            if self.stop_event is not None and self.stop_event.is_set():
+                print("[*] Safety net fired — the gate is open. Stopping.")
+                return
             if self.watchdog:
                 self.watchdog.beat()
             device = monitor.poll(timeout=1.0)
@@ -317,7 +328,10 @@ class Cerberus:
         return answer in ("y", "yes")
 
     def _record(self, decision: Decision, findings=()) -> None:
-        if self.ledger is not None:
+        # In dry-run we change nothing that persists, and the ledger is
+        # persistent state. Recording a decision that was never actually made
+        # would also poison the history with dry-run noise.
+        if self.ledger is not None and not self.dry_run:
             self.ledger.record(decision.device, decision.reason)
             error = self.ledger.save()
             if error:
@@ -369,13 +383,24 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
             print(f"[!] ledger unreadable ({store.load_error}); "
                   f"continuing without history")
 
+    # A panic file left behind by a previous run would fire the watchdog the
+    # instant it starts, which looks like a malfunction rather than the
+    # deliberate signal it is. Refuse clearly instead.
+    if policy.panic_file.exists() and not dry_run:
+        raise SystemExit(
+            f"A panic file already exists at {policy.panic_file}.\n"
+            f"It would force the gate open immediately. Remove it first:\n"
+            f"    rm {policy.panic_file}")
+
     print("[*] Closing the USB authorization gate:")
     with gate.AuthorizationGate(dry_run=dry_run) as opened:
         dog = None
+        stop_event = threading.Event()
         if watchdog_timeout > 0 and not dry_run:
             def on_stall(reason: str) -> None:
                 print(f"\n[!!] WATCHDOG: {reason} — reopening the gate now")
                 opened.restore()
+                stop_event.set()
             dog = safety.Watchdog(watchdog_timeout, on_stall, policy)
             dog.start()
             print(f"  - watchdog armed ({watchdog_timeout:.0f}s), "
@@ -384,7 +409,8 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
         engine = Cerberus(dry_run=dry_run, timeout=timeout, json_log=json_log,
                           rule_config=rule_config, observe=observe,
                           policy=policy, ledger=store,
-                          capture_payload=capture_payload, watchdog=dog)
+                          capture_payload=capture_payload, watchdog=dog,
+                          stop_event=stop_event)
         engine.snapshot()
         try:
             engine.run()

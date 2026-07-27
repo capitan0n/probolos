@@ -66,6 +66,18 @@ def real_microsoft_mouse():
                       "1.5", build((0x03, 0x01, 0x02)))
 
 
+def real_lenovo_mouse():
+    """
+    17ef:608d — Lenovo's VID, and the strings say PixArt again.
+
+    A second, independent instance of the same trap: two mice from different
+    brands, both reporting the sensor vendor as manufacturer. Cross-branded
+    strings are not an edge case, they are the norm.
+    """
+    return FakeDevice("17ef", "608d", "PixArt", "Lenovo USB Optical Mouse",
+                      "1.5", build((0x03, 0x01, 0x02)))
+
+
 def real_realtek_bluetooth():
     """0bda:4853 — two 0xe0 interfaces: HCI plus isochronous voice."""
     return FakeDevice("0bda", "4853", "Realtek", "Bluetooth Radio", "12",
@@ -83,6 +95,9 @@ class TestNoFalsePositivesOnRealHardware(unittest.TestCase):
 
     def test_microsoft_mouse_is_silent(self):
         self.assertEqual(rules.evaluate(real_microsoft_mouse()), [])
+
+    def test_lenovo_mouse_is_silent(self):
+        self.assertEqual(rules.evaluate(real_lenovo_mouse()), [])
 
     def test_realtek_bluetooth_is_silent(self):
         self.assertEqual(rules.evaluate(real_realtek_bluetooth()), [])
