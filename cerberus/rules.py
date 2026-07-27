@@ -219,8 +219,86 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
             "hardware. This signal is weak on its own: keyboards with built-in "
             "hubs or USB passthrough are legitimately high-speed.")
 
+    # -- 8. What the device says about its own power draw ------------------
+    findings.extend(_power_findings(dev, cfg))
+
     findings.sort(key=lambda f: f.severity, reverse=True)
     return findings
+
+
+def _power_findings(dev, cfg: RuleConfig) -> List[Finding]:
+    """
+    Consistency checks on the device's declared power consumption.
+
+    These are DECLARATIONS, not measurements. A computer cannot measure what a
+    USB device actually draws -- there is no current sensor on the port, and
+    the battery gauge is swamped by CPU frequency changes. So this is one more
+    reading of the device's own testimony, and it catches only the careless:
+    anyone who clones a descriptor set clones bMaxPower along with it.
+
+    They are cheap and occasionally decisive, so they are here -- at low
+    severity, honestly labelled, because overstating a weak signal is how a
+    tool loses the user's attention for the strong ones.
+    """
+    from . import descriptors as desc_mod
+
+    out: List[Finding] = []
+    ds = getattr(dev, "descriptor_set", None)
+    if ds is None or not ds.configs:
+        return out
+
+    def add(rule_id, severity, title, explanation):
+        if cfg.enabled(rule_id):
+            out.append(Finding(rule_id, cfg.severity(rule_id, severity),
+                               title, explanation))
+
+    bcd = ds.device.usb_version
+    limit = desc_mod.bus_power_limit_ma(bcd)
+    first = ds.configs[0]
+    declared = first.max_power_ma
+    classes = set(dev.interface_classes)
+
+    # (a) Objective: the device asks for more than the bus may legally supply.
+    # No threshold guessing here -- the number comes from the specification.
+    if declared > limit:
+        add("power-exceeds-bus-limit", Severity.WARNING,
+            "Device asks for more power than the bus can legally supply",
+            f"It declares {declared} mA, while USB {bcd >> 8}.{(bcd >> 4) & 0xF} "
+            f"permits at most {limit} mA for one device. Real products are "
+            "tested against this limit; a descriptor that violates it was "
+            "probably written by hand rather than by a vendor toolchain.")
+
+    # (b) Storage that costs nothing to run has no flash in it. Programming
+    # NAND takes real current, and this is the one power check that touches
+    # physics rather than paperwork -- though only the paperwork is visible.
+    if CLS_MASS_STORAGE in classes and not first.self_powered and declared <= 50:
+        add("storage-declares-negligible-power", Severity.NOTICE,
+            "Storage device that claims to need almost no power",
+            f"It declares {declared} mA. Writing to NAND flash costs real "
+            "current, and ordinary drives declare far more than this. A device "
+            "that expects to spend nothing may have nothing to spend it on.")
+
+    # (c) "I have my own power supply, and also give me half an amp."
+    # Drawing a little bus power while self-powered is normal; drawing a lot
+    # is a contradiction. The threshold is deliberately high to stay quiet.
+    if first.self_powered and declared >= 250:
+        add("self-powered-but-demands-bus-power", Severity.NOTICE,
+            "Claims its own power supply yet demands most of the bus",
+            f"The configuration sets the self-powered flag but still asks for "
+            f"{declared} mA. Self-powered devices normally draw little or "
+            "nothing from the bus.")
+
+    # (d) Weakest of the four, and marked as such. Multiple configurations may
+    # legitimately have different power needs, so only a wide gap is mentioned.
+    span = ds.power_span()
+    if len(ds.configs) > 1 and span and span[0] > 0 and span[1] >= span[0] * 4:
+        add("power-varies-across-configurations", Severity.NOTICE,
+            "Configurations disagree widely about power",
+            f"Declared draw ranges from {span[0]} mA to {span[1]} mA across "
+            "configurations. This can be perfectly legitimate; it is mentioned "
+            "only because it is unusual.")
+
+    return out
 
 
 def _is_benign_group(classes: Set[int], cfg: RuleConfig) -> bool:
@@ -295,3 +373,136 @@ def load_config(path) -> RuleConfig:
         severity_overrides=overrides,
         extra_benign_groups=[set(g) for g in (data.get("benign_groups") or [])],
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: judging observed behaviour
+#
+# Kept here, next to the identity rules, so that every judgement Cerberus makes
+# lives in one auditable place. quarantine.py only observes; it never decides.
+# This module deliberately does not import evdev -- it takes a plain data object
+# and can therefore be tested on any machine, with no hardware and no root.
+# ---------------------------------------------------------------------------
+
+# An operator asked not to touch a device produces no keystrokes. So the
+# baseline expectation during quarantine is silence, and the question is only
+# how to read the exceptions.
+_ACCIDENT_THRESHOLD = 5      # a lean on the keyboard, not a payload
+_MACHINE_INTERVAL = 0.050    # 50 ms between keys: faster than sustained human
+_MACHINE_REGULARITY = 0.20   # coefficient of variation below this is inhuman
+
+
+def behaviour_findings(obs, config: Optional[RuleConfig] = None) -> List[Finding]:
+    """
+    Turn a quarantine Observation into findings.
+
+    The strongest signal here is not speed. It is that the device typed AT ALL
+    while its owner was told to keep their hands off it. Timing statistics only
+    serve to separate an accidental brush against the keys from an automated
+    payload.
+    """
+    cfg = config or DEFAULT_CONFIG
+    findings: List[Finding] = []
+
+    def add(rule_id: str, default_sev: Severity, title: str, explanation: str):
+        if not cfg.enabled(rule_id):
+            return
+        findings.append(Finding(rule_id, cfg.severity(rule_id, default_sev),
+                                title, explanation))
+
+    # -- could we observe at all? -----------------------------------------
+    if obs.error:
+        add("quarantine-unavailable", Severity.NOTICE,
+            "Behaviour could not be observed",
+            f"{obs.error}. The device was judged on its claims alone, which is "
+            "exactly the situation a well-made malicious device is built for.")
+        return findings
+
+    ungrabbed = [n for n in obs.nodes if n not in obs.grabbed]
+    if obs.grab_failures or ungrabbed:
+        detail = "; ".join(obs.grab_failures) or ", ".join(ungrabbed)
+        add("incomplete-isolation", Severity.WARNING,
+            "Device was not fully isolated",
+            f"Some input channels stayed outside the quarantine ({detail}). "
+            "Anything sent through them reached the session normally, so the "
+            "observation below is incomplete.")
+
+    keys = obs.key_presses
+    if not keys:
+        return findings
+
+    # -- it typed, unprompted ---------------------------------------------
+    intervals = obs.intervals()
+    mean_gap = _mean(intervals)
+    cv = _coefficient_of_variation(intervals)
+    first = obs.time_to_first_key()
+
+    machine_like = (
+        len(keys) >= 3
+        and mean_gap is not None and mean_gap < _MACHINE_INTERVAL
+        and cv is not None and cv < _MACHINE_REGULARITY
+    )
+
+    if machine_like:
+        add("machine-generated-keystrokes", Severity.CRITICAL,
+            "Keystrokes were generated by a machine, not a person",
+            f"{len(keys)} keystrokes arrived while nobody was touching the "
+            f"device, averaging {mean_gap * 1000:.0f} ms apart with a timing "
+            f"variation of {cv:.2f}. Human typing is slower and markedly more "
+            "irregular; this rhythm is automated. The keystrokes were captured "
+            "by Cerberus and did not reach your session.")
+    elif len(keys) >= _ACCIDENT_THRESHOLD:
+        add("unprompted-typing", Severity.CRITICAL,
+            "Device typed on its own",
+            f"{len(keys)} keystrokes arrived during quarantine although the "
+            "device was not being touched. Whatever the timing, a device that "
+            "types unprompted is doing something it was not asked to do.")
+    else:
+        add("unexpected-keystrokes", Severity.WARNING,
+            "A few unexplained keystrokes",
+            f"{len(keys)} keystroke(s) arrived during quarantine. This is as "
+            "consistent with brushing against the keys as with an attack, so "
+            "it is reported rather than judged.")
+
+    if first is not None and first < 0.5 and len(keys) >= 3:
+        add("immediate-activity", Severity.WARNING,
+            "Typing began the instant the device came alive",
+            f"The first keystroke arrived {first * 1000:.0f} ms after "
+            "authorization. Legitimate input devices wait for a person.")
+
+    return findings
+
+
+def race_window_note(obs) -> Optional[str]:
+    """
+    Plain statement of the exposure gap, for the report.
+
+    Printed always, not only when it is large. The gap between authorizing a
+    device and capturing its input is inherent to the approach, and a tool that
+    mentions its own weak point only when convenient is not trustworthy.
+    """
+    if not obs.observed:
+        return None
+    return (f"isolated {obs.race_window * 1000:.0f} ms after authorization; "
+            f"anything sent in that window reached the session")
+
+
+def _mean(values) -> Optional[float]:
+    return sum(values) / len(values) if values else None
+
+
+def _coefficient_of_variation(values) -> Optional[float]:
+    """
+    Standard deviation divided by the mean: regularity, independent of speed.
+
+    This is the discriminating statistic. Raw speed catches only crude
+    payloads, and a fast typist can outrun a slow one; but no human sustains a
+    near-constant interval between keys, while a script does so by default.
+    """
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    if mean <= 0:
+        return None
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    return (variance ** 0.5) / mean

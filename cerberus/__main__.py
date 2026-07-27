@@ -14,13 +14,13 @@ import os
 import sys
 from pathlib import Path
 
-from . import daemon, gate, report, rules, sysfs, usbclass
+from . import daemon, gate, ledger as ledger_mod, report, rules, safety, sysfs, usbclass
 
 BANNER = r"""
    ___         _
   / __|___ _ _| |__  ___ _ _ _  _ ___
  | (__/ -_) '_| '_ \/ -_) '_| || (_-<
-  \___\___|_| |_.__/\___|_|  \_,_/__/   stage 1 — authorization gate
+  \___\___|_| |_.__/\___|_|  \_,_/__/   identity · consistency · behaviour
 """
 
 
@@ -58,6 +58,12 @@ def cmd_list(verbose: bool = False) -> None:
         print(f"               serial       : {dev.serial or '-'}")
         print(f"               speed        : {dev.speed or '?'} Mbps")
         print(f"               kinds        : {', '.join(dev.kinds)}")
+        ds = dev.descriptor_set
+        if ds and ds.configs:
+            c = ds.configs[0]
+            src = "self-powered" if c.self_powered else "bus-powered"
+            print(f"               declares     : {c.max_power_ma} mA "
+                  f"({src}, raw {c.max_power_raw} × {c.power_unit_ma} mA)")
         if dev.parse_error:
             print(f"               PARSE ERROR  : {dev.parse_error}")
         for iface in dev.interfaces:
@@ -118,6 +124,32 @@ def main(argv=None) -> None:
                         help="append decisions as JSON lines to FILE")
     parser.add_argument("--rules", type=Path, metavar="FILE",
                         help="YAML file tuning rule severities (optional)")
+    parser.add_argument("--observe", type=float, default=3.0, metavar="SEC",
+                        help="seconds of behavioural quarantine for input "
+                             "devices (0 disables stage 3)")
+    parser.add_argument("--capture-payload", action="store_true",
+                        help="reconstruct what a quarantined device typed. "
+                             "OFF by default: this records key content, and "
+                             "only ever from devices never authorized")
+    parser.add_argument("--ledger", type=Path, metavar="FILE",
+                        default=ledger_mod.DEFAULT_PATH,
+                        help="device history file for drift detection")
+    parser.add_argument("--no-ledger", action="store_true",
+                        help="keep no history between runs")
+    parser.add_argument("--allow-port", action="append", default=[],
+                        metavar="PORT",
+                        help="port that is never gated, e.g. 1-4 (repeatable). "
+                             "Keep a rescue keyboard in one")
+    parser.add_argument("--gate-fixed-ports", action="store_true",
+                        help="also gate internal, non-removable ports. "
+                             "This can lock you out of a laptop keyboard")
+    parser.add_argument("--watchdog", type=float, default=60.0, metavar="SEC",
+                        help="reopen the gate if the daemon stops making "
+                             "progress for SEC seconds (0 disables)")
+    parser.add_argument("--panic-file", type=Path,
+                        default=safety.DEFAULT_PANIC_FILE,
+                        help="create this file from another terminal to force "
+                             "the gate open")
     args = parser.parse_args(argv)
 
     require_usb()
@@ -143,8 +175,23 @@ def main(argv=None) -> None:
         except (RuntimeError, ValueError, OSError) as exc:
             sys.exit(f"rule config: {exc}")
 
+    policy = safety.SafetyPolicy(
+        allowed_ports=args.allow_port,
+        protect_fixed_ports=not args.gate_fixed_ports,
+        panic_file=args.panic_file,
+    )
+    if args.gate_fixed_ports:
+        print("[!] --gate-fixed-ports: internal devices WILL be blocked.")
+        print("[!] If this machine's keyboard is internal USB, make sure you")
+        print("[!] have SSH access before continuing.\n")
+
     daemon.serve(dry_run=args.dry_run, timeout=args.timeout,
-                 json_log=args.log, rule_config=rule_config)
+                 json_log=args.log, rule_config=rule_config,
+                 observe=args.observe,
+                 policy=policy,
+                 ledger_path=None if args.no_ledger else args.ledger,
+                 capture_payload=args.capture_payload,
+                 watchdog_timeout=args.watchdog)
 
 
 if __name__ == "__main__":

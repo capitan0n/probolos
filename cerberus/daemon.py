@@ -38,7 +38,8 @@ try:
 except ImportError:  # pragma: no cover - import guard for offline linting
     pyudev = None
 
-from . import gate, report, rules, sysfs
+from . import (analyzers, gate, ledger as ledger_mod, quarantine,
+               report, rules, safety, sysfs, usbclass)
 
 
 @dataclass
@@ -54,11 +55,21 @@ class Cerberus:
                  dry_run: bool = False,
                  timeout: float = 0.0,
                  json_log: Optional[Path] = None,
-                 rule_config: Optional[rules.RuleConfig] = None):
+                 rule_config: Optional[rules.RuleConfig] = None,
+                 observe: float = 3.0,
+                 policy: Optional[safety.SafetyPolicy] = None,
+                 ledger: Optional[object] = None,
+                 capture_payload: bool = False,
+                 watchdog: Optional[safety.Watchdog] = None):
         self.dry_run = dry_run
         self.timeout = timeout          # 0 == wait forever
         self.json_log = json_log
         self.rule_config = rule_config
+        self.observe = observe          # seconds of behavioural quarantine
+        self.policy = policy or safety.SafetyPolicy()
+        self.ledger = ledger
+        self.capture_payload = capture_payload
+        self.watchdog = watchdog
         self.known: Set[str] = set()    # devices present at startup
 
     # ------------------------------------------------------------------
@@ -101,6 +112,8 @@ class Cerberus:
         while True:
             # poll() with a timeout instead of a blocking iterator, so signals
             # are delivered promptly and shutdown stays responsive.
+            if self.watchdog:
+                self.watchdog.beat()
             device = monitor.poll(timeout=1.0)
             if device is None:
                 continue
@@ -123,7 +136,24 @@ class Cerberus:
         if dev.is_root_hub:
             return
 
-        findings = rules.evaluate(dev, self.rule_config)
+        # SAFETY BEFORE SECURITY. A device on an internal port or on the
+        # operator's allowlist is admitted without a question, because the cost
+        # of being wrong here is somebody with no keyboard and no way to answer
+        # the prompt that would give them one.
+        protection = self.policy.is_protected(dev)
+        if protection and not self.dry_run:
+            try:
+                sysfs.set_authorized(dev.syspath, 1)
+            except OSError as exc:
+                print(f"[!] could not authorize protected device: {exc}")
+            print(f"[=] ADMITTED WITHOUT PROMPT ({protection}) — "
+                  f"{report.one_liner(dev)}\n")
+            self._record(Decision(dev, True, f"protected: {protection}",
+                                  time.time()))
+            return
+
+        findings = analyzers.run(analyzers.Context(
+            device=dev, ledger=self.ledger, config=self.rule_config))
 
         print()
         print(report.render(dev, findings))
@@ -134,9 +164,39 @@ class Cerberus:
             self._record(Decision(dev, False, "dry-run", time.time()), findings)
             return
 
-        approved = self._ask(dev, findings)
+        # ---- stage 3: behavioural quarantine, for input devices only ----
+        # An input device is the only kind that can act against you the instant
+        # it is authorized, so it is the only kind worth the risk of switching
+        # on early. Storage and everything else stay blocked until approved.
+        quarantined = False
+        if self.observe > 0 and usbclass.KIND_INPUT in dev.kinds:
+            obs = self._quarantine(dev)
+            behaviour = analyzers.run(
+                analyzers.Context(device=dev, observation=obs,
+                                  ledger=self.ledger, config=self.rule_config),
+                analyzers=[analyzers.BehaviourAnalyzer(),
+                           analyzers.PayloadAnalyzer()])
+            print()
+            print(report.render_behaviour(obs, behaviour))
+            print()
+            findings = sorted(list(findings) + behaviour,
+                              key=lambda f: f.severity, reverse=True)
+            quarantined = obs.observed
+
+        if self.watchdog:
+            with self.watchdog.paused():
+                approved = self._ask(dev, findings)
+        else:
+            approved = self._ask(dev, findings)
         if approved:
             try:
+                if quarantined:
+                    # Already authorized for the observation; nothing to do but
+                    # let it go, which happened when the grab was released.
+                    print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
+                    self._record(Decision(dev, True, "user approved",
+                                          time.time()), findings)
+                    return
                 sysfs.set_authorized(dev.syspath, 1)
                 print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
                 self._record(Decision(dev, True, "user approved", time.time()),
@@ -144,15 +204,40 @@ class Cerberus:
             except OSError as exc:
                 print(f"[!] failed to authorize: {exc}\n")
         else:
-            # It is already unauthorized; we simply leave it that way. Writing
-            # 0 again is harmless and makes the state explicit in the logs.
+            # For a quarantined device this write genuinely matters: it was
+            # switched on for the observation and is alive right now. For every
+            # other device it is a no-op that makes the state explicit.
             try:
                 sysfs.set_authorized(dev.syspath, 0)
-            except OSError:
-                pass
+            except OSError as exc:
+                # Never swallowed. Failing to switch off a device that just
+                # typed at you is the most dangerous outcome in this program.
+                print(f"\n[!!] COULD NOT DEAUTHORIZE {dev.name}: {exc}")
+                print(f"[!!] The device may still be live. Unplug it now, or "
+                      f"run as root:")
+                print(f"[!!]   echo 0 > {dev.syspath}/authorized\n")
             print(f"[-] REJECTED — {report.one_liner(dev, findings)}\n")
             self._record(Decision(dev, False, "user rejected", time.time()),
                          findings)
+
+    def _quarantine(self, dev: sysfs.UsbDevice):
+        """
+        Switch the device on inside a closed room and watch it.
+
+        The instruction to the user is the experiment: if nobody touches the
+        device, then anything it sends is something it decided to send.
+        """
+        print("  This is an input device. Cerberus will switch it on with its")
+        print("  input captured, so nothing it sends can reach your session.")
+        print(f"  >>> DO NOT TOUCH IT for the next {self.observe:.0f} seconds. <<<")
+        print()
+
+        return quarantine.quarantine(
+            dev.syspath,
+            authorize_fn=lambda: sysfs.set_authorized(dev.syspath, 1),
+            duration=self.observe,
+            capture=self.capture_payload,
+        )
 
     def _on_remove(self, sys_path: str) -> None:
         name = Path(sys_path).name
@@ -232,6 +317,11 @@ class Cerberus:
         return answer in ("y", "yes")
 
     def _record(self, decision: Decision, findings=()) -> None:
+        if self.ledger is not None:
+            self.ledger.record(decision.device, decision.reason)
+            error = self.ledger.save()
+            if error:
+                print(f"[!] could not write ledger: {error}")
         """Append one JSON line. Audit trail first, pretty output second."""
         if not self.json_log:
             return
@@ -264,17 +354,43 @@ class Cerberus:
 
 def serve(dry_run: bool = False, timeout: float = 0.0,
           json_log: Optional[Path] = None,
-          rule_config: Optional[rules.RuleConfig] = None) -> None:
-    """Wire the gate and the loop together."""
-    engine = Cerberus(dry_run=dry_run, timeout=timeout, json_log=json_log,
-                      rule_config=rule_config)
+          rule_config: Optional[rules.RuleConfig] = None,
+          observe: float = 3.0,
+          policy: Optional[safety.SafetyPolicy] = None,
+          ledger_path: Optional[Path] = None,
+          capture_payload: bool = False,
+          watchdog_timeout: float = 0.0) -> None:
+    """Wire the gate, the safety net and the loop together."""
+    policy = policy or safety.SafetyPolicy()
+    store = None
+    if ledger_path is not None:
+        store = ledger_mod.Ledger(ledger_path)
+        if store.load_error:
+            print(f"[!] ledger unreadable ({store.load_error}); "
+                  f"continuing without history")
 
     print("[*] Closing the USB authorization gate:")
-    with gate.AuthorizationGate(dry_run=dry_run) as _g:
+    with gate.AuthorizationGate(dry_run=dry_run) as opened:
+        dog = None
+        if watchdog_timeout > 0 and not dry_run:
+            def on_stall(reason: str) -> None:
+                print(f"\n[!!] WATCHDOG: {reason} — reopening the gate now")
+                opened.restore()
+            dog = safety.Watchdog(watchdog_timeout, on_stall, policy)
+            dog.start()
+            print(f"  - watchdog armed ({watchdog_timeout:.0f}s), "
+                  f"panic file: {policy.panic_file}")
+
+        engine = Cerberus(dry_run=dry_run, timeout=timeout, json_log=json_log,
+                          rule_config=rule_config, observe=observe,
+                          policy=policy, ledger=store,
+                          capture_payload=capture_payload, watchdog=dog)
         engine.snapshot()
         try:
             engine.run()
         except KeyboardInterrupt:
             print("\n[*] Interrupted.")
         finally:
+            if dog:
+                dog.stop()
             print("[*] Reopening the gate:")

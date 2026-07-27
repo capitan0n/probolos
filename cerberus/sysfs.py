@@ -67,6 +67,12 @@ class UsbDevice:
     device_class: Optional[int]
     descriptor_set: Optional[descriptors.DescriptorSet]
     parse_error: Optional[str] = None
+    # The unparsed bytes, kept so the ledger can hash the device's testimony
+    # exactly as it was given. Hashing our parsed view instead would miss any
+    # change in a field the parser ignores -- which is where a device that
+    # wants to change quietly would put it.
+    raw_descriptors: Optional[bytes] = None
+    removable: Optional[str] = None
 
     # ---------- derived views ----------
 
@@ -128,8 +134,10 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
 
     desc_set = None
     parse_error = None
+    raw = None
     try:
-        desc_set = descriptors.parse_file(syspath / "descriptors")
+        raw = (syspath / "descriptors").read_bytes()
+        desc_set = descriptors.parse(raw)
     except FileNotFoundError:
         parse_error = "no descriptors attribute"
     except descriptors.DescriptorParseError as exc:
@@ -153,6 +161,10 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
         device_class=read_int_attr(syspath, "bDeviceClass", base=16),
         descriptor_set=desc_set,
         parse_error=parse_error,
+        raw_descriptors=raw,
+        # "fixed" means the port is not user-accessible: a soldered-in webcam,
+        # or the built-in keyboard. Cerberus must never gate those.
+        removable=read_attr(syspath, "removable"),
     )
 
 

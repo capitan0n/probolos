@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 # Standard descriptor type codes (bDescriptorType)
 DESC_DEVICE = 0x01
@@ -73,13 +73,51 @@ class InterfaceDescriptor:
     interface_protocol: int
 
 
+# bmAttributes bits in a configuration descriptor
+ATTR_SELF_POWERED = 0x40
+ATTR_REMOTE_WAKEUP = 0x20
+
+
+def power_unit_ma(bcd_usb: int) -> int:
+    """
+    How many milliamps one unit of bMaxPower represents.
+
+    This is the detail that makes naive parsers wrong: bMaxPower is expressed
+    in 2 mA units for USB 2.0 and earlier, but in 8 mA units for SuperSpeed
+    (USB 3.x). Assuming 2 mA everywhere under-reports every USB 3 device by a
+    factor of four -- which would quietly corrupt any rule written about power.
+    """
+    return 8 if bcd_usb >= 0x0300 else 2
+
+
+def bus_power_limit_ma(bcd_usb: int) -> int:
+    """
+    What the bus is actually allowed to supply to one device.
+
+    USB 2.0 permits 5 unit loads of 100 mA; SuperSpeed permits 6 of 150 mA.
+    A device declaring more than this is not describing a valid configuration.
+    """
+    return 900 if bcd_usb >= 0x0300 else 500
+
+
 @dataclass
 class ConfigDescriptor:
     value: int                # bConfigurationValue
     num_interfaces: int       # as *declared* by the config descriptor
     attributes: int
-    max_power_ma: int         # bMaxPower is in 2mA units
+    max_power_ma: int         # already scaled by the correct unit
+    max_power_raw: int = 0    # the byte as the device sent it
+    power_unit_ma: int = 2    # the multiplier that was applied
     interfaces: List[InterfaceDescriptor] = field(default_factory=list)
+
+    @property
+    def self_powered(self) -> bool:
+        """The device claims it has its own power supply."""
+        return bool(self.attributes & ATTR_SELF_POWERED)
+
+    @property
+    def remote_wakeup(self) -> bool:
+        return bool(self.attributes & ATTR_REMOTE_WAKEUP)
 
 
 @dataclass
@@ -106,6 +144,15 @@ class DescriptorSet:
             if iface.interface_class not in seen:
                 seen.append(iface.interface_class)
         return seen
+
+    def declared_power_ma(self) -> Optional[int]:
+        """Bus power the first configuration asks for, in milliamps."""
+        return self.configs[0].max_power_ma if self.configs else None
+
+    def power_span(self) -> Optional[tuple]:
+        """(lowest, highest) declared power across configurations."""
+        values = [c.max_power_ma for c in self.configs]
+        return (min(values), max(values)) if values else None
 
     def declared_interface_mismatch(self) -> bool:
         """
@@ -160,6 +207,7 @@ def parse(blob: bytes) -> DescriptorSet:
 
     offset = 18
     current: ConfigDescriptor | None = None
+    unit = power_unit_ma(bcd_usb)
 
     while offset + 2 <= len(blob):
         d_len = blob[offset]
@@ -183,7 +231,9 @@ def parse(blob: bytes) -> DescriptorSet:
                 value=cfg_value,
                 num_interfaces=n_ifaces,
                 attributes=attrs,
-                max_power_ma=max_power * 2,
+                max_power_ma=max_power * unit,
+                max_power_raw=max_power,
+                power_unit_ma=unit,
             )
             result.configs.append(current)
 
@@ -202,7 +252,8 @@ def parse(blob: bytes) -> DescriptorSet:
                 # Interface before any configuration: malformed, but we keep it
                 # in a synthetic config so the anomaly is visible downstream.
                 current = ConfigDescriptor(value=0, num_interfaces=0,
-                                           attributes=0, max_power_ma=0)
+                                           attributes=0, max_power_ma=0,
+                                           power_unit_ma=unit)
                 result.configs.append(current)
             current.interfaces.append(iface)
 

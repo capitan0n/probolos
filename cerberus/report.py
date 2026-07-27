@@ -59,6 +59,24 @@ def _wrap(text: str, width: int) -> List[str]:
     return lines
 
 
+def _finding_lines(finding: rules.Finding) -> List[str]:
+    """
+    Render one finding, wrapping BOTH the title and the body.
+
+    Titles are written for humans and some are long; letting them overflow the
+    box was a real bug. Wrapping here means every future rule is safe by
+    construction rather than by remembering to keep titles short.
+    """
+    mark = _SEVERITY_MARK[finding.severity]
+    head = f"{mark} {finding.severity.label}: {finding.title}"
+    lines = []
+    for i, chunk in enumerate(_wrap(head, WIDTH - 3)):
+        lines.append(_line(chunk if i == 0 else f"     {chunk}"))
+    for chunk in _wrap(finding.explanation, WIDTH - 8):
+        lines.append(_line(f"     {chunk}"))
+    return lines
+
+
 def render(dev: sysfs.UsbDevice,
            findings: Optional[Sequence[rules.Finding]] = None) -> str:
     """Build the full report block for one blocked device."""
@@ -101,6 +119,15 @@ def render(dev: sysfs.UsbDevice,
         n_ifaces = len(dev.interfaces)
         out.append(_line(f"{n_ifaces} interface(s), {d.num_configurations} "
                          f"configuration(s)"))
+        cfgs = dev.descriptor_set.configs
+        if cfgs:
+            cfg0 = cfgs[0]
+            source = "self-powered" if cfg0.self_powered else "bus-powered"
+            # The raw byte is shown alongside the milliamps because the two
+            # differ by the USB generation, and that discrepancy was a real bug.
+            out.append(_line(f"declares {cfg0.max_power_ma} mA  ({source}, "
+                             f"bMaxPower={cfg0.max_power_raw} × "
+                             f"{cfg0.power_unit_ma} mA)"))
 
     # --- what the rules concluded ---------------------------------------
     out.append(_rule())
@@ -108,10 +135,7 @@ def render(dev: sysfs.UsbDevice,
 
     for finding in findings:
         out.append(_line())
-        mark = _SEVERITY_MARK[finding.severity]
-        out.append(_line(f"{mark} {finding.severity.label}: {finding.title}"))
-        for line in _wrap(finding.explanation, WIDTH - 8):
-            out.append(_line(f"     {line}"))
+        out.extend(_finding_lines(finding))
 
     out.append("└" + "─" * WIDTH + "┘")
 
@@ -133,3 +157,47 @@ def one_liner(dev: sysfs.UsbDevice,
     if findings:
         text += f"  <{rules.worst(findings).label}: {len(findings)} finding(s)>"
     return text
+
+
+def render_behaviour(obs, findings: Sequence[rules.Finding]) -> str:
+    """
+    Second report block, printed after the device has been watched in isolation.
+
+    Deliberately a SEPARATE block rather than an update of the first one: the
+    user should see that two independent kinds of evidence were gathered, and
+    that a device passing the identity check can still fail here.
+    """
+    out: List[str] = []
+    out.append("┌" + "─" * WIDTH + "┐")
+    out.append(_line("BEHAVIOUR UNDER QUARANTINE"))
+    out.append(_rule())
+
+    if obs.error:
+        out.append(_line(f"Not observed: {obs.error}"))
+    else:
+        nodes = len(obs.grabbed)
+        out.append(_line(f"Isolated {nodes} input channel(s) for "
+                         f"{obs.duration:.0f}s"))
+        out.append(_line(f"Keystrokes captured : {len(obs.key_presses)}"))
+        if obs.button_presses:
+            out.append(_line(f"Button presses      : {obs.button_presses} "
+                             f"(normal for a mouse)"))
+        if obs.motion_events:
+            out.append(_line(f"Motion events       : {obs.motion_events} "
+                             f"(normal for a mouse)"))
+
+        note = rules.race_window_note(obs)
+        if note:
+            out.append(_line())
+            for line in _wrap(f"Exposure gap: {note}.", WIDTH - 3):
+                out.append(_line(line))
+
+    if findings:
+        out.append(_rule())
+        for finding in findings:
+            out.extend(_finding_lines(finding))
+            if finding is not findings[-1]:
+                out.append(_line())
+
+    out.append("└" + "─" * WIDTH + "┘")
+    return "\n".join(out)
