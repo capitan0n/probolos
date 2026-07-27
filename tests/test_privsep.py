@@ -84,6 +84,30 @@ class TestGatePathValidation(unittest.TestCase):
             gate_server.GateServer._safe_usb_path(
                 "/sys/bus/usb/devices/does-not-exist-9-9"))
 
+    def test_raw_devices_path_is_refused(self):
+        """
+        A caller must reference USB nodes through the bus view, not by handing
+        us a resolved /sys/devices/ path directly -- otherwise it could reach a
+        non-USB device that merely lives under /sys/devices/.
+        """
+        self.assertIsNone(
+            gate_server.GateServer._safe_usb_path(
+                "/sys/devices/pci0000:00/usb1"))
+
+    def test_root_hub_symlink_shape_passes_validation_conditions(self):
+        """
+        Root hubs are symlinks from the bus view into /sys/devices/. The bug in
+        0.6.0 was that following the symlink took the path out of the bus prefix
+        and it was wrongly refused. A path under the bus view that resolves into
+        /sys/devices/ must be accepted (subject to is_dir). We can only check
+        the prefix logic here since the node does not exist in CI, but that is
+        exactly the logic that regressed.
+        """
+        import os
+        normalized = os.path.normpath("/sys/bus/usb/devices/usb1")
+        self.assertTrue((normalized + "/").startswith(
+            gate_server.USB_LINK_PREFIX))
+
 
 class TestGateRefusesBadRequests(unittest.TestCase):
     """

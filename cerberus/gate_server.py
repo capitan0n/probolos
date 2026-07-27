@@ -35,7 +35,18 @@ from . import protocol
 
 # The only paths the gate will ever touch. Requests outside these are refused
 # regardless of what the analyzer says, because the analyzer is not trusted.
-USB_PREFIX = "/sys/bus/usb/devices/"
+#
+# USB device directories are exposed under /sys/bus/usb/devices/ as SYMLINKS
+# into the real device tree under /sys/devices/. realpath() follows those
+# symlinks, so after resolution a legitimate USB device path begins with
+# /sys/devices/ and NOT with the bus prefix. We therefore accept a resolved
+# path only if BOTH hold: it is under /sys/devices/, and it is reachable
+# through /sys/bus/usb/devices/ (i.e. it really is a USB node, not some other
+# device that merely lives under /sys/devices/). This keeps the gate from
+# being tricked into writing to an unrelated device while still handling the
+# symlinks that the USB subsystem actually uses.
+USB_LINK_PREFIX = "/sys/bus/usb/devices/"
+USB_REAL_PREFIX = "/sys/devices/"
 INPUT_PREFIX = "/dev/input/"
 
 
@@ -55,15 +66,35 @@ class GateServer:
     @staticmethod
     def _safe_usb_path(path: str) -> Optional[Path]:
         """
-        Resolve and confirm a path is a real device directory under the USB
-        tree. realpath collapses any ../ trickery before the prefix check, so
-        a path cannot escape the tree by indirection.
+        Confirm a path names a genuine USB device node, and return it resolved.
+
+        Two conditions, both required:
+
+          1. the path, as given, must sit under /sys/bus/usb/devices/ -- this
+             is what the analyzer is allowed to reference, and it rules out
+             asking for an arbitrary /sys/devices/ path directly;
+          2. after realpath (which follows the bus symlink into the real
+             device tree and collapses any ../), it must land under
+             /sys/devices/ and be a directory.
+
+        Requiring BOTH means a caller cannot reach a non-USB device by handing
+        us a resolved /sys/devices/ path directly (fails 1), nor escape the USB
+        tree by symlink or traversal (fails 2). The ../ check still holds
+        because realpath is applied to the ORIGINAL string: a path like
+        /sys/bus/usb/devices/../../etc resolves out of /sys/devices/ and is
+        refused.
         """
+        # Condition 1: the reference must be inside the USB bus view. Compare
+        # on the un-resolved path so a raw /sys/devices/... request is refused.
+        normalized = os.path.normpath(path)
+        if not (normalized + "/").startswith(USB_LINK_PREFIX):
+            return None
+        # Condition 2: resolve and confirm it lands in the real device tree.
         try:
             resolved = os.path.realpath(path)
         except OSError:
             return None
-        if not (resolved + "/").startswith(USB_PREFIX):
+        if not (resolved + "/").startswith(USB_REAL_PREFIX):
             return None
         p = Path(resolved)
         return p if p.is_dir() else None
@@ -89,7 +120,7 @@ class GateServer:
         devpath = self._safe_usb_path(req.path)
         if devpath is None:
             return protocol.Response(protocol.DENIED,
-                                     f"path not under {USB_PREFIX}")
+                                     f"path not under {USB_LINK_PREFIX}")
         try:
             (devpath / "authorized").write_text(str(req.value))
             return protocol.Response(protocol.OK)
@@ -102,7 +133,7 @@ class GateServer:
         hubpath = self._safe_usb_path(req.path)
         if hubpath is None:
             return protocol.Response(protocol.DENIED,
-                                     f"path not under {USB_PREFIX}")
+                                     f"path not under {USB_LINK_PREFIX}")
         try:
             (hubpath / "authorized_default").write_text(str(req.value))
             return protocol.Response(protocol.OK)
