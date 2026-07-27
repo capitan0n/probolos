@@ -200,24 +200,31 @@ class Cerberus:
         else:
             approved = self._ask(dev, findings)
         if approved:
+            # The user's decision is a fact the moment it is made, so it is
+            # recorded BEFORE the sysfs write. This matters for the ledger:
+            # if the device is yanked between the prompt and the write (a
+            # short-lived test gadget, or a real device pulled at the wrong
+            # moment), the authorization fails -- but the history of "this
+            # identity was seen and approved" must survive regardless, or drift
+            # detection silently forgets devices that were briefly present.
+            self._record(Decision(dev, True, "user approved", time.time()),
+                         findings)
             try:
                 if quarantined:
                     # Already authorized for the observation; nothing to do but
                     # let it go, which happened when the grab was released.
                     print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
-                    self._record(Decision(dev, True, "user approved",
-                                          time.time()), findings)
                     return
                 sysfs.set_authorized(dev.syspath, 1)
                 print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
-                self._record(Decision(dev, True, "user approved", time.time()),
-                             findings)
             except OSError as exc:
                 print(f"[!] failed to authorize: {exc}\n")
         else:
             # For a quarantined device this write genuinely matters: it was
             # switched on for the observation and is alive right now. For every
             # other device it is a no-op that makes the state explicit.
+            self._record(Decision(dev, False, "user rejected", time.time()),
+                         findings)
             try:
                 sysfs.set_authorized(dev.syspath, 0)
             except OSError as exc:
@@ -228,8 +235,6 @@ class Cerberus:
                       f"run as root:")
                 print(f"[!!]   echo 0 > {dev.syspath}/authorized\n")
             print(f"[-] REJECTED — {report.one_liner(dev, findings)}\n")
-            self._record(Decision(dev, False, "user rejected", time.time()),
-                         findings)
 
     def _quarantine(self, dev: sysfs.UsbDevice):
         """
