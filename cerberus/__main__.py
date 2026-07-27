@@ -152,6 +152,11 @@ def main(argv=None) -> None:
                         default=safety.DEFAULT_PANIC_FILE,
                         help="create this file from another terminal to force "
                              "the gate open")
+    parser.add_argument("--privsep", action="store_true",
+                        help="run with privilege separation: a small root gate "
+                             "and an unprivileged analyzer. Recommended")
+    parser.add_argument("--privsep-user", default="nobody", metavar="USER",
+                        help="user the analyzer drops to under --privsep")
     args = parser.parse_args(argv)
 
     require_usb()
@@ -187,14 +192,36 @@ def main(argv=None) -> None:
         print("[!] If this machine's keyboard is internal USB, make sure you")
         print("[!] have SSH access before continuing.\n")
 
-    daemon.serve(dry_run=args.dry_run, timeout=args.timeout,
-                 json_log=args.log, rule_config=rule_config,
-                 observe=args.observe,
-                 policy=policy,
-                 ledger_path=None if args.no_ledger
-                             else (args.ledger or ledger_mod.default_path()),
-                 capture_payload=args.capture_payload,
-                 watchdog_timeout=args.watchdog)
+    ledger_path = (None if args.no_ledger
+                   else (args.ledger or ledger_mod.default_path()))
+
+    def _serve():
+        daemon.serve(dry_run=args.dry_run, timeout=args.timeout,
+                     json_log=args.log, rule_config=rule_config,
+                     observe=args.observe,
+                     policy=policy,
+                     ledger_path=ledger_path,
+                     capture_payload=args.capture_payload,
+                     watchdog_timeout=args.watchdog)
+
+    if args.privsep:
+        from . import privsep
+        from .gate_client import GateBackend
+
+        def analyzer_main(gate_client):
+            # Runs in the UNPRIVILEGED child. Every privileged sysfs write from
+            # here on is routed to the root gate over the socket.
+            sysfs.install_backend(GateBackend(gate_client))
+            _serve()
+            return 0
+
+        try:
+            rc = privsep.start(analyzer_main, drop_to=args.privsep_user)
+        except privsep.PrivsepError as exc:
+            sys.exit(f"privsep: {exc}")
+        sys.exit(rc)
+    else:
+        _serve()
 
 
 if __name__ == "__main__":

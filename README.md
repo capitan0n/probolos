@@ -78,13 +78,17 @@ and only needed to override rule severities from a file.
 ## Usage
 
 ```bash
-python -m cerberus --list        # inventory, read-only, no root needed
-python -m cerberus --dry-run     # watch attachments, never block anything
-sudo python -m cerberus          # run the gate
-sudo python -m cerberus --timeout 30 --log /var/log/cerberus.jsonl
+python -m cerberus --list           # inventory, read-only, no root needed
+python -m cerberus --dry-run        # watch attachments, never block anything
+sudo python -m cerberus --privsep   # run the gate WITH privilege separation
+sudo python -m cerberus             # run as a single root process (simpler)
+sudo python -m cerberus --privsep --timeout 30 --log /var/log/cerberus.jsonl
 sudo python -m cerberus --release   # recovery: unblock everything, reopen gate
 sudo python -m cerberus --observe 0 # disable behavioural quarantine
 ```
+
+`--privsep` is recommended: it runs the clever, larger, more exposed code as an
+unprivileged user, keeping only a small audited gate as root. See `SECURITY.md`.
 
 Start with `--dry-run`. It shows exactly what the gate would report without
 changing a single kernel flag.
@@ -255,9 +259,10 @@ honestly, and see whether the distributions separate.
       tested invariants.
 - [x] **Analyzer plugin layer.** One contract, `analyze(ctx) -> [Finding]`,
       with failures contained so a broken heuristic cannot block a keyboard.
-- [ ] **Privilege separation.** A minimal root gate passing file descriptors
-      over `SCM_RIGHTS` to an unprivileged analyzer under systemd sandboxing.
-      This should have come first.
+- [x] **Privilege separation** (`--privsep`). A minimal root gate
+      (`gate_server.py`) passes file descriptors over `SCM_RIGHTS` to an
+      unprivileged analyzer running as `nobody`; the privilege drop is
+      verified. systemd sandboxing of the two units is the remaining step.
 - [ ] **Interface-level authorization + `drivers_autoprobe=0` + libusb.**
       Eliminates the quarantine race instead of measuring it, and is the
       precondition for both active interrogation and QEMU passthrough.

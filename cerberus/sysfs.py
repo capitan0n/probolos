@@ -197,6 +197,37 @@ def list_root_hubs() -> List[Path]:
 # The gate itself
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Privileged-write backend.
+#
+# By default these operations write sysfs directly, which requires root. When
+# privilege separation is active, install_backend() swaps in a backend that
+# routes the same calls through the gate over the SEQPACKET socket, so the
+# unprivileged analyzer never writes sysfs itself. Callers do not change; only
+# the backend does. This is what let the whole daemon move behind the split
+# without rewriting its logic.
+# --------------------------------------------------------------------------
+
+class _DirectBackend:
+    """Writes sysfs directly. The original behaviour, used when running as root
+    without privilege separation."""
+
+    def authorize(self, syspath: Path, value: int) -> None:
+        (syspath / "authorized").write_text(str(value))
+
+    def set_default(self, hub: Path, value: int) -> None:
+        (hub / "authorized_default").write_text(str(value))
+
+
+_backend = _DirectBackend()
+
+
+def install_backend(backend) -> None:
+    """Replace the privileged-write backend (used by privsep)."""
+    global _backend
+    _backend = backend
+
+
 def set_authorized(syspath: Path, value: int) -> None:
     """
     Authorize (1) or deauthorize (0) a single device.
@@ -204,8 +235,11 @@ def set_authorized(syspath: Path, value: int) -> None:
     Writing 1 makes the kernel choose and set a configuration, which creates
     the interfaces and binds drivers -- this is the exact instant a keyboard
     becomes able to type. Writing 0 unconfigures it again.
+
+    Routed through the active backend so that under privilege separation the
+    write happens in the root gate, not here.
     """
-    (syspath / "authorized").write_text(str(value))
+    _backend.authorize(syspath, value)
 
 
 def get_authorized_default(hub: Path) -> Optional[int]:
@@ -222,5 +256,7 @@ def set_authorized_default(hub: Path, value: int) -> None:
 
     Note it does NOT retroactively touch devices that are already attached --
     which is precisely the 'only new devices' scope we chose.
+
+    Routed through the active backend, as with set_authorized.
     """
-    (hub / "authorized_default").write_text(str(value))
+    _backend.set_default(hub, value)

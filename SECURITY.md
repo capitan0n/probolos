@@ -47,11 +47,24 @@ and then admits a keyboard over the air, with no USB event at all.
 
 These are real and are not hidden:
 
-**The daemon runs as root and reads keystrokes.** This is the wrong shape. The
-privileged operations are small — writes to `sysfs`, opening input nodes — and
-belong in a minimal process that passes file descriptors to an unprivileged
-analyzer over `SCM_RIGHTS`. Until that split exists, a bug in any analyzer is a
-bug in a root process.
+**Privilege separation exists (`--privsep`), but is not yet the default.**
+With `--privsep`, a small root gate (`gate_server.py`, the only privileged
+code) does nothing but write `authorized`/`authorized_default` and open input
+nodes read-only, passing the file descriptors to an unprivileged analyzer over
+`SCM_RIGHTS`. The analyzer — all rules, timing, ledger, payload work — runs as
+`nobody` and can regain no privilege; the drop is verified, including that
+`setuid(0)` fails afterwards. A bug in any analyzer is then a bug in an
+unprivileged process, not a root compromise.
+
+What this does and does not buy: it bounds the blast radius of a compromised
+analyzer to the analyzer's own (minimal) privileges. It does NOT stop the
+analyzer from reading keystrokes it is entitled to read during quarantine —
+that is bounded instead by the structural "never on an authorized device"
+invariant. The two protections are separate and neither replaces the other.
+
+Without `--privsep` the daemon still runs entirely as root, which is why the
+flag is recommended in the README and will become the default once it has more
+real-world testing.
 
 **The quarantine has a race.** Between `authorized=1` and the `EVIOCGRAB`
 completing, keystrokes can reach the session. The window is measured and
@@ -118,6 +131,7 @@ independent layers:
 | Port allowlist | `--allow-port` keeps a rescue port always open |
 | Watchdog | daemon alive but stuck; reopens the gate |
 | Panic file | `touch /tmp/cerberus-panic` from another TTY or over SSH |
+| Privilege separation | analyzer compromise cannot escalate to root |
 
 Plus the gate's own restore paths (context manager, signal handlers, `atexit`)
 which cover a daemon that dies, and `--release` for manual recovery.
