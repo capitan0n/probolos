@@ -66,6 +66,14 @@ Without `--privsep` the daemon still runs entirely as root, which is why the
 flag is recommended in the README and will become the default once it has more
 real-world testing.
 
+**Observation requires briefly authorizing the device.** During the observation
+window the device is live, with its input captured. It is returned to
+`authorized=0` the instant observation ends, before the human is asked, so
+there is no window in which it is both live and unwatched. A composite device's
+non-input functions (storage, network) are nonetheless live for the duration of
+the window, which is a real exposure and the reason the window is short and
+configurable (`--observe`, `0` disables it).
+
 **The quarantine has a race.** Between `authorized=1` and the `EVIOCGRAB`
 completing, keystrokes can reach the session. The window is measured and
 printed in every report, typically 10–20 ms. It is eliminated, not merely

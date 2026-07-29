@@ -149,11 +149,30 @@ class PayloadAnalyzer(Analyzer):
             detail)]
 
 
+class StorageAnalyzer(Analyzer):
+    """
+    Stage 4: structural inspection of the raw medium.
+
+    Requires a MediumReport in the context, which the daemon produces only for
+    storage devices and only inside the same briefly-authorized window used for
+    behavioural quarantine.
+    """
+    id = "storage"
+    title = "what the medium contains"
+
+    def analyze(self, ctx):
+        medium = ctx.extra.get("medium")
+        if medium is None:
+            return []
+        return rules.storage_findings(medium, ctx.config)
+
+
 DEFAULT_ANALYZERS: List[Analyzer] = [
     SemanticAnalyzer(),
     LedgerAnalyzer(),
     BehaviourAnalyzer(),
     PayloadAnalyzer(),
+    StorageAnalyzer(),
 ]
 
 

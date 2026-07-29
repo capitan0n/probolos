@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import select
 import threading
+from collections import OrderedDict
 import sys
 import time
 from dataclasses import dataclass
@@ -40,7 +41,8 @@ except ImportError:  # pragma: no cover - import guard for offline linting
     pyudev = None
 
 from . import (analyzers, gate, ledger as ledger_mod, quarantine,
-               report, rules, safety, sysfs, usbclass)
+               report, rules, safety, session as session_mod, storage, sysfs,
+               trust as trust_mod, usbclass)
 
 
 @dataclass
@@ -62,7 +64,11 @@ class Cerberus:
                  ledger: Optional[object] = None,
                  capture_payload: bool = False,
                  watchdog: Optional[safety.Watchdog] = None,
-                 stop_event=None):
+                 stop_event=None,
+                 trust_store=None,
+                 inspect_storage: bool = True,
+                 monitor=None,
+                 lock_policy: str = session_mod.POLICY_QUEUE):
         self.dry_run = dry_run
         self.timeout = timeout          # 0 == wait forever
         self.json_log = json_log
@@ -73,6 +79,15 @@ class Cerberus:
         self.capture_payload = capture_payload
         self.watchdog = watchdog
         self.stop_event = stop_event
+        self.trust = trust_store
+        self.inspect_storage = inspect_storage
+        self.monitor = monitor or session_mod.AlwaysUnlocked()
+        self.lock_policy = lock_policy
+        # Devices attached while the screen was locked. They are held blocked
+        # and asked about when someone returns, so nobody has to unplug and
+        # replug hardware just because they stepped away.
+        self.pending: "OrderedDict[str, Path]" = OrderedDict()
+        self._was_locked = False
         self.known: Set[str] = set()    # devices present at startup
 
     # ------------------------------------------------------------------
@@ -88,10 +103,31 @@ class Cerberus:
         or mouse is USB -- they are already authorized and we never look at
         them again.
         """
+        stranded = []
         for dev in sysfs.list_devices():
+            # A device sitting at authorized=0 is NOT a device that is working
+            # fine and should be left alone -- it is one something already
+            # blocked, almost always a previous Cerberus run that exited before
+            # a decision was made. Treating it as baseline would leave it dead
+            # AND never ask about it, so its owner would have to unplug and
+            # replug hardware to get a question they never got the chance to
+            # answer. Those devices are queued for decision instead.
+            if dev.authorized == 0 and not dev.is_root_hub:
+                stranded.append(dev)
+                continue
             self.known.add(dev.name)
+
         print(f"[*] Baseline: {len(self.known)} USB device(s) already attached, "
               f"all left untouched")
+
+        if stranded:
+            print(f"[*] {len(stranded)} device(s) are attached but blocked "
+                  f"(left over from an earlier run):")
+            for dev in stranded:
+                print(f"      {report.one_liner(dev)}")
+                self.pending[dev.name] = dev.syspath
+            print("    You will be asked about them now, without unplugging "
+                  "anything.\n")
 
     # ------------------------------------------------------------------
     # main loop
@@ -112,6 +148,14 @@ class Cerberus:
 
         print("[*] Listening. Plug in a device. Ctrl-C to stop.\n")
 
+        # Devices found blocked at startup are decided immediately -- unless
+        # the screen is locked, in which case they simply stay queued until
+        # someone is back, exactly like a device attached while away.
+        if self.pending and not self.dry_run:
+            if (self.lock_policy == session_mod.POLICY_IGNORE
+                    or not self.monitor.is_locked()):
+                self._drain_pending()
+
         while True:
             # poll() with a timeout instead of a blocking iterator, so signals
             # are delivered promptly and shutdown stays responsive.
@@ -125,6 +169,18 @@ class Cerberus:
                 return
             if self.watchdog:
                 self.watchdog.beat()
+
+            # Watch for the screen unlocking so held devices can be asked
+            # about. Polling once a second is plenty: this is a human-timescale
+            # event, and polling avoids depending on a session bus the
+            # unprivileged analyzer cannot reach.
+            if self.lock_policy == session_mod.POLICY_QUEUE and not self.dry_run:
+                locked = self.monitor.is_locked()
+                if locked is not None:
+                    if self._was_locked and not locked:
+                        self._drain_pending()
+                    self._was_locked = bool(locked)
+
             device = monitor.poll(timeout=1.0)
             if device is None:
                 continue
@@ -133,7 +189,20 @@ class Cerberus:
             elif device.action == "remove":
                 self._on_remove(device.sys_path)
 
-    def _on_add(self, sys_path: str) -> None:
+    def _on_add(self, sys_path: str, was_held: bool = False) -> None:
+        """
+        Handle a device attachment.
+
+        `was_held` marks a device that spent time blocked in the queue -- it
+        arrived while the screen was locked, or was left undecided by an
+        earlier run. Such a device is always asked about, even if remembered.
+
+        The reason is that trust was granted while its owner was present and
+        watching. A device that turned up while nobody was there has not earned
+        the shortcut, and deferring the question must not quietly become
+        approving it: otherwise "nothing is admitted while you are away" would
+        really mean "nothing is admitted until you get back, then everything".
+        """
         path = Path(sys_path)
         name = path.name
 
@@ -146,6 +215,17 @@ class Cerberus:
             return
         if dev.is_root_hub:
             return
+
+        # ---- nobody is at the machine ------------------------------------
+        # Neither quarantine nor the storage scan runs while the screen is
+        # locked: both require switching the device on, and powering up unknown
+        # hardware while its owner is absent is the exact situation being
+        # defended against. Only the identity is recorded; the device stays
+        # dead until a human is back.
+        if self.lock_policy != session_mod.POLICY_IGNORE and not self.dry_run:
+            if self.monitor.is_locked():
+                self._hold_until_unlocked(dev)
+                return
 
         # SAFETY BEFORE SECURITY. A device on an internal port or on the
         # operator's allowlist is admitted without a question, because the cost
@@ -166,6 +246,27 @@ class Cerberus:
         findings = analyzers.run(analyzers.Context(
             device=dev, ledger=self.ledger, config=self.rule_config))
 
+        # ---- previously approved devices go straight through --------------
+        # Trust is checked AFTER the identity analysers have run, never before,
+        # so that a remembered device producing a CRITICAL finding is still
+        # stopped. Trust decides whether to ask a question with no troubling
+        # answer; it cannot silence one that has.
+        if (self.trust is not None and not self.dry_run and not was_held
+                and self.trust.is_trusted(dev)
+                and rules.worst(findings) < rules.Severity.CRITICAL):
+            try:
+                sysfs.set_authorized(dev.syspath, 1)
+                self.trust.record_admission(dev)
+                error = self.trust.save()
+                if error:
+                    print(f"[!] could not update trust store: {error}")
+                print(f"[=] TRUSTED — {report.one_liner(dev, findings)}\n")
+                self._record(Decision(dev, True, "trusted", time.time()),
+                             findings)
+            except OSError as exc:
+                print(f"[!] failed to authorize trusted device: {exc}")
+            return
+
         print()
         print(report.render(dev, findings))
         print()
@@ -179,9 +280,40 @@ class Cerberus:
         # An input device is the only kind that can act against you the instant
         # it is authorized, so it is the only kind worth the risk of switching
         # on early. Storage and everything else stay blocked until approved.
-        quarantined = False
+        # ---- stage 4: look inside storage media, without mounting --------
+        if self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds:
+            medium = self._inspect_medium(dev)
+            if medium is not None:
+                storage_findings = analyzers.run(
+                    analyzers.Context(device=dev, config=self.rule_config,
+                                      extra={"medium": medium}),
+                    analyzers=[analyzers.StorageAnalyzer()])
+                print()
+                print(report.render_medium(medium, storage_findings))
+                print()
+                findings = sorted(list(findings) + storage_findings,
+                                  key=lambda f: f.severity, reverse=True)
+
         if self.observe > 0 and usbclass.KIND_INPUT in dev.kinds:
             obs = self._quarantine(dev)
+            # THE DEVICE GOES STRAIGHT BACK TO BLOCKED.
+            #
+            # Observation requires switching the device on, but the moment the
+            # grab is released it would be both live and unwatched -- and the
+            # human has not decided yet. A malicious keyboard could simply stay
+            # silent for the observation window and then type freely while its
+            # victim reads the report, which makes the whole quarantine
+            # trivially defeatable by waiting. Worse, a composite storage +
+            # keyboard device would have its storage half live and available
+            # for automount during that same window.
+            #
+            # So the device is deauthorized again immediately, and is only
+            # authorized for real if the human approves. Deny-by-default has to
+            # hold at every instant, not just at the start.
+            try:
+                sysfs.set_authorized(dev.syspath, 0)
+            except OSError as exc:
+                print(f"[!] could not re-block after observation: {exc}")
             behaviour = analyzers.run(
                 analyzers.Context(device=dev, observation=obs,
                                   ledger=self.ledger, config=self.rule_config),
@@ -192,8 +324,13 @@ class Cerberus:
             print()
             findings = sorted(list(findings) + behaviour,
                               key=lambda f: f.severity, reverse=True)
-            quarantined = obs.observed
 
+        if was_held and self.trust is not None and self.trust.is_trusted(dev):
+            print("  Note: this device is on your remembered list, but it was")
+            print("  attached while you were away, so it is being asked about")
+            print("  anyway.\n")
+
+        self._remember = False
         if self.watchdog:
             with self.watchdog.paused():
                 approved = self._ask(dev, findings)
@@ -209,12 +346,19 @@ class Cerberus:
             # detection silently forgets devices that were briefly present.
             self._record(Decision(dev, True, "user approved", time.time()),
                          findings)
+            if getattr(self, "_remember", False) and self.trust is not None:
+                entry = self.trust.trust(dev)
+                if entry is None:
+                    print("  (cannot remember this device: its descriptors "
+                          "could not be read, so there is nothing to pin "
+                          "trust to)")
+                else:
+                    self.trust.record_admission(dev)
+                    error = self.trust.save()
+                    print(f"  remembered — this device will be admitted "
+                          f"without asking, unless something changes"
+                          + (f" [{error}]" if error else ""))
             try:
-                if quarantined:
-                    # Already authorized for the observation; nothing to do but
-                    # let it go, which happened when the grab was released.
-                    print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
-                    return
                 sysfs.set_authorized(dev.syspath, 1)
                 print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
             except OSError as exc:
@@ -235,6 +379,101 @@ class Cerberus:
                       f"run as root:")
                 print(f"[!!]   echo 0 > {dev.syspath}/authorized\n")
             print(f"[-] REJECTED — {report.one_liner(dev, findings)}\n")
+
+    def report_blocked_on_exit(self) -> None:
+        """
+        Say plainly which devices are being left switched off.
+
+        Cerberus will not silently authorize a device nobody approved, so
+        anything undecided stays blocked. But leaving hardware dead without
+        saying so is how a tool earns a reputation for breaking things, and the
+        user has no way to guess why a stick stopped working.
+        """
+        if not self.pending:
+            return
+        print(f"\n[!] {len(self.pending)} device(s) are still blocked because "
+              f"no decision was made:")
+        for name in self.pending:
+            print(f"      {name}")
+        print("    They stay blocked on purpose. Start Cerberus again and you "
+              "will be asked,")
+        print("    or release them now with:  sudo python -m cerberus --release")
+
+    def _hold_until_unlocked(self, dev: sysfs.UsbDevice) -> None:
+        """Keep a device blocked and remember to ask about it later."""
+        if self.lock_policy == session_mod.POLICY_QUEUE:
+            self.pending[dev.name] = dev.syspath
+            print(f"[⏸] SCREEN LOCKED — holding {report.one_liner(dev)}")
+            print("    It stays blocked. You will be asked when you unlock.\n")
+            reason = "held: screen locked"
+        else:
+            print(f"[-] SCREEN LOCKED — denied {report.one_liner(dev)}\n")
+            reason = "denied: screen locked"
+        try:
+            sysfs.set_authorized(dev.syspath, 0)
+        except OSError:
+            pass
+        self._record(Decision(dev, False, reason, time.time()))
+
+    def _drain_pending(self) -> None:
+        """
+        Someone unlocked the screen: put the held questions now.
+
+        Each device is re-read from sysfs rather than replayed from the earlier
+        snapshot. It has been blocked the whole time so nothing about it can
+        have changed, but reading it again is what makes the full inspection --
+        quarantine, storage scan -- run now, at the moment there is a human to
+        see the result.
+        """
+        if not self.pending:
+            return
+        print(f"\n[▶] Screen unlocked — {len(self.pending)} device(s) were "
+              f"held while you were away.\n")
+        held, self.pending = self.pending, OrderedDict()
+        for name, syspath in held.items():
+            if not syspath.exists():
+                print(f"[*] {name} was removed while held; nothing to decide\n")
+                continue
+            self._on_add(str(syspath), was_held=True)
+
+    def _inspect_medium(self, dev: sysfs.UsbDevice):
+        """
+        Switch the medium on just long enough to read its partition table.
+
+        Same discipline as the behavioural quarantine: authorize, look, and put
+        it straight back to blocked before anyone is asked anything. The medium
+        is opened read-only and never mounted, so the kernel's filesystem
+        drivers never see its contents.
+        """
+        print("  This is a storage device. Cerberus will read its partition")
+        print("  table directly, without mounting it.")
+
+        try:
+            sysfs.set_authorized(dev.syspath, 1)
+        except OSError as exc:
+            print(f"  (could not switch it on to look: {exc})")
+            return None
+
+        medium = None
+        try:
+            # The block device takes a moment to appear after authorization.
+            devices = []
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not devices:
+                devices = storage.find_block_devices(dev.syspath)
+                if not devices:
+                    time.sleep(0.1)
+            if devices:
+                medium = storage.inspect(devices[0],
+                                         open_fn=sysfs.open_block_device)
+            else:
+                medium = storage.MediumReport(error="no block device appeared")
+        finally:
+            try:
+                sysfs.set_authorized(dev.syspath, 0)
+            except OSError as exc:
+                print(f"[!] could not re-block after inspection: {exc}")
+        return medium
 
     def _quarantine(self, dev: sysfs.UsbDevice):
         """
@@ -257,6 +496,9 @@ class Cerberus:
 
     def _on_remove(self, sys_path: str) -> None:
         name = Path(sys_path).name
+        if name in self.pending:
+            del self.pending[name]
+            print(f"[*] {name} removed while held; question withdrawn")
         if name not in self.known:
             print(f"[*] removed: {name}")
 
@@ -297,9 +539,16 @@ class Cerberus:
         """
         critical = rules.worst(findings) == rules.Severity.CRITICAL
         if critical:
+            # No "always" option here on purpose. Remembering a device that
+            # matches an attack pattern is not a choice worth offering in one
+            # keystroke; if it really is a false positive, the user can trust
+            # it deliberately with --trust after understanding why it fired.
             prompt = ("  This device matches an attack pattern.\n"
                       "  Type the word 'authorize' to allow it, anything else "
                       "to reject: ")
+        elif self.trust is not None:
+            prompt = ("  Authorize this device? "
+                      "[y]es once / [a]lways / [N]o: ")
         else:
             prompt = "  Authorize this device? [y/N] "
         if self.timeout > 0 and not critical:
@@ -330,6 +579,9 @@ class Cerberus:
         answer = answer.strip().lower()
         if critical:
             return answer == "authorize"
+        if answer in ("a", "always") and self.trust is not None:
+            self._remember = True
+            return True
         return answer in ("y", "yes")
 
     def _record(self, decision: Decision, findings=()) -> None:
@@ -378,9 +630,28 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
           policy: Optional[safety.SafetyPolicy] = None,
           ledger_path: Optional[Path] = None,
           capture_payload: bool = False,
-          watchdog_timeout: float = 0.0) -> None:
+          watchdog_timeout: float = 0.0,
+          trust_path: Optional[Path] = None,
+          inspect_storage: bool = True,
+          lock_policy: str = session_mod.POLICY_QUEUE,
+          force_locked: Optional[bool] = None) -> None:
     """Wire the gate, the safety net and the loop together."""
     policy = policy or safety.SafetyPolicy()
+    monitor = session_mod.detect(force_locked)
+    if lock_policy != session_mod.POLICY_IGNORE:
+        print(f"  - screen-lock policy: {lock_policy} "
+              f"via {monitor.describe}")
+
+    trust_store = None
+    if trust_path is not None:
+        trust_store = trust_mod.TrustStore(trust_path)
+        if trust_store.load_error:
+            print(f"[!] trust store unreadable ({trust_store.load_error}); "
+                  f"nothing will be treated as trusted")
+        elif trust_store.devices:
+            print(f"  - {len(trust_store.devices)} remembered device(s) will "
+                  f"be admitted without asking")
+
     store = None
     if ledger_path is not None:
         store = ledger_mod.Ledger(ledger_path)
@@ -415,7 +686,9 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
                           rule_config=rule_config, observe=observe,
                           policy=policy, ledger=store,
                           capture_payload=capture_payload, watchdog=dog,
-                          stop_event=stop_event)
+                          stop_event=stop_event, trust_store=trust_store,
+                          inspect_storage=inspect_storage, monitor=monitor,
+                          lock_policy=lock_policy)
         engine.snapshot()
         try:
             engine.run()
@@ -424,4 +697,5 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
         finally:
             if dog:
                 dog.stop()
+            engine.report_blocked_on_exit()
             print("[*] Reopening the gate:")

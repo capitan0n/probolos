@@ -201,3 +201,60 @@ def render_behaviour(obs, findings: Sequence[rules.Finding]) -> str:
 
     out.append("└" + "─" * WIDTH + "┘")
     return "\n".join(out)
+
+
+def render_medium(medium, findings: Sequence[rules.Finding]) -> str:
+    """
+    Report block for stage 4: what is physically on the medium.
+
+    Presented separately from the identity block for the same reason as the
+    behaviour block -- it is independent evidence, gathered a different way,
+    and a device that passes the first can fail this one.
+    """
+    from . import storage as storage_mod
+
+    out: List[str] = []
+    out.append("┌" + "─" * WIDTH + "┐")
+    out.append(_line("WHAT IS ON THE MEDIUM (read-only, never mounted)"))
+    out.append(_rule())
+
+    if medium.error:
+        out.append(_line(f"Not inspected: {medium.error}"))
+    else:
+        size = medium.size_sectors
+        if size:
+            gib = size * storage_mod.SECTOR / (1024 ** 3)
+            out.append(_line(f"Capacity     : {gib:.1f} GiB ({size} sectors)"))
+        out.append(_line(f"Layout       : {medium.scheme.upper()}"))
+
+        real = [p for p in medium.partitions
+                if p.type_byte != storage_mod.PROTECTIVE_MBR_TYPE]
+        if not real and medium.scheme == "none":
+            fs = medium.signatures.get(-1)
+            out.append(_line(f"No partition table; contains {fs or 'no known'} "
+                             f"filesystem"))
+        for part in real:
+            seen = medium.signatures.get(part.index)
+            boot = " [bootable]" if part.bootable else ""
+            out.append(_line(
+                f"Partition {part.index + 1}  : "
+                f"{storage_mod.type_name(part.type_byte)}{boot}"))
+            out.append(_line(
+                f"               starts at sector {part.start_lba}, "
+                f"{part.sectors} sectors"))
+            if seen:
+                out.append(_line(f"               contains {seen}"))
+
+    if findings:
+        out.append(_rule())
+        for finding in findings:
+            out.extend(_finding_lines(finding))
+            if finding is not findings[-1]:
+                out.append(_line())
+
+    out.append("└" + "─" * WIDTH + "┘")
+    out.append("")
+    out.append("  Only the partition table and filesystem signatures were")
+    out.append("  read. No files were opened and nothing was mounted, so the")
+    out.append("  kernel's filesystem drivers never saw this medium.")
+    return "\n".join(out)

@@ -53,10 +53,26 @@ class AuthorizationGate:
             if current is None:
                 self.log(f"  ! {hub.name}: no authorized_default, skipping")
                 continue
-            # Remember the exact original value. Some kernels use 2
-            # ("authorize internal ports only"); blindly restoring 1 would
-            # silently weaken the machine's configuration.
-            self._original[hub] = current
+            # Remember the original value so it can be put back exactly. Some
+            # kernels use 2 ("authorize internal ports only"), and blindly
+            # restoring 1 would silently weaken the machine's configuration.
+            #
+            # EXCEPT when we find it already at 0. A hub sitting at 0 before we
+            # touched anything is not a configuration anyone chose -- it is the
+            # residue of a previous run that died without restoring. Recording
+            # 0 as "the original" and faithfully putting it back on exit would
+            # make the lockout permanent, with each run politely preserving the
+            # damage done by the last. So 0 is treated as "no valid previous
+            # state" and 1 is restored instead, which is the only value that
+            # leaves the machine usable.
+            if current == 0:
+                self.log(f"  ! {hub.name}: was already closed "
+                         f"(authorized_default=0) — this is leftover from a "
+                         f"run that did not shut down cleanly; will restore "
+                         f"to 1, not 0")
+                self._original[hub] = 1
+            else:
+                self._original[hub] = current
             if not self.dry_run:
                 sysfs.set_authorized_default(hub, 0)
             state = "would close" if self.dry_run else "closed"

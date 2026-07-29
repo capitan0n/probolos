@@ -84,29 +84,49 @@ class TestGatePathValidation(unittest.TestCase):
             gate_server.GateServer._safe_usb_path(
                 "/sys/bus/usb/devices/does-not-exist-9-9"))
 
-    def test_raw_devices_path_is_refused(self):
+    def test_orphan_devices_path_is_refused(self):
         """
-        A caller must reference USB nodes through the bus view, not by handing
-        us a resolved /sys/devices/ path directly -- otherwise it could reach a
-        non-USB device that merely lives under /sys/devices/.
+        A device under /sys/devices/ that is NOT linked from the USB bus view
+        must be refused: only genuine USB nodes are reachable both ways.
         """
         self.assertIsNone(
             gate_server.GateServer._safe_usb_path(
-                "/sys/devices/pci0000:00/usb1"))
+                "/sys/devices/pci0000:00/some-non-usb-device"))
 
-    def test_root_hub_symlink_shape_passes_validation_conditions(self):
+    def test_both_path_forms_accepted_for_a_real_usb_node(self):
         """
-        Root hubs are symlinks from the bus view into /sys/devices/. The bug in
-        0.6.0 was that following the symlink took the path out of the bus prefix
-        and it was wrongly refused. A path under the bus view that resolves into
-        /sys/devices/ must be accepted (subject to is_dir). We can only check
-        the prefix logic here since the node does not exist in CI, but that is
-        exactly the logic that regressed.
+        The 0.6.0 regression: paths arrive both as the bus-view symlink
+        (sysfs.list_devices) and as the resolved /sys/devices path (pyudev
+        sys_path) for the SAME device. Both must be accepted; a non-USB device
+        under /sys/devices with no bus link must not. Uses a synthetic tree so
+        it runs without real USB hardware.
         """
         import os
-        normalized = os.path.normpath("/sys/bus/usb/devices/usb1")
-        self.assertTrue((normalized + "/").startswith(
-            gate_server.USB_LINK_PREFIX))
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "sys" / "devices" / "usb5" / "5-1"
+            real.mkdir(parents=True)
+            busdir = Path(tmp) / "sys" / "bus" / "usb" / "devices"
+            busdir.mkdir(parents=True)
+            (busdir / "5-1").symlink_to(real)
+            orphan = Path(tmp) / "sys" / "devices" / "platform" / "evil"
+            orphan.mkdir(parents=True)
+
+            with mock.patch.object(gate_server, "USB_LINK_PREFIX",
+                                   str(busdir) + "/"), \
+                 mock.patch.object(gate_server, "USB_REAL_PREFIX",
+                                   str(Path(tmp) / "sys" / "devices") + "/"):
+                G = gate_server.GateServer
+                # both forms of the real device resolve and are accepted
+                self.assertEqual(G._safe_usb_path(str(busdir / "5-1")),
+                                 Path(os.path.realpath(real)))
+                self.assertEqual(G._safe_usb_path(str(real)),
+                                 Path(os.path.realpath(real)))
+                # the orphan (no bus link) is refused
+                self.assertIsNone(G._safe_usb_path(str(orphan)))
 
 
 class TestGateRefusesBadRequests(unittest.TestCase):

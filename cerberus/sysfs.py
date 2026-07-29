@@ -218,6 +218,14 @@ class _DirectBackend:
     def set_default(self, hub: Path, value: int) -> None:
         (hub / "authorized_default").write_text(str(value))
 
+    def open_input(self, node_path) -> int:
+        import os
+        return os.open(str(node_path), os.O_RDONLY | os.O_NONBLOCK)
+
+    def open_block(self, device_path) -> int:
+        import os
+        return os.open(str(device_path), os.O_RDONLY)
+
 
 _backend = _DirectBackend()
 
@@ -244,6 +252,24 @@ def set_authorized(syspath: Path, value: int) -> None:
 
 def get_authorized_default(hub: Path) -> Optional[int]:
     return read_int_attr(hub, "authorized_default")
+
+
+def open_input_node(node_path) -> int:
+    """
+    Open an input event node and return its file descriptor.
+
+    Routed through the backend for the same reason as the authorize calls: an
+    unprivileged analyzer cannot open /dev/input/eventN itself, so under
+    privilege separation this becomes a request to the root gate, which opens
+    it read-only and passes the descriptor back over SCM_RIGHTS. The caller
+    gets a working fd either way and does not need to know which happened.
+    """
+    return _backend.open_input(node_path)
+
+
+def open_block_device(device_path) -> int:
+    """Open a whole disk read-only, directly or via the gate."""
+    return _backend.open_block(device_path)
 
 
 def set_authorized_default(hub: Path, value: int) -> None:

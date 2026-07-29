@@ -67,13 +67,15 @@ question that is about itself.**
 Manjaro / Arch:
 
 ```bash
-sudo pacman -S python-pyudev python-evdev
+sudo pacman -S python-pyudev
 ```
 
-`python-pyudev` is required. `python-evdev` is required only for stage 3;
-without it Cerberus still runs and says plainly that behaviour could not be
-observed, rather than silently skipping the check. `python-yaml` is optional
-and only needed to override rule severities from a file.
+`python-pyudev` is the only requirement. Behavioural quarantine talks to the
+kernel's evdev interface directly (one ioctl and a fixed-size struct), which
+removed the `python-evdev` dependency and, more importantly, made the same
+code path work under privilege separation — where the input node arrives as an
+already-open descriptor from the gate rather than a path to be opened.
+`python-yaml` is optional, for overriding rule severities from a file.
 
 ## Usage
 
@@ -146,7 +148,9 @@ which keystrokes can reach your session. The kernel must probe the device, bind
 
 Cerberus starts its udev listener *before* authorizing so it is already waiting
 when the node appears, and it **measures and prints the actual gap** in every
-report. Typical values are 10-20 ms. Most off-the-shelf payloads wait several
+report. Measured on real hardware (a low-speed USB mouse on a Linux 6.12
+laptop): **41-45 ms**. That is larger than the 10-20 ms first estimated here,
+which is exactly why the number is measured and printed rather than assumed. Most off-the-shelf payloads wait several
 hundred milliseconds before typing, because firing earlier loses keystrokes to
 an incomplete enumeration; against those, the grab wins. Against a payload
 tuned to fire at the earliest possible instant, it may not.
@@ -199,6 +203,86 @@ descriptor set clones `bMaxPower` with it, so these rules catch only the
 careless and are all NOTICE or WARNING. Measuring real consumption needs
 external hardware such as an INA219, and is well covered in the literature —
 see PowerID (INFOCOM 2023) and subsequent work.
+
+## When nobody is at the machine
+
+The most realistic physical-access attack is not someone plugging a device in
+while you watch — it is someone doing it while you are away, and letting you
+approve it distractedly along with everything else when you get back.
+
+So while the screen is locked, Cerberus admits nothing, **including remembered
+devices**, and — importantly — does not power the device up at all. Neither the
+behavioural quarantine nor the storage scan runs, because both require
+switching the device on, and energising unknown hardware in an empty room is
+the situation being defended against.
+
+The device is held, not rejected. It stays blocked, goes into a queue, and the
+question is put the moment the screen unlocks — so nothing has to be unplugged
+and replugged just because you stepped away.
+
+**A held device is asked about even if it is remembered.** Trust was granted
+while you were present and watching; a device that turned up while nobody was
+there has not earned the shortcut. Without this, deferring the question would
+quietly become approving it, and "nothing is admitted while you are away" would
+really mean "nothing until you get back, then everything". The same applies to
+devices found still blocked from an earlier run.
+
+```bash
+sudo python -m cerberus --lock-policy queue    # hold and ask on unlock (default)
+sudo python -m cerberus --lock-policy deny     # refuse outright, do not ask later
+sudo python -m cerberus --lock-policy ignore   # take no notice of lock state
+sudo python -m cerberus --force-locked         # test the policy without locking
+```
+
+Lock state comes from systemd-logind's `LockedHint` over the system bus, not
+from the desktop's own screensaver interface — the analyzer runs unprivileged
+and outside your session, so logind is the only vantage point it has. If the
+state cannot be determined, Cerberus assumes unlocked and **says so at
+startup**: a protection that is not working must never look like one that is.
+
+## Remembered devices
+
+Being asked about your own mouse twice a day is how a security tool gets turned
+off. Approving a device with `a` (always) remembers it, and it is admitted
+silently next time.
+
+Three properties make this narrower than a typical allowlist:
+
+- **What is trusted is an exact device**, keyed on identity *and* a SHA-256 of
+  its raw descriptors. A cloned VID/PID is not the trusted device. This is the
+  same evidence the drift detector uses, applied where it matters most.
+- **Trust never overrides evidence.** A remembered device that produces a
+  CRITICAL finding is still stopped and still asked about. Trust decides
+  whether to ask a question with no troubling answer; it cannot silence one
+  that has. The `always` option is not even offered for a CRITICAL device.
+- **Trust is visible and revocable**: `--trusted` lists it, `--forget` removes
+  it. You can always answer "what does this machine let in without asking?"
+
+```bash
+sudo python -m cerberus --trusted          # what is remembered
+sudo python -m cerberus --forget kingston  # revoke by name
+sudo python -m cerberus --no-trust         # ask about everything, once
+```
+
+## Looking inside storage (stage 4)
+
+Mounting a device hands its data to a kernel filesystem driver written on the
+assumption that the disk is not hostile — and a desktop session will automount
+the instant a device is authorized. So Cerberus reads the raw block device
+itself, read-only, and parses only the partition table and filesystem
+signatures: structures simple enough to parse safely, with every length
+checked. Nothing is mounted and no file is opened.
+
+It looks for the medium contradicting itself: a partition extending past the
+end of the device (impossible on honest media, and the signature of a drive
+lying about its capacity), partitions overlapping each other, a declared
+partition type that disagrees with the filesystem actually written there, or an
+unusually large unallocated gap before the first partition.
+
+It deliberately does **not** walk directories or hunt for `autorun.inf`. That
+would mean implementing FAT and NTFS parsing — reintroducing the very attack
+surface this stage exists to avoid. Content inspection at that depth belongs in
+a sandbox, not in the admission path.
 
 ## The ledger: identity across time
 
@@ -269,8 +353,12 @@ honestly, and see whether the distributions separate.
 - [ ] **`dummy_hcd` / `raw-gadget` testbed in CI.** Synthetic malicious devices
       on every commit, so the rules face negative samples and not only three
       clean fixtures.
-- [ ] **Stage 4 — read-only storage inspection.** Raw `blkid -p` / `dumpe2fs`
-      examination of the block device without ever mounting it.
+- [x] **Stage 4 — read-only storage inspection.** The partition table and
+      filesystem signatures are parsed directly from the raw block device,
+      opened read-only and never mounted, so the kernel's filesystem drivers
+      never see the medium.
+- [x] **Remembered devices.** Trust is pinned to identity AND descriptor hash,
+      never overrides a CRITICAL finding, and is inspectable and revocable.
 - [ ] **Sandbox as a third answer.** Deny / open in an ephemeral VM /
       authorize, with the VM's observations feeding back into the prompt.
 

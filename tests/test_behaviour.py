@@ -141,3 +141,129 @@ class TestStatistics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestInputNodeDiscovery(unittest.TestCase):
+    """
+    The bug that hid itself: find_input_nodes compared the bus-view USB path
+    (/sys/bus/usb/devices/3-1, a symlink) against udev's already-resolved
+    sys_path (/sys/devices/pci.../3-1/...). They never matched, so quarantine
+    found no nodes and reported "nothing to observe" for every real device --
+    an absence of evidence that looked like evidence of absence.
+    """
+
+    def test_bus_view_path_matches_resolved_udev_paths(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from cerberus import quarantine
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "devices" / "pci0000:00" / "3-1"
+            (real / "3-1:1.0" / "input" / "input25" / "event5").mkdir(parents=True)
+            busdir = Path(tmp) / "bus" / "usb" / "devices"
+            busdir.mkdir(parents=True)
+            (busdir / "3-1").symlink_to(real)
+
+            class FakeUdevDevice:
+                def __init__(self, node, sys_path):
+                    self.device_node = node
+                    self.sys_path = sys_path
+
+            class FakeContext:
+                def list_devices(self, subsystem=None):
+                    return [
+                        FakeUdevDevice(
+                            "/dev/input/event5",
+                            str(real / "3-1:1.0" / "input" / "input25" / "event5")),
+                        # an unrelated device that must NOT match
+                        FakeUdevDevice("/dev/input/event0",
+                                       str(Path(tmp) / "devices" / "platform" / "i8042")),
+                    ]
+
+            with mock.patch.object(quarantine, "pyudev", object()):
+                found = quarantine.find_input_nodes(busdir / "3-1",
+                                                    context=FakeContext())
+
+            self.assertEqual(found, ["/dev/input/event5"],
+                             "bus-view path must match resolved udev sys_paths")
+
+    def test_unrelated_devices_are_not_claimed(self):
+        """
+        Grabbing the wrong node would capture the user's real keyboard and lock
+        them out of their own machine, so the ancestry test must be strict.
+        """
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from cerberus import quarantine
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ours = Path(tmp) / "devices" / "usb1" / "1-1"
+            ours.mkdir(parents=True)
+            theirs = Path(tmp) / "devices" / "usb1" / "1-2" / "input" / "event9"
+            theirs.mkdir(parents=True)
+
+            class FakeUdevDevice:
+                device_node = "/dev/input/event9"
+                sys_path = str(theirs)
+
+            class FakeContext:
+                def list_devices(self, subsystem=None):
+                    return [FakeUdevDevice()]
+
+            with mock.patch.object(quarantine, "pyudev", object()):
+                found = quarantine.find_input_nodes(ours, context=FakeContext())
+
+            self.assertEqual(found, [])
+
+
+class TestNoLiveWindowAfterObservation(unittest.TestCase):
+    """
+    Found by running it: after the observation window ended, the grab was
+    released but the device stayed authorized while the human read the report.
+    A malicious keyboard could stay silent for the three seconds and then type
+    freely during the prompt -- defeating quarantine by simply waiting.
+
+    The device must be blocked again the instant observation ends, and only
+    authorized if the human approves.
+    """
+
+    def test_device_is_reblocked_before_the_prompt(self):
+        from pathlib import Path
+        from unittest import mock
+        from cerberus import daemon as daemon_mod, quarantine, sysfs, usbclass
+
+        dev = mock.Mock(spec=sysfs.UsbDevice)
+        dev.name = "1-4"
+        dev.syspath = Path("/sys/bus/usb/devices/1-4")
+        dev.kinds = [usbclass.KIND_INPUT]
+        dev.is_root_hub = False
+        dev.claims = ["KEYBOARD"]
+        dev.vendor_id, dev.product_id = "1234", "5678"
+        dev.label.return_value = "Test Keyboard"
+
+        engine = daemon_mod.Cerberus(observe=1.0)
+        calls = []
+
+        obs = quarantine.Observation(duration=1.0, race_window=0.01,
+                                     nodes=["/dev/input/event9"],
+                                     grabbed=["/dev/input/event9"])
+
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized",
+                               side_effect=lambda p, v: calls.append(v)), \
+             mock.patch.object(engine, "_quarantine", return_value=obs), \
+             mock.patch.object(engine, "_ask", return_value=False), \
+             mock.patch.object(engine, "_load_with_retry", return_value=dev), \
+             mock.patch.object(daemon_mod.report, "render", return_value=""), \
+             mock.patch.object(daemon_mod.report, "render_behaviour",
+                               return_value=""), \
+             mock.patch.object(daemon_mod.report, "one_liner", return_value=""):
+            engine._on_add("/sys/bus/usb/devices/1-4")
+
+        # First write after observation must be 0 (re-block), never 1.
+        self.assertTrue(calls, "no authorization writes were made")
+        self.assertEqual(calls[0], 0,
+                         "device must be re-blocked immediately after "
+                         "observation, before the human is asked")

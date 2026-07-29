@@ -49,20 +49,57 @@ way for Cerberus to leave a keyboard permanently captured.
 
 from __future__ import annotations
 
+import fcntl
+import os
+import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-try:
-    import evdev
-except ImportError:  # pragma: no cover
-    evdev = None
+from . import sysfs
 
 try:
     import pyudev
 except ImportError:  # pragma: no cover
     pyudev = None
+
+# --------------------------------------------------------------------------
+# evdev, done directly.
+#
+# We used to depend on python-evdev, but it opens the device node itself from a
+# path -- which is impossible for the unprivileged analyzer under privilege
+# separation, where the node arrives as an already-open file descriptor passed
+# from the root gate. Talking to the kernel ourselves removes the dependency
+# AND leaves one code path that works in both modes, instead of two that drift.
+#
+# The interface is small: one ioctl to take exclusive control, and a fixed
+# 24-byte struct to read.
+# --------------------------------------------------------------------------
+
+# EVIOCGRAB = _IOW('E', 0x90, int)
+EVIOCGRAB = (1 << 30) | (ord('E') << 8) | 0x90 | (4 << 16)
+
+# struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
+# On 64-bit Linux: two longs for the timeval, then 2+2+4.
+INPUT_EVENT_FORMAT = "llHHi"
+INPUT_EVENT_SIZE = struct.calcsize(INPUT_EVENT_FORMAT)
+
+EV_KEY = 0x01
+EV_REL = 0x02
+EV_ABS = 0x03
+
+
+def _grab(fd: int) -> None:
+    """Take exclusive control of an input device. Events then reach only us."""
+    fcntl.ioctl(fd, EVIOCGRAB, 1)
+
+
+def _ungrab(fd: int) -> None:
+    try:
+        fcntl.ioctl(fd, EVIOCGRAB, 0)
+    except OSError:
+        pass
 
 
 # Mouse buttons are EV_KEY events too. BTN_* occupies 0x100-0x151; below and
@@ -125,7 +162,8 @@ class Observation:
 
 
 def available() -> bool:
-    return evdev is not None and pyudev is not None
+    """Only pyudev is required now; the evdev side is handled directly."""
+    return pyudev is not None
 
 
 def find_input_nodes(usb_syspath: Path, context=None) -> List[str]:
@@ -140,14 +178,19 @@ def find_input_nodes(usb_syspath: Path, context=None) -> List[str]:
     if pyudev is None:
         return []
     ctx = context or pyudev.Context()
-    target = str(usb_syspath)
+    # Both sides must be compared in the SAME form. usb_syspath usually arrives
+    # as the bus view (/sys/bus/usb/devices/3-1, a symlink), while udev reports
+    # sys_path already resolved (/sys/devices/pci.../3-1). Comparing them
+    # directly never matches, so quarantine silently found no input nodes and
+    # reported "nothing to observe" for every real device -- a bug that hid
+    # itself by looking like an absence of evidence.
+    target = os.path.realpath(str(usb_syspath))
     nodes = []
     for dev in ctx.list_devices(subsystem="input"):
         node = dev.device_node
         if not node or not node.startswith("/dev/input/event"):
             continue
-        # ancestry check: is this input node underneath our USB device?
-        if str(dev.sys_path).startswith(target + "/"):
+        if os.path.realpath(str(dev.sys_path)).startswith(target + "/"):
             nodes.append(node)
     return sorted(nodes)
 
@@ -165,8 +208,8 @@ def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
     obs = Observation(duration=duration, capture=capture)
 
     if not available():
-        obs.error = ("python-evdev and python-pyudev are required "
-                     "(Manjaro: sudo pacman -S python-evdev python-pyudev)")
+        obs.error = ("python-pyudev is required "
+                     "(Manjaro: sudo pacman -S python-pyudev)")
         return obs
 
     ctx = pyudev.Context()
@@ -198,13 +241,16 @@ def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
             seen.add(node)
             obs.nodes.append(node)
             try:
-                dev = evdev.InputDevice(node)
-                dev.grab()
-                devices.append(dev)
+                # Opening goes through the backend: direct when running as a
+                # single root process, or a request to the gate under privsep,
+                # which returns an already-open read-only descriptor.
+                fd = sysfs.open_input_node(node)
+                _grab(fd)
+                devices.append(fd)
                 obs.grabbed.append(node)
                 if obs.race_window == 0.0:
                     obs.race_window = time.monotonic() - authorized_at
-            except (OSError, PermissionError) as exc:
+            except OSError as exc:
                 obs.grab_failures.append(f"{node}: {exc}")
 
         # Once we hold something, stop waiting for stragglers: extra dwell here
@@ -219,63 +265,69 @@ def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
     try:
         _collect(devices, obs, duration)
     finally:
-        # Releasing is best-effort: closing the fd releases the grab anyway.
-        for dev in devices:
+        # Releasing is best-effort: closing the fd releases the grab anyway,
+        # which is also why a crash can never leave a keyboard captured.
+        for fd in devices:
+            _ungrab(fd)
             try:
-                dev.ungrab()
-            except OSError:
-                pass
-            try:
-                dev.close()
+                os.close(fd)
             except OSError:
                 pass
 
     return obs
 
 
-def _collect(devices, obs: Observation, duration: float) -> None:
-    """Read events from the grabbed nodes for `duration` seconds."""
+def _collect(fds, obs: Observation, duration: float) -> None:
+    """Read events from the grabbed descriptors for `duration` seconds."""
     import select
 
-    fd_map = {dev.fd: dev for dev in devices}
+    live = set(fds)
     start = time.monotonic()
     end = start + duration
 
-    while True:
+    while live:
         remaining = end - time.monotonic()
         if remaining <= 0:
             break
-        ready, _, _ = select.select(list(fd_map), [], [], remaining)
+        ready, _, _ = select.select(list(live), [], [], remaining)
         for fd in ready:
-            dev = fd_map[fd]
             try:
-                for event in dev.read():
-                    _record_event(event, obs, start)
+                data = os.read(fd, INPUT_EVENT_SIZE * 64)
             except BlockingIOError:
                 continue
             except OSError:
                 # Device yanked out mid-observation. Not an error: unplugging
                 # is a perfectly normal thing for a person to do.
-                fd_map.pop(fd, None)
-        if not fd_map:
-            break
+                live.discard(fd)
+                continue
+            if not data:
+                live.discard(fd)
+                continue
+            # A read can return several events; they are fixed-size records.
+            for offset in range(0, len(data) - INPUT_EVENT_SIZE + 1,
+                                INPUT_EVENT_SIZE):
+                _sec, _usec, etype, code, value = struct.unpack(
+                    INPUT_EVENT_FORMAT,
+                    data[offset:offset + INPUT_EVENT_SIZE])
+                _record_event(etype, code, value, obs, start)
 
 
-def _record_event(event, obs: Observation, start: float) -> None:
+def _record_event(etype: int, code: int, value: int,
+                  obs: Observation, start: float) -> None:
     offset = time.monotonic() - start
-    if event.type == evdev.ecodes.EV_KEY and event.value == 1:
+    if etype == EV_KEY and value == 1:
         # value 1 == key down. Releases and auto-repeats are excluded so the
         # timing statistics measure intent, not key-hold duration.
-        if is_keyboard_key(event.code):
+        if is_keyboard_key(code):
             obs.key_presses.append(KeyPress(
                 timestamp=offset,
-                code=event.code if obs.capture else None))
+                code=code if obs.capture else None))
         else:
             obs.button_presses += 1
+    elif etype in (EV_REL, EV_ABS):
+        obs.motion_events += 1
 
     # Modifier state needs key-up as well as key-down, so payload capture keeps
     # the full event stream. Nothing here runs unless capture was requested.
-    if obs.capture and event.type == evdev.ecodes.EV_KEY:
-        obs.raw_events.append((offset, event.code, event.value))
-    elif event.type in (evdev.ecodes.EV_REL, evdev.ecodes.EV_ABS):
-        obs.motion_events += 1
+    if obs.capture and etype == EV_KEY:
+        obs.raw_events.append((offset, code, value))

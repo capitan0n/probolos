@@ -87,7 +87,43 @@ def drop_privileges(uid: int, gid: int) -> None:
         pass  # exactly what we want: root is unreachable now
 
 
-def start(analyzer_main, drop_to: str = "nobody", log=print) -> int:
+def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
+    """
+    Make a state directory writable by the analyzer, before privilege drops.
+
+    The analyzer runs as an unprivileged user and cannot create or write
+    /var/lib/cerberus, which is root-owned. Rather than routing ledger writes
+    through the privileged gate -- which would mean putting file I/O and a
+    serialisation format inside the trusted process, exactly what the split
+    exists to avoid -- the launcher hands ownership of one directory to the
+    analyzer while it still can.
+    """
+    import os as _os
+    directory = _os.path.dirname(_os.path.abspath(str(path)))
+    try:
+        _os.makedirs(directory, exist_ok=True)
+        _os.chown(directory, uid, gid)
+        # The directory must also be traversable and writable by the owner;
+        # a previous root-only run may have left tighter bits.
+        _os.chmod(directory, 0o700)
+        target = str(path)
+        if _os.path.exists(target):
+            _os.chown(target, uid, gid)
+            _os.chmod(target, 0o600)
+        # Stale temp files from an interrupted save would be root-owned and
+        # would block the atomic rename the ledger relies on.
+        tmp = _os.path.splitext(target)[0] + ".tmp"
+        if _os.path.exists(tmp):
+            _os.chown(tmp, uid, gid)
+        log(f"[privsep] state dir {directory} handed to uid {uid}")
+    except OSError as exc:
+        log(f"[privsep] could not prepare {directory}: {exc}\n"
+            f"[privsep] the analyzer will not be able to keep device history. "
+            f"Fix with: sudo chown -R {uid}:{gid} {directory}")
+
+
+def start(analyzer_main, drop_to: str = "nobody", log=print,
+          state_paths=()) -> int:
     """
     Fork the gate and the analyzer.
 
@@ -102,6 +138,18 @@ def start(analyzer_main, drop_to: str = "nobody", log=print) -> int:
             "in the child). Try: sudo ...")
 
     uid, gid = resolve_user(drop_to)
+
+    # Hand over any files the analyzer will need to write, while still root.
+    # Several state files usually share one directory; prepare it once.
+    seen_dirs = set()
+    for path in state_paths:
+        if not path:
+            continue
+        directory = os.path.dirname(os.path.abspath(str(path)))
+        quiet = directory in seen_dirs
+        seen_dirs.add(directory)
+        prepare_state_dir(path, uid, gid,
+                          log=(lambda *_a: None) if quiet else log)
 
     parent_sock, child_sock = socket.socketpair(
         socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -130,6 +178,20 @@ def start(analyzer_main, drop_to: str = "nobody", log=print) -> int:
 
     # ---- parent: stays root, runs the gate ----
     child_sock.close()
+
+    # Ignore terminal signals in the gate. They are delivered to the whole
+    # process group, so without this the gate would tear down its socket at the
+    # same instant the analyzer is trying to send its final restore requests
+    # through it -- producing the "Broken pipe / FAILED to restore" cascade.
+    # The gate instead keeps serving until the analyzer finishes its cleanup
+    # and closes the connection, which is what ends serve_forever() cleanly.
+    import signal
+    for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(_sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+
     log(f"[privsep] gate running as root (pid {os.getpid()}), "
         f"analyzer as {drop_to} (pid {pid})")
     try:

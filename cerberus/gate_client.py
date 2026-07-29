@@ -19,7 +19,18 @@ from typing import Optional
 from . import protocol
 
 
-class GateError(Exception):
+class GateError(OSError):
+    """
+    A failure talking to the gate.
+
+    Subclasses OSError deliberately: the daemon already handles OSError from
+    direct sysfs writes (a device removed mid-authorize raises one), and under
+    privilege separation the very same situation surfaces here instead. Making
+    GateError an OSError means every existing `except OSError` in the daemon
+    keeps working identically whether or not privsep is active -- a device that
+    vanishes mid-decision is handled the same way in both modes, rather than
+    crashing the analyzer in one of them.
+    """
     pass
 
 
@@ -71,6 +82,14 @@ class GateClient:
         if not resp.ok:
             raise GateError(f"set_default failed: {resp.status}: {resp.detail}")
 
+    def open_block(self, device_path) -> int:
+        """Ask the gate to open a whole disk read-only and return the fd."""
+        resp, fd = self._round_trip(protocol.Request(
+            protocol.REQ_OPEN_BLOCK, path=str(device_path)), expect_fd=True)
+        if not resp.ok or fd is None:
+            raise GateError(f"open_block failed: {resp.status}: {resp.detail}")
+        return fd
+
     def open_input(self, node_path) -> int:
         """
         Ask the gate to open an input node and return the received fd.
@@ -104,3 +123,9 @@ class GateBackend:
 
     def set_default(self, hub, value: int) -> None:
         self.client.set_default(hub, value)
+
+    def open_input(self, node_path) -> int:
+        return self.client.open_input(node_path)
+
+    def open_block(self, device_path) -> int:
+        return self.client.open_block(device_path)

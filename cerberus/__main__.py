@@ -14,7 +14,8 @@ import os
 import sys
 from pathlib import Path
 
-from . import daemon, gate, ledger as ledger_mod, report, rules, safety, sysfs, usbclass
+from . import (daemon, gate, ledger as ledger_mod, report, rules, safety,
+               session as session_mod, sysfs, trust as trust_mod, usbclass)
 
 BANNER = r"""
    ___         _
@@ -106,6 +107,44 @@ def cmd_release() -> None:
             print(f"  {hub.name}: authorized_default reset to 1")
 
 
+def cmd_trusted(path) -> None:
+    """Show what this machine currently lets in without asking."""
+    store = trust_mod.TrustStore(path)
+    if store.load_error:
+        sys.exit(f"trust store unreadable: {store.load_error}")
+    if not store.devices:
+        print("No remembered devices. Every device will be asked about.")
+        return
+    import datetime
+    print(f"{len(store.devices)} remembered device(s):\n")
+    for entry in store.devices.values():
+        when = datetime.datetime.fromtimestamp(entry.trusted_at)
+        print(f"  {entry.label}")
+        print(f"    identity   : {entry.identity}")
+        print(f"    descriptors: {entry.descriptor_hash[:16]}…")
+        print(f"    trusted    : {when:%Y-%m-%d %H:%M}, admitted "
+              f"{entry.times_admitted} time(s)")
+        print(f"    ports      : {', '.join(entry.ports) or '-'}")
+        print()
+
+
+def cmd_forget(path, pattern: str) -> None:
+    store = trust_mod.TrustStore(path)
+    if pattern.lower() == "all":
+        count = store.clear()
+        print(f"Forgot {count} device(s).")
+    else:
+        removed = store.forget(pattern)
+        if not removed:
+            print(f"Nothing matched {pattern!r}.")
+            return
+        for identity in removed:
+            print(f"  forgot {identity}")
+    error = store.save()
+    if error:
+        sys.exit(f"could not write trust store: {error}")
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         prog="cerberus",
@@ -152,6 +191,29 @@ def main(argv=None) -> None:
                         default=safety.DEFAULT_PANIC_FILE,
                         help="create this file from another terminal to force "
                              "the gate open")
+    parser.add_argument("--trusted", action="store_true",
+                        help="list remembered devices and exit")
+    parser.add_argument("--forget", metavar="PATTERN",
+                        help="remove remembered devices matching PATTERN "
+                             "(use 'all' to clear the store)")
+    parser.add_argument("--no-trust", action="store_true",
+                        help="ask about every device, ignore what is remembered")
+    parser.add_argument("--trust-file", type=Path, metavar="FILE",
+                        help="where remembered devices are stored")
+    parser.add_argument("--no-storage-scan", action="store_true",
+                        help="skip reading the partition table of storage "
+                             "devices (stage 4)")
+    parser.add_argument("--lock-policy", default=session_mod.POLICY_QUEUE,
+                        choices=[session_mod.POLICY_QUEUE,
+                                 session_mod.POLICY_DENY,
+                                 session_mod.POLICY_IGNORE],
+                        help="what to do when a device arrives while the "
+                             "screen is locked: hold it and ask on unlock "
+                             "(default), deny outright, or take no notice")
+    parser.add_argument("--force-locked", action="store_true",
+                        help="pretend the screen is locked (to test the policy)")
+    parser.add_argument("--force-unlocked", action="store_true",
+                        help="pretend the screen is unlocked")
     parser.add_argument("--privsep", action="store_true",
                         help="run with privilege separation: a small root gate "
                              "and an unprivileged analyzer. Recommended")
@@ -161,8 +223,13 @@ def main(argv=None) -> None:
 
     require_usb()
 
-    if args.list:
-        cmd_list(verbose=args.verbose)
+    trust_path = args.trust_file or trust_mod.default_path()
+
+    if args.trusted:
+        cmd_trusted(trust_path)
+        return
+    if args.forget:
+        cmd_forget(trust_path, args.forget)
         return
     if args.release:
         cmd_release()
@@ -174,6 +241,12 @@ def main(argv=None) -> None:
         print("[!] The gate will close: NEW USB devices will not work until")
         print("[!] you approve them here. Keep a second way in (SSH, or your")
         print("[!] built-in keyboard) while testing.\n")
+
+    forced_lock = None
+    if args.force_locked:
+        forced_lock = True
+    elif args.force_unlocked:
+        forced_lock = False
 
     rule_config = None
     if args.rules:
@@ -202,7 +275,11 @@ def main(argv=None) -> None:
                      policy=policy,
                      ledger_path=ledger_path,
                      capture_payload=args.capture_payload,
-                     watchdog_timeout=args.watchdog)
+                     watchdog_timeout=args.watchdog,
+                     trust_path=None if args.no_trust else trust_path,
+                     inspect_storage=not args.no_storage_scan,
+                     lock_policy=args.lock_policy,
+                     force_locked=forced_lock)
 
     if args.privsep:
         from . import privsep
@@ -216,7 +293,9 @@ def main(argv=None) -> None:
             return 0
 
         try:
-            rc = privsep.start(analyzer_main, drop_to=args.privsep_user)
+            rc = privsep.start(analyzer_main, drop_to=args.privsep_user,
+                               state_paths=[p for p in (ledger_path, trust_path)
+                                            if p])
         except privsep.PrivsepError as exc:
             sys.exit(f"privsep: {exc}")
         sys.exit(rc)

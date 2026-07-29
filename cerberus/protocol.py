@@ -13,6 +13,7 @@ short the list of things it will do is. That list is here:
     AUTHORIZE      set authorized=1/0 on one device path
     SET_DEFAULT    set authorized_default on one root hub
     OPEN_INPUT     open an input node read-only and pass back the fd
+    OPEN_BLOCK     open a block device read-only and pass back the fd
     PING           liveness check
 
 Nothing else. The gate refuses anything not on this list. In particular it
@@ -46,6 +47,7 @@ from typing import Optional
 REQ_AUTHORIZE = "authorize"
 REQ_SET_DEFAULT = "set_default"
 REQ_OPEN_INPUT = "open_input"
+REQ_OPEN_BLOCK = "open_block"
 REQ_PING = "ping"
 
 # Response status
@@ -72,7 +74,8 @@ class Request:
     def decode(data: bytes) -> "Request":
         obj = _load(data)
         kind = obj.get("kind")
-        if kind not in (REQ_AUTHORIZE, REQ_SET_DEFAULT, REQ_OPEN_INPUT, REQ_PING):
+        if kind not in (REQ_AUTHORIZE, REQ_SET_DEFAULT, REQ_OPEN_INPUT,
+                        REQ_OPEN_BLOCK, REQ_PING):
             raise ValueError(f"unknown request kind: {kind!r}")
         value = obj.get("value")
         if value is not None and not isinstance(value, int):

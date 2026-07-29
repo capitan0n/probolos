@@ -126,3 +126,46 @@ class TestWatchdog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestGateDoesNotPerpetuateLockout(unittest.TestCase):
+    """
+    A regression found on real hardware: after a run crashed leaving
+    authorized_default=0, the NEXT run recorded 0 as "the original value" and
+    faithfully restored 0 on exit -- so every subsequent run politely preserved
+    the lockout, and USB stayed dead until fixed by hand.
+
+    0 must be treated as "no valid previous state", not as a setting to honour.
+    """
+
+    def test_zero_is_not_recorded_as_the_state_to_restore(self):
+        from unittest import mock
+        from pathlib import Path
+        from cerberus import gate as gate_mod
+
+        hub = Path("/sys/bus/usb/devices/usb1")
+        with mock.patch.object(gate_mod.sysfs, "list_root_hubs",
+                               return_value=[hub]), \
+             mock.patch.object(gate_mod.sysfs, "get_authorized_default",
+                               return_value=0), \
+             mock.patch.object(gate_mod.sysfs, "set_authorized_default"):
+            g = gate_mod.AuthorizationGate(dry_run=True, log=lambda *a: None)
+            with g:
+                # 0 found on entry must be replaced by 1 as the restore target
+                self.assertEqual(g._original[hub], 1)
+
+    def test_a_real_setting_is_preserved_exactly(self):
+        """Value 2 (internal ports only) must be restored as 2, not as 1."""
+        from unittest import mock
+        from pathlib import Path
+        from cerberus import gate as gate_mod
+
+        hub = Path("/sys/bus/usb/devices/usb1")
+        with mock.patch.object(gate_mod.sysfs, "list_root_hubs",
+                               return_value=[hub]), \
+             mock.patch.object(gate_mod.sysfs, "get_authorized_default",
+                               return_value=2), \
+             mock.patch.object(gate_mod.sysfs, "set_authorized_default"):
+            g = gate_mod.AuthorizationGate(dry_run=True, log=lambda *a: None)
+            with g:
+                self.assertEqual(g._original[hub], 2)

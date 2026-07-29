@@ -48,6 +48,13 @@ from . import protocol
 USB_LINK_PREFIX = "/sys/bus/usb/devices/"
 USB_REAL_PREFIX = "/sys/devices/"
 INPUT_PREFIX = "/dev/input/"
+# Whole disks only: sda, sdb... never a partition (sda1) and never a mapper or
+# loop device. Cerberus inspects the medium it was handed, not whatever else
+# happens to be attached, and a partition node would let a caller reach into a
+# disk it was never asked about.
+BLOCK_PREFIX = "/dev/"
+import re as _re
+_BLOCK_NAME = _re.compile(r"^sd[a-z]+$")
 
 
 class GateServer:
@@ -68,36 +75,44 @@ class GateServer:
         """
         Confirm a path names a genuine USB device node, and return it resolved.
 
-        Two conditions, both required:
+        Paths reach us in TWO legitimate forms, and both must be accepted:
 
-          1. the path, as given, must sit under /sys/bus/usb/devices/ -- this
-             is what the analyzer is allowed to reference, and it rules out
-             asking for an arbitrary /sys/devices/ path directly;
-          2. after realpath (which follows the bus symlink into the real
-             device tree and collapses any ../), it must land under
-             /sys/devices/ and be a directory.
+          * the bus view, e.g. /sys/bus/usb/devices/5-1 (a symlink), which is
+            what sysfs.list_devices produces; and
+          * the resolved device-tree path, e.g. /sys/devices/.../5-1, which is
+            what pyudev's sys_path produces for the very same device.
 
-        Requiring BOTH means a caller cannot reach a non-USB device by handing
-        us a resolved /sys/devices/ path directly (fails 1), nor escape the USB
-        tree by symlink or traversal (fails 2). The ../ check still holds
-        because realpath is applied to the ORIGINAL string: a path like
-        /sys/bus/usb/devices/../../etc resolves out of /sys/devices/ and is
-        refused.
+        The security requirement is not "which prefix" but "is this actually a
+        USB device the kernel recognises". We enforce that structurally: after
+        realpath, the path must live under /sys/devices/ AND there must be a
+        matching entry under /sys/bus/usb/devices/ whose realpath is identical.
+        That second check is what proves it is a USB node and not some other
+        device that merely lives under /sys/devices/ -- a caller cannot forge
+        it, because only real USB devices are linked from the bus view.
+
+        Traversal is still defeated: realpath collapses ../ first, so
+        /sys/bus/usb/devices/../../etc resolves out of /sys/devices/ and fails.
         """
-        # Condition 1: the reference must be inside the USB bus view. Compare
-        # on the un-resolved path so a raw /sys/devices/... request is refused.
-        normalized = os.path.normpath(path)
-        if not (normalized + "/").startswith(USB_LINK_PREFIX):
-            return None
-        # Condition 2: resolve and confirm it lands in the real device tree.
         try:
             resolved = os.path.realpath(path)
         except OSError:
             return None
+        # Must resolve into the real device tree and be a directory.
         if not (resolved + "/").startswith(USB_REAL_PREFIX):
             return None
         p = Path(resolved)
-        return p if p.is_dir() else None
+        if not p.is_dir():
+            return None
+        # Prove it is a USB node: some entry in the bus view must resolve to
+        # exactly this path. This is the check a forged /sys/devices/ path
+        # cannot pass, because only genuine USB devices are linked there.
+        bus_view = Path(USB_LINK_PREFIX) / p.name
+        try:
+            if os.path.realpath(bus_view) == resolved:
+                return p
+        except OSError:
+            pass
+        return None
 
     @staticmethod
     def _safe_input_path(path: str) -> Optional[Path]:
@@ -112,6 +127,31 @@ class GateServer:
         # that wandered somewhere unexpected.
         return p if (p.exists() and p.name.startswith("event")) else None
 
+    @staticmethod
+    def _safe_block_path(path: str) -> Optional[Path]:
+        """
+        Confirm a path is a whole USB-attached disk node.
+
+        Deliberately narrow: only /dev/sdX with no partition suffix, and only
+        if the kernel agrees it is a block device. Read-only access to a raw
+        disk is still access to every byte on it, so this is the request that
+        most deserves a tight check.
+        """
+        import stat as _stat
+        try:
+            resolved = os.path.realpath(path)
+        except OSError:
+            return None
+        p = Path(resolved)
+        if p.parent != Path("/dev") or not _BLOCK_NAME.match(p.name):
+            return None
+        try:
+            if not _stat.S_ISBLK(os.stat(resolved).st_mode):
+                return None
+        except OSError:
+            return None
+        return p
+
     # ---- request handlers ----
 
     def _do_authorize(self, req: protocol.Request) -> protocol.Response:
@@ -119,8 +159,12 @@ class GateServer:
             return protocol.Response(protocol.ERROR, "value must be 0 or 1")
         devpath = self._safe_usb_path(req.path)
         if devpath is None:
-            return protocol.Response(protocol.DENIED,
-                                     f"path not under {USB_LINK_PREFIX}")
+            # Include the exact path and its resolved form in the denial, so a
+            # rejected request can be diagnosed instead of guessed at.
+            resolved = os.path.realpath(req.path) if req.path else "(empty)"
+            return protocol.Response(
+                protocol.DENIED,
+                f"not a USB device path: {req.path!r} -> {resolved!r}")
         try:
             (devpath / "authorized").write_text(str(req.value))
             return protocol.Response(protocol.OK)
@@ -159,6 +203,19 @@ class GateServer:
         except OSError as exc:
             return protocol.Response(protocol.ERROR, str(exc)), None
 
+    def _do_open_block(self, req: protocol.Request):
+        """Open a whole disk read-only and pass the descriptor back."""
+        node = self._safe_block_path(req.path)
+        if node is None:
+            return protocol.Response(
+                protocol.DENIED,
+                f"not a whole-disk block device: {req.path!r}"), None
+        try:
+            fd = os.open(str(node), os.O_RDONLY)
+            return protocol.Response(protocol.OK, has_fd=True), fd
+        except OSError as exc:
+            return protocol.Response(protocol.ERROR, str(exc)), None
+
     # ---- the loop ----
 
     def serve_forever(self) -> None:
@@ -186,6 +243,8 @@ class GateServer:
                 resp = self._do_set_default(req)
             elif req.kind == protocol.REQ_OPEN_INPUT:
                 resp, fd_to_send = self._do_open_input(req)
+            elif req.kind == protocol.REQ_OPEN_BLOCK:
+                resp, fd_to_send = self._do_open_block(req)
             else:
                 resp = protocol.Response(protocol.ERROR, "unhandled kind")
 

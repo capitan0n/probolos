@@ -509,3 +509,115 @@ def _coefficient_of_variation(values) -> Optional[float]:
         return None
     variance = sum((v - mean) ** 2 for v in values) / len(values)
     return (variance ** 0.5) / mean
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: judging what a storage medium says about itself
+# ---------------------------------------------------------------------------
+
+# A gap before the first partition is normal -- 1 MiB alignment (2048 sectors)
+# has been standard for over a decade, and some tools use 8 MiB. Only a gap far
+# beyond any alignment convention suggests space deliberately set aside.
+_ALIGNMENT_TOLERANCE_SECTORS = 32768        # 16 MiB
+
+
+def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Finding]:
+    """
+    Turn a raw-medium report into findings.
+
+    Everything here is a structural contradiction: the medium disagreeing with
+    itself. Nothing depends on reading files, and nothing depends on the medium
+    being honest, because every number is checked against another number rather
+    than believed.
+    """
+    cfg = config or DEFAULT_CONFIG
+    out: List[Finding] = []
+
+    def add(rule_id, severity, title, explanation):
+        if cfg.enabled(rule_id):
+            out.append(Finding(rule_id, cfg.severity(rule_id, severity),
+                               title, explanation))
+
+    if report is None:
+        return out
+
+    if report.error:
+        add("storage-unreadable", Severity.NOTICE,
+            "The medium could not be read",
+            f"{report.error}. Its contents were not examined, so this device "
+            "was judged on its declared identity alone.")
+        return out
+
+    from . import storage as storage_mod
+
+    partitions = [p for p in report.partitions
+                  if p.type_byte != storage_mod.PROTECTIVE_MBR_TYPE]
+    size = report.size_sectors
+
+    # -- 1. A partition that does not fit on the disk it claims to be on -----
+    if size:
+        for part in partitions:
+            if part.end_lba > size:
+                over = part.end_lba - size
+                add("partition-beyond-end-of-device", Severity.WARNING,
+                    "A partition claims space past the end of the device",
+                    f"Partition {part.index + 1} ends at sector "
+                    f"{part.end_lba} on a device of {size} sectors, "
+                    f"{over} sectors too far. This cannot happen on honestly "
+                    "written media; it is how a device lies about its own "
+                    "capacity, and reading it will not return what was "
+                    "written.")
+                break
+
+    # -- 2. Partitions that overlap each other -------------------------------
+    ordered = sorted(partitions, key=lambda p: p.start_lba)
+    for earlier, later in zip(ordered, ordered[1:]):
+        if later.start_lba < earlier.end_lba:
+            add("overlapping-partitions", Severity.WARNING,
+                "Two partitions claim the same sectors",
+                f"Partition {earlier.index + 1} runs to sector "
+                f"{earlier.end_lba} while partition {later.index + 1} starts "
+                f"at {later.start_lba}. Overlapping partitions are impossible "
+                "to produce by ordinary formatting and mean the two views of "
+                "the medium disagree about what is stored where.")
+            break
+
+    # -- 3. Declared type versus what is actually written --------------------
+    for part in partitions:
+        seen = report.signatures.get(part.index)
+        expected = storage_mod.expected_filesystems(part.type_byte)
+        if seen and expected and seen not in expected:
+            add("filesystem-type-mismatch", Severity.NOTICE,
+                "A partition contains something other than it declares",
+                f"Partition {part.index + 1} is declared as "
+                f"{storage_mod.type_name(part.type_byte)} but contains a "
+                f"{seen} signature. Usually this is a medium that was "
+                "reformatted without the partition type being updated, which "
+                "is harmless; it is reported because the two statements do "
+                "not agree.")
+            break
+
+    # -- 4. Unallocated space before the first partition ---------------------
+    if partitions:
+        first = min(partitions, key=lambda p: p.start_lba)
+        if first.start_lba > _ALIGNMENT_TOLERANCE_SECTORS:
+            mib = first.start_lba * storage_mod.SECTOR / (1024 * 1024)
+            add("large-unallocated-gap", Severity.NOTICE,
+                "A large unused area sits before the first partition",
+                f"The first partition begins {mib:.1f} MiB into the device. "
+                "Alignment normally accounts for 1 to 8 MiB. A much larger "
+                "gap is space no filesystem describes, which is where data "
+                "would go if it were meant not to be found by ordinary tools.")
+
+    # -- 5. A GPT that contradicts its own protective MBR --------------------
+    if report.scheme == "gpt":
+        protective = [p for p in report.partitions
+                      if p.type_byte == storage_mod.PROTECTIVE_MBR_TYPE]
+        if not protective:
+            add("gpt-without-protective-mbr", Severity.NOTICE,
+                "GPT header present without a protective MBR",
+                "A GPT-partitioned medium normally carries a protective MBR "
+                "so that older tools do not treat it as unpartitioned. Its "
+                "absence is unusual, though some tools produce it.")
+
+    return out

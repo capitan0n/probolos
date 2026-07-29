@@ -104,6 +104,7 @@ class Ledger:
         self.path = Path(path)
         self.entries: Dict[str, Entry] = {}
         self.load_error: Optional[str] = None
+        self._last_save_error: Optional[str] = None
         self.load()
 
     # ---------- persistence ----------
@@ -126,7 +127,13 @@ class Ledger:
             self.entries[key] = Entry(**raw)
 
     def save(self) -> Optional[str]:
-        """Write atomically. Returns an error string, or None on success."""
+        """
+        Write atomically. Returns an error string, or None on success.
+
+        A repeated failure is reported only once: an unwritable ledger is a
+        single condition, and printing it for every device attachment would
+        bury the findings the user actually needs to read.
+        """
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
@@ -140,7 +147,11 @@ class Ledger:
             tmp.replace(self.path)
             return None
         except OSError as exc:
-            return str(exc)
+            message = str(exc)
+            if message == self._last_save_error:
+                return None          # already reported; stay quiet
+            self._last_save_error = message
+            return message
 
     # ---------- use ----------
 
