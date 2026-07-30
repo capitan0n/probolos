@@ -1,0 +1,89 @@
+[Unit]
+Description=Cerberus USB authorization gate
+Documentation=https://github.com/capitan0n/cerberus
+# udev must be up: the whole design depends on receiving attach events, and
+# starting before it would mean missing devices attached during boot.
+After=systemd-udevd.service systemd-logind.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+# --privsep is not optional here. As a long-running service the analyzer would
+# otherwise sit as root for weeks; the split keeps that surface to a small
+# audited gate.
+ExecStart=/usr/bin/python3 -m cerberus --privsep --agent --timeout 0
+Restart=on-failure
+RestartSec=5
+
+# ---------------------------------------------------------------------------
+# Sandboxing.
+#
+# The gate legitimately needs root, so the question is not whether to drop
+# privilege -- privsep already does that internally -- but how much of the
+# system root can still reach. Each line below removes something Cerberus has
+# no business touching, so a compromise of even the privileged half is boxed in.
+#
+# What is deliberately NOT restricted is explained inline: over-tightening a
+# unit until the service silently stops working is worse than not tightening it.
+# ---------------------------------------------------------------------------
+
+# Filesystem: everything read-only except the two paths that must be written.
+ProtectSystem=strict
+ProtectHome=yes
+StateDirectory=cerberus
+StateDirectoryMode=0700
+RuntimeDirectory=cerberus
+RuntimeDirectoryMode=0750
+# /sys must be writable: the entire mechanism is writing `authorized` and
+# `authorized_default`. This is the one broad permission the design requires,
+# and it is why the privileged half is kept small enough to audit.
+ProtectKernelTunables=no
+
+# Kernel and hardware
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+# Device access is restricted to the two classes actually needed: input nodes
+# to observe behaviour, block devices to read a partition table. Everything
+# else -- sound, video, tty, GPU -- is denied.
+DevicePolicy=closed
+DeviceAllow=char-input rw
+DeviceAllow=block-* r
+DeviceAllow=char-misc rw
+
+# Privileges: no path to gaining more than it starts with.
+NoNewPrivileges=yes
+# CAP_DAC_OVERRIDE and CAP_CHOWN are needed to prepare the state and runtime
+# directories and hand them to the unprivileged analyzer before dropping.
+# CAP_SETUID/SETGID are needed for that drop itself.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_SETUID CAP_SETGID CAP_FOWNER
+AmbientCapabilities=
+
+# Network: Cerberus has no reason to speak to anything. Removing this entirely
+# means an analyzer compromise cannot exfiltrate what it observed.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Namespaces and execution
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @privileged
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+# Keyring and IPC isolation
+PrivateTmp=yes
+PrivateMounts=yes
+KeyringMode=private
+ProtectProc=invisible
+ProcSubset=pid
+
+[Install]
+WantedBy=multi-user.target

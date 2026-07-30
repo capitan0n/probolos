@@ -44,8 +44,15 @@ import subprocess
 from typing import Optional
 
 
+# Three-way answers, matching the terminal prompt's [y]es once / [a]lways / [N]o.
+CHOICE_ONCE = "once"
+CHOICE_ALWAYS = "always"
+CHOICE_NO = "no"
+
+
 class DialogBackend:
-    """A way of asking one yes/no question. Returns True, False, or None."""
+    """A way of asking a question. Returns an answer, or None if it could not
+    even be asked."""
 
     name = "none"
 
@@ -54,6 +61,24 @@ class DialogBackend:
 
     def confirm(self, title: str, text: str, yes_label: str,
                 no_label: str, timeout: float) -> Optional[bool]:
+        raise NotImplementedError
+
+    def choose(self, title: str, text: str, once_label: str,
+               always_label: str, no_label: str,
+               timeout: float) -> Optional[str]:
+        """
+        Ask the three-way question: allow once, allow always, or refuse.
+
+        This exists because the graphical path must not be more permissive than
+        the terminal one. With only Allow/Cancel, "allow" had to mean "remember
+        forever", so anyone glancing at an unfamiliar stick once acquired a
+        permanent trust entry they never asked for. A security tool whose
+        convenient path grants more than its inconvenient path is training its
+        users badly.
+
+        Backends that cannot show three buttons fall back to asking twice, which
+        is worse ergonomics but the same set of outcomes.
+        """
         raise NotImplementedError
 
 
@@ -85,6 +110,32 @@ class KDialogBackend(DialogBackend):
             return None         # could not ask at all
         return result.returncode == 0
 
+    def choose(self, title: str, text: str, once_label: str,
+               always_label: str, no_label: str,
+               timeout: float) -> Optional[str]:
+        # kdialog's --warningyesnocancel gives exactly three labelled buttons.
+        # Exit codes: 0 = yes, 1 = no, 2 = cancel. The labels are mapped so the
+        # least privileged choice (once) is the primary button and the most
+        # privileged (always) is the secondary one -- the default should be the
+        # smaller grant, not the larger.
+        args = [self._binary, "--title", title,
+                "--yes-label", once_label,
+                "--no-label", always_label,
+                "--cancel-label", no_label,
+                "--warningyesnocancel", text]
+        try:
+            result = subprocess.run(args, timeout=timeout,
+                                    capture_output=True)
+        except subprocess.TimeoutExpired:
+            return CHOICE_NO
+        except OSError:
+            return None
+        if result.returncode == 0:
+            return CHOICE_ONCE
+        if result.returncode == 1:
+            return CHOICE_ALWAYS
+        return CHOICE_NO
+
 
 class ZenityBackend(DialogBackend):
     """GTK dialog tool, standard on GNOME and XFCE."""
@@ -111,6 +162,29 @@ class ZenityBackend(DialogBackend):
         except OSError:
             return None
         return result.returncode == 0
+
+    def choose(self, title: str, text: str, once_label: str,
+               always_label: str, no_label: str,
+               timeout: float) -> Optional[str]:
+        # zenity has no third button, but --extra-button adds one that prints
+        # its own label on stdout and exits non-zero. So: OK means once, the
+        # extra button means always, and anything else is a refusal.
+        args = [self._binary, "--question", "--title", title,
+                "--text", text,
+                "--ok-label", once_label, "--cancel-label", no_label,
+                "--extra-button", always_label, "--default-cancel"]
+        try:
+            result = subprocess.run(args, timeout=timeout,
+                                    capture_output=True, text=True)
+        except subprocess.TimeoutExpired:
+            return CHOICE_NO
+        except OSError:
+            return None
+        if result.returncode == 0:
+            return CHOICE_ONCE
+        if (result.stdout or "").strip() == always_label:
+            return CHOICE_ALWAYS
+        return CHOICE_NO
 
 
 class TkinterBackend(DialogBackend):
@@ -158,6 +232,35 @@ class TkinterBackend(DialogBackend):
         except OSError:
             return None
         return result.returncode == 0
+
+    def choose(self, title: str, text: str, once_label: str,
+               always_label: str, no_label: str,
+               timeout: float) -> Optional[str]:
+        # askyesnocancel gives three outcomes: True, False, None. Mapped so that
+        # closing the window (None) refuses, matching every other backend.
+        script = (
+            "import sys, tkinter as tk\n"
+            "from tkinter import messagebox\n"
+            "root = tk.Tk(); root.withdraw()\n"
+            "root.attributes('-topmost', True)\n"
+            "answer = messagebox.askyesnocancel(sys.argv[1], sys.argv[2],\n"
+            "                                   default=messagebox.CANCEL,\n"
+            "                                   icon='warning')\n"
+            "sys.exit(0 if answer is True else (1 if answer is False else 2))\n")
+        try:
+            result = subprocess.run(
+                [self._python(), "-c", script, title,
+                 f"{text}\n\nYes = {once_label}\nNo = {always_label}"],
+                timeout=timeout, capture_output=True)
+        except subprocess.TimeoutExpired:
+            return CHOICE_NO
+        except OSError:
+            return None
+        if result.returncode == 0:
+            return CHOICE_ONCE
+        if result.returncode == 1:
+            return CHOICE_ALWAYS
+        return CHOICE_NO
 
 
 def detect(log=print) -> Optional[DialogBackend]:

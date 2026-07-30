@@ -1,0 +1,37 @@
+[Unit]
+Description=Cerberus desktop agent (asks you about new USB devices)
+Documentation=https://github.com/capitan0n/cerberus
+# A USER unit: it belongs to the graphical session, because that is the only
+# place a dialog can appear. The analyzer deliberately runs outside the session
+# and cannot do this itself.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m cerberus.agent
+# The socket may not exist yet if the system service is still starting, and the
+# session may outlive a Cerberus restart. Retrying quietly is correct here.
+Restart=always
+RestartSec=5
+
+# This half runs as the user and needs almost nothing beyond the session bus
+# and the ability to spawn a dialog. It is the component that should be able to
+# do the least, since it is the one exposed to the desktop.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @clock @debug @module @mount @obsolete @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=graphical-session.target

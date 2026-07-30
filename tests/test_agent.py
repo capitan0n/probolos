@@ -373,11 +373,125 @@ class TestAgentNeedsTwoYeses(unittest.TestCase):
         self.assertEqual(agent._ask_user({"title": "t", "body": "b"}, 30),
                          ANSWER_NO)
 
-    def test_always_requires_both_confirmations_too(self):
-        from cerberus.agentlink import ANSWER_ALWAYS
+    def test_always_requires_both_dialogs_too(self):
+        """
+        With a trust store the second dialog is the three-way one, so 'always'
+        still needs the first dialog approved AND the choice made explicitly.
+        """
+        from cerberus import dialogs
+        from cerberus.agentlink import ANSWER_ALWAYS, ANSWER_NO
         agent = self.build()
-        agent.dialog.confirm.side_effect = [True, True]
+
+        agent.dialog.confirm.return_value = True
+        agent.dialog.choose.return_value = dialogs.CHOICE_ALWAYS
         self.assertEqual(
             agent._ask_user({"title": "t", "body": "b", "allow_always": True},
                             30),
             ANSWER_ALWAYS)
+
+        # Refusing the FIRST dialog must stop it reaching the choice at all.
+        agent.dialog.confirm.return_value = False
+        agent.dialog.choose.reset_mock()
+        self.assertEqual(
+            agent._ask_user({"title": "t", "body": "b", "allow_always": True},
+                            30),
+            ANSWER_NO)
+        agent.dialog.choose.assert_not_called()
+
+
+class TestThreeWayChoice(unittest.TestCase):
+    """
+    The graphical path must offer the same outcomes as the terminal one. When it
+    only had Allow/Cancel, "allow" implied "remember forever" -- so the
+    convenient path granted MORE than the inconvenient path, which is exactly
+    backwards for a security tool.
+    """
+
+    def build(self):
+        from cerberus import agent as agent_mod
+        instance = agent_mod.Agent.__new__(agent_mod.Agent)
+        instance.log = lambda *a: None
+        instance.notifier = mock.Mock()
+        instance.notifier.available.return_value = False
+        instance.dialog = mock.Mock()
+        instance.sock = None
+        return instance
+
+    def test_once_is_reachable_without_being_remembered(self):
+        from cerberus import dialogs
+        from cerberus.agentlink import ANSWER_YES
+        agent = self.build()
+        agent.dialog.confirm.return_value = True
+        agent.dialog.choose.return_value = dialogs.CHOICE_ONCE
+
+        answer = agent._ask_user(
+            {"title": "t", "body": "b", "allow_always": True}, 30)
+        self.assertEqual(answer, ANSWER_YES,
+                         "'just this once' must not create a trust entry")
+
+    def test_always_is_reachable_and_distinct(self):
+        from cerberus import dialogs
+        from cerberus.agentlink import ANSWER_ALWAYS
+        agent = self.build()
+        agent.dialog.confirm.return_value = True
+        agent.dialog.choose.return_value = dialogs.CHOICE_ALWAYS
+
+        self.assertEqual(
+            agent._ask_user({"title": "t", "body": "b", "allow_always": True},
+                            30),
+            ANSWER_ALWAYS)
+
+    def test_cancel_on_the_second_dialog_refuses(self):
+        from cerberus import dialogs
+        from cerberus.agentlink import ANSWER_NO
+        agent = self.build()
+        agent.dialog.confirm.return_value = True
+        agent.dialog.choose.return_value = dialogs.CHOICE_NO
+
+        self.assertEqual(
+            agent._ask_user({"title": "t", "body": "b", "allow_always": True},
+                            30),
+            ANSWER_NO)
+
+    def test_without_a_trust_store_only_two_buttons_are_used(self):
+        """No trust store means nothing to remember, so the three-way question
+        would offer a choice that does nothing."""
+        from cerberus.agentlink import ANSWER_YES
+        agent = self.build()
+        agent.dialog.confirm.side_effect = [True, True]
+
+        self.assertEqual(
+            agent._ask_user({"title": "t", "body": "b", "allow_always": False},
+                            30),
+            ANSWER_YES)
+        agent.dialog.choose.assert_not_called()
+
+
+class TestKdialogThreeWayMapping(unittest.TestCase):
+    """kdialog exit codes: 0 = yes, 1 = no, 2 = cancel."""
+
+    def backend(self):
+        from cerberus import dialogs
+        b = dialogs.KDialogBackend()
+        b._binary = "/usr/bin/kdialog"
+        return b
+
+    def test_exit_codes_map_to_the_three_choices(self):
+        from cerberus import dialogs
+        cases = {0: dialogs.CHOICE_ONCE, 1: dialogs.CHOICE_ALWAYS,
+                 2: dialogs.CHOICE_NO}
+        for code, expected in cases.items():
+            with mock.patch.object(dialogs.subprocess, "run",
+                                   return_value=mock.Mock(returncode=code)):
+                self.assertEqual(
+                    self.backend().choose("t", "x", "once", "always", "no", 5),
+                    expected)
+
+    def test_a_timeout_refuses(self):
+        from cerberus import dialogs
+        with mock.patch.object(dialogs.subprocess, "run",
+                               side_effect=dialogs.subprocess.TimeoutExpired(
+                                   cmd="kdialog", timeout=1)):
+            self.assertEqual(
+                self.backend().choose("t", "x", "once", "always", "no", 1),
+                dialogs.CHOICE_NO)

@@ -2,6 +2,35 @@
 
 All notable changes to Cerberus. Versioning is semantic.
 
+## [0.8.1] — three choices, and a service
+
+### Fixed
+- **The graphical path was more permissive than the terminal one.** The agent
+  offered only Allow/Cancel, so "allow" had to mean "remember forever" — anyone
+  glancing at an unfamiliar stick once acquired a permanent trust entry they
+  never asked for. The second dialog now offers the same three outcomes as the
+  terminal: just this once, always, or cancel. A security tool whose convenient
+  path grants more than its inconvenient path is training its users badly.
+  *Found by reading the output of a successful run.*
+
+### Added
+- **systemd units** (`systemd/`): a system service for the gate and a user
+  service for the agent, since a dialog can only appear inside a graphical
+  session. Sandboxed with `ProtectSystem=strict`, `PrivateNetwork=yes`,
+  `DevicePolicy=closed` restricted to input and block devices,
+  `MemoryDenyWriteExecute=yes`, a `SystemCallFilter` denying module loading and
+  raw I/O, and a `CapabilityBoundingSet` of only the five capabilities the
+  privilege drop needs. `ProtectKernelTunables` is deliberately off and the
+  reason is documented: writing sysfs `authorized` is the mechanism itself.
+
+### Changed
+- Notification actions were abandoned in favour of dialogs. Plasma advertises
+  the `actions` capability and renders no button for it, and the specification
+  permits servers not to support interaction at all — a security decision cannot
+  rest on an optional mechanism. This also matches what polkit, USBGuard's
+  applet, Windows driver prompts and macOS 13's "Allow accessory to connect?"
+  all do.
+
 ## [0.8.0] — approving from the desktop
 
 ### Added

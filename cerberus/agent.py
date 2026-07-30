@@ -314,17 +314,34 @@ class Agent:
                             "It will be able to act on your computer — type, "
                             "read and write storage, or use the network, "
                             "depending on what it is.")
-            if allow_always:
-                confirm_text += ("\n\nIt will also be REMEMBERED and admitted "
-                                 "without asking next time.")
-            confirmed = self.dialog.confirm(
+
+            if not allow_always:
+                confirmed = self.dialog.confirm(
+                    title="Cerberus — confirm",
+                    text=confirm_text,
+                    yes_label="Yes, switch it on", no_label="Cancel",
+                    timeout=30.0)
+                return ANSWER_YES if confirmed else ANSWER_NO
+
+            # Three outcomes, the same set the terminal offers. Without this the
+            # graphical path would be MORE permissive than the terminal one:
+            # "allow" would have to mean "remember forever", so glancing at an
+            # unfamiliar stick once would silently create a permanent trust
+            # entry. The convenient path must never grant more than the
+            # inconvenient one.
+            choice = self.dialog.choose(
                 title="Cerberus — confirm",
-                text=confirm_text,
-                yes_label="Yes, switch it on", no_label="Cancel",
+                text=confirm_text + "\n\nAllow it once, or remember it for "
+                                    "next time as well?",
+                once_label="Just this once",
+                always_label="Always allow",
+                no_label="Cancel",
                 timeout=30.0)
-            if not confirmed:
-                return ANSWER_NO
-            return ANSWER_ALWAYS if allow_always else ANSWER_YES
+            if choice == dialogs.CHOICE_ONCE:
+                return ANSWER_YES
+            if choice == dialogs.CHOICE_ALWAYS:
+                return ANSWER_ALWAYS
+            return ANSWER_NO
         finally:
             if announcement is not None:
                 self.notifier.close(announcement)
@@ -374,14 +391,24 @@ def main(argv=None) -> int:
         answer = backend.confirm(
             title="Cerberus test",
             text=("This is what a device prompt will look like.\n\n"
-                  "Press \"Allow\" to confirm the dialog works."),
+                  "Press \"Allow\" to continue to the second dialog."),
             yes_label="Allow", no_label="Cancel", timeout=60.0)
         if answer is None:
             print("The dialog could not be shown.")
             return 1
-        print("Dialog works — the agent will function here."
-              if answer else
-              "Dialog works, and you pressed Cancel. That is the safe default.")
+        if not answer:
+            print("Dialog works, and you pressed Cancel. That is the safe "
+                  "default.")
+            return 0
+
+        choice = backend.choose(
+            title="Cerberus test — three choices",
+            text=("The real second dialog offers three outcomes, the same as "
+                  "the terminal.\n\nPick any of them."),
+            once_label="Just this once", always_label="Always allow",
+            no_label="Cancel", timeout=60.0)
+        print(f"You chose: {choice}")
+        print("Both dialogs work — the agent will function here.")
         return 0
 
     return Agent(args.socket).run()
