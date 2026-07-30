@@ -245,3 +245,41 @@ class TestMbrParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestNumberedManagement(unittest.TestCase):
+    """ufw-style: list numbered, delete by number. Stable ordering is what
+    makes the numbers safe to act on."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = trust.TrustStore(Path(self.tmp.name) / "t.json")
+        import time
+        for serial, raw in [("AAA", b"a"), ("BBB", b"b"), ("CCC", b"c")]:
+            self.store.trust(Dev(serial=serial, raw=raw))
+            time.sleep(0.001)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_ordered_is_stable_by_trust_time(self):
+        serials = [e.identity.split(":")[-1] for e in self.store.ordered()]
+        self.assertEqual(serials, ["AAA", "BBB", "CCC"])
+
+    def test_forget_by_number_removes_the_shown_entry(self):
+        removed = self.store.forget_index(2)
+        self.assertIn("BBB", removed)
+        remaining = [e.identity.split(":")[-1] for e in self.store.ordered()]
+        self.assertEqual(remaining, ["AAA", "CCC"])
+
+    def test_forget_out_of_range_is_refused(self):
+        self.assertIsNone(self.store.forget_index(0))
+        self.assertIsNone(self.store.forget_index(99))
+        self.assertEqual(len(self.store.ordered()), 3, "nothing removed")
+
+    def test_numbers_renumber_after_a_delete(self):
+        """After deleting [2], the old [3] becomes the new [2] -- exactly like
+        ufw, so a second delete acts on what is now shown."""
+        self.store.forget_index(2)               # removes BBB
+        removed = self.store.forget_index(2)     # now removes CCC
+        self.assertIn("CCC", removed)

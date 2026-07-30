@@ -40,7 +40,7 @@ try:
 except ImportError:  # pragma: no cover - import guard for offline linting
     pyudev = None
 
-from . import (analyzers, gate, ledger as ledger_mod, quarantine,
+from . import (agentlink, analyzers, gate, ledger as ledger_mod, quarantine,
                report, rules, safety, session as session_mod, storage, sysfs,
                trust as trust_mod, usbclass)
 
@@ -68,7 +68,8 @@ class Cerberus:
                  trust_store=None,
                  inspect_storage: bool = True,
                  monitor=None,
-                 lock_policy: str = session_mod.POLICY_QUEUE):
+                 lock_policy: str = session_mod.POLICY_QUEUE,
+                 agent=None):
         self.dry_run = dry_run
         self.timeout = timeout          # 0 == wait forever
         self.json_log = json_log
@@ -83,6 +84,7 @@ class Cerberus:
         self.inspect_storage = inspect_storage
         self.monitor = monitor or session_mod.AlwaysUnlocked()
         self.lock_policy = lock_policy
+        self.agent = agent
         # Devices attached while the screen was locked. They are held blocked
         # and asked about when someone returns, so nobody has to unplug and
         # replug hardware just because they stepped away.
@@ -380,6 +382,28 @@ class Cerberus:
                 print(f"[!!]   echo 0 > {dev.syspath}/authorized\n")
             print(f"[-] REJECTED — {report.one_liner(dev, findings)}\n")
 
+    @staticmethod
+    def _agent_title(dev: sysfs.UsbDevice) -> str:
+        claims = ", ".join(dev.claims) if dev.claims else "unknown type"
+        return f"New USB device: {claims}"
+
+    @staticmethod
+    def _agent_body(dev: sysfs.UsbDevice, findings) -> str:
+        """
+        A few lines, not a report. A notification that has to be scrolled will
+        not be read, and an unread warning is worse than none: it trains the
+        habit of clicking through.
+        """
+        lines = [dev.label()]
+        if getattr(dev, "serial", None):
+            lines.append(f"serial {dev.serial}")
+        for finding in list(findings)[:2]:
+            lines.append(f"{finding.severity.label}: {finding.title}")
+        extra = len(list(findings)) - 2
+        if extra > 0:
+            lines.append(f"…and {extra} more finding(s)")
+        return "\n".join(lines)
+
     def report_blocked_on_exit(self) -> None:
         """
         Say plainly which devices are being left switched off.
@@ -538,6 +562,40 @@ class Cerberus:
         hard for everything would just retrain the reflex on a longer word.
         """
         critical = rules.worst(findings) == rules.Severity.CRITICAL
+
+        # ---- ask through the desktop agent, if one is listening -----------
+        # A CRITICAL device is never offered to the agent as a question. Two
+        # clicks are too cheap for something matching an attack pattern, and a
+        # person clicking a popup is not in the same state of attention as one
+        # typing a word. The agent is told to warn instead, and the decision
+        # stays in the terminal.
+        if self.agent is not None and self.agent.connected:
+            if critical:
+                self.agent.notify_critical(
+                    f"Dangerous USB device blocked",
+                    report.one_liner(dev, findings))
+                print("  (a warning was sent to your desktop; this device "
+                      "cannot be approved from a notification)")
+            else:
+                answer = self.agent.ask(
+                    title=self._agent_title(dev),
+                    body=self._agent_body(dev, findings),
+                    severity=rules.worst(findings).label if findings else "none",
+                    allow_always=self.trust is not None,
+                    timeout=self.timeout if self.timeout else 60.0)
+                if answer == agentlink.ANSWER_ALWAYS:
+                    self._remember = True
+                    return True
+                if answer == agentlink.ANSWER_YES:
+                    return True
+                if answer == agentlink.ANSWER_NO:
+                    return False
+                # answer is None: the agent could not answer at all. That is not
+                # a decision, so it must not be treated as one -- fall through
+                # to the terminal rather than silently refusing something the
+                # user never saw.
+                print("  (no answer from the desktop agent; asking here)")
+
         if critical:
             # No "always" option here on purpose. Remembering a device that
             # matches an attack pattern is not a choice worth offering in one
@@ -634,9 +692,20 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
           trust_path: Optional[Path] = None,
           inspect_storage: bool = True,
           lock_policy: str = session_mod.POLICY_QUEUE,
-          force_locked: Optional[bool] = None) -> None:
+          force_locked: Optional[bool] = None,
+          agent_socket: Optional[Path] = None) -> None:
     """Wire the gate, the safety net and the loop together."""
     policy = policy or safety.SafetyPolicy()
+    link = None
+    if agent_socket is not None:
+        link = agentlink.AgentLink(agent_socket)
+        if link.start():
+            print(f"  - desktop agent socket: {agent_socket}")
+            print(f"    start the agent in your session with: "
+                  f"python -m cerberus.agent")
+        else:
+            link = None
+
     monitor = session_mod.detect(force_locked)
     if lock_policy != session_mod.POLICY_IGNORE:
         print(f"  - screen-lock policy: {lock_policy} "
@@ -688,7 +757,7 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
                           capture_payload=capture_payload, watchdog=dog,
                           stop_event=stop_event, trust_store=trust_store,
                           inspect_storage=inspect_storage, monitor=monitor,
-                          lock_policy=lock_policy)
+                          lock_policy=lock_policy, agent=link)
         engine.snapshot()
         try:
             engine.run()
@@ -698,4 +767,6 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
             if dog:
                 dog.stop()
             engine.report_blocked_on_exit()
+            if link:
+                link.stop()
             print("[*] Reopening the gate:")

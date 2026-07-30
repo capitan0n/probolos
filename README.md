@@ -204,6 +204,76 @@ careless and are all NOTICE or WARNING. Measuring real consumption needs
 external hardware such as an INA219, and is well covered in the literature —
 see PowerID (INFOCOM 2023) and subsequent work.
 
+## Approving from a notification instead of a terminal
+
+Nobody keeps a terminal open all day, and a security tool you have to go and
+find is one you stop using. A small agent runs in your own session, shows a
+notification when a device is waiting, and sends your answer back.
+
+```bash
+# check notifications and the dialog work on your desktop
+# (KDE needs kdialog: sudo pacman -S kdialog)
+python -m cerberus.agent --test
+
+# terminal 1 (root)
+sudo python -m cerberus --privsep --agent
+
+# terminal 2 (you, in your graphical session)
+python -m cerberus.agent
+```
+
+**A notification announces; a dialog decides.** The notification tells you
+something is waiting. The answer is taken from a dialog window with explicit
+buttons, and a second, differently worded dialog must also be confirmed.
+Cancelling either, or leaving either unanswered, is a refusal.
+
+This split is not a compromise — it is what every other system doing this uses.
+polkit asks for authorisation in a window; USBGuard ships a notifier for
+awareness and a separate applet with a window for the decision; Windows prompts
+in a window before installing a driver; and macOS 13 and later shows "Allow
+accessory to connect?" for USB devices. Notification buttons are optional in the
+specification (Plasma advertises the `actions` capability and still renders no
+button for it), and a security decision cannot rest on a mechanism that servers
+are free not to implement.
+
+The dialog is found in this order: `kdialog` (KDE), `zenity` (GTK desktops),
+then a Python `tkinter` dialog. If none exists, the agent says so and refuses to
+start rather than pretending to protect anything.
+
+**A CRITICAL device is never approvable from a notification.** The agent is told
+to display a warning with no way to allow anything, and the decision stays in
+the terminal where the whole word `authorize` has to be typed. Convenience must
+not lower the defence in the worst case.
+
+### Why clicking to approve hardware is safe here
+
+It looks like it should not be: a malicious HID device could click its own
+approval. It cannot, and the reason is structural rather than clever — **when the
+notification appears, the device is still unauthorized.** It has no input path
+into the session, so it cannot move a pointer or press a key. The question is
+asked precisely while the thing being asked about is unable to answer it.
+
+This is the same invariant the terminal prompt relied on, and it is why the
+device is returned to blocked the instant the observation window ends. Break
+that and the notification becomes unsafe immediately — which is why it is a
+tested invariant and not a comment.
+
+### Three processes, each knowing as little as possible
+
+    gate      (root)      writes sysfs, opens devices. Knows nothing else.
+    analyzer  (nobody)    all the judgement. Knows nothing about graphics.
+    agent     (you)       shows a notification. Knows nothing about USB.
+
+The analyzer runs outside your login session — that is what makes privilege
+separation work — so it cannot reach your session's D-Bus and should not learn
+how. The agent connects inward over a Unix socket restricted to your group. If
+no agent is connected, everything falls back to the terminal: the notification
+path is an interface, not a dependency.
+
+Notifications use `org.freedesktop.Notifications` through `gdbus`, which is a
+freedesktop standard rather than a KDE or GNOME extension — one implementation
+covers KDE, GNOME, XFCE and the rest, with no Python D-Bus binding to install.
+
 ## When nobody is at the machine
 
 The most realistic physical-access attack is not someone plugging a device in
@@ -365,7 +435,7 @@ honestly, and see whether the distributions separate.
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -t .
+python -m unittest discover -b -s tests -t .
 ```
 
 The descriptor parser is tested against synthesised device blobs, including a

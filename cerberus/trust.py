@@ -177,6 +177,32 @@ class TrustStore:
         if getattr(dev, "name", None) and dev.name not in entry.ports:
             entry.ports.append(dev.name)
 
+    def ordered(self) -> List["TrustedDevice"]:
+        """
+        Remembered devices in a stable, numbered order (by when trusted).
+
+        Stable ordering matters because the numbers are how a person refers to
+        an entry -- "delete rule 3" must mean the same entry every time it is
+        listed, the way `ufw status numbered` behaves.
+        """
+        return sorted(self.devices.values(), key=lambda d: d.trusted_at)
+
+    def forget_index(self, index: int) -> Optional[str]:
+        """
+        Remove the entry shown at position `index` (1-based, as displayed).
+
+        Returns the identity removed, or None if the number is out of range.
+        One at a time by design: a person deleting a rule by number should see
+        exactly what went, not a range that might include something they did
+        not mean.
+        """
+        entries = self.ordered()
+        if not (1 <= index <= len(entries)):
+            return None
+        entry = entries[index - 1]
+        del self.devices[entry.key]
+        return entry.identity
+
     def forget(self, pattern: str) -> List[str]:
         """
         Remove trust for anything whose key, identity or label matches.

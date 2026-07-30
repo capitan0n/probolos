@@ -13,9 +13,11 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
-from . import (daemon, gate, ledger as ledger_mod, report, rules, safety,
-               session as session_mod, sysfs, trust as trust_mod, usbclass)
+from . import (agentlink, daemon, gate, ledger as ledger_mod, report, rules,
+               safety, session as session_mod, sysfs, trust as trust_mod,
+               usbclass)
 
 BANNER = r"""
    ___         _
@@ -107,36 +109,81 @@ def cmd_release() -> None:
             print(f"  {hub.name}: authorized_default reset to 1")
 
 
+def _active_session_user() -> Optional[str]:
+    """
+    Work out whose desktop session this is, so the agent socket can be made
+    reachable by exactly that user and nobody else.
+
+    Uses logind, which already provides the lock state, rather than guessing
+    from SUDO_USER -- although that is used as a fallback, since running under
+    sudo is the normal case here and it is a strong hint.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    loginctl = shutil.which("loginctl")
+    if loginctl:
+        try:
+            out = subprocess.run([loginctl, "list-sessions", "--no-legend"],
+                                 capture_output=True, text=True, timeout=3)
+            for line in out.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    info = subprocess.run(
+                        [loginctl, "show-session", parts[0], "-p", "Type",
+                         "-p", "Name"],
+                        capture_output=True, text=True, timeout=3)
+                    values = dict(l.split("=", 1)
+                                  for l in info.stdout.splitlines() if "=" in l)
+                    if values.get("Type") in ("x11", "wayland", "mir"):
+                        return values.get("Name")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return os.environ.get("SUDO_USER")
+
+
 def cmd_trusted(path) -> None:
-    """Show what this machine currently lets in without asking."""
+    """Show what this machine currently lets in without asking, numbered."""
     store = trust_mod.TrustStore(path)
     if store.load_error:
         sys.exit(f"trust store unreadable: {store.load_error}")
-    if not store.devices:
+    entries = store.ordered()
+    if not entries:
         print("No remembered devices. Every device will be asked about.")
         return
     import datetime
-    print(f"{len(store.devices)} remembered device(s):\n")
-    for entry in store.devices.values():
+    print(f"Remembered devices ({len(entries)}) — admitted without asking:\n")
+    for i, entry in enumerate(entries, start=1):
         when = datetime.datetime.fromtimestamp(entry.trusted_at)
-        print(f"  {entry.label}")
-        print(f"    identity   : {entry.identity}")
-        print(f"    descriptors: {entry.descriptor_hash[:16]}…")
-        print(f"    trusted    : {when:%Y-%m-%d %H:%M}, admitted "
+        print(f"[{i}] {entry.label}")
+        print(f"      identity    : {entry.identity}")
+        print(f"      descriptors : {entry.descriptor_hash[:16]}…")
+        print(f"      trusted     : {when:%Y-%m-%d %H:%M}, admitted "
               f"{entry.times_admitted} time(s)")
-        print(f"    ports      : {', '.join(entry.ports) or '-'}")
+        print(f"      ports       : {', '.join(entry.ports) or '-'}")
         print()
+    print("Remove one with:  sudo python -m cerberus --forget N   "
+          "(N is the number in brackets)")
 
 
 def cmd_forget(path, pattern: str) -> None:
     store = trust_mod.TrustStore(path)
     if pattern.lower() == "all":
         count = store.clear()
-        print(f"Forgot {count} device(s).")
+        print(f"Forgot all {count} device(s).")
+    elif pattern.isdigit():
+        # A bare number refers to the position shown by --trusted, like
+        # `ufw delete N`. This is the common case: look, then delete by number.
+        identity = store.forget_index(int(pattern))
+        if identity is None:
+            sys.exit(f"No remembered device numbered {pattern}. "
+                     f"Run --trusted to see the list.")
+        print(f"Forgot [{pattern}] {identity}")
     else:
         removed = store.forget(pattern)
         if not removed:
-            print(f"Nothing matched {pattern!r}.")
+            print(f"Nothing matched {pattern!r}. Run --trusted to see the list.")
             return
         for identity in removed:
             print(f"  forgot {identity}")
@@ -194,8 +241,8 @@ def main(argv=None) -> None:
     parser.add_argument("--trusted", action="store_true",
                         help="list remembered devices and exit")
     parser.add_argument("--forget", metavar="PATTERN",
-                        help="remove remembered devices matching PATTERN "
-                             "(use 'all' to clear the store)")
+                        help="remove a remembered device: a number from "
+                             "--trusted, a name/id substring, or 'all'")
     parser.add_argument("--no-trust", action="store_true",
                         help="ask about every device, ignore what is remembered")
     parser.add_argument("--trust-file", type=Path, metavar="FILE",
@@ -214,6 +261,15 @@ def main(argv=None) -> None:
                         help="pretend the screen is locked (to test the policy)")
     parser.add_argument("--force-unlocked", action="store_true",
                         help="pretend the screen is unlocked")
+    parser.add_argument("--agent", action="store_true",
+                        help="accept decisions from a desktop notification "
+                             "agent (start it with: python -m cerberus.agent)")
+    parser.add_argument("--agent-socket", type=Path,
+                        default=agentlink.DEFAULT_SOCKET, metavar="PATH",
+                        help="where the desktop agent connects")
+    parser.add_argument("--agent-user", metavar="USER",
+                        help="the desktop user allowed to answer through the "
+                             "agent (default: the owner of the active session)")
     parser.add_argument("--privsep", action="store_true",
                         help="run with privilege separation: a small root gate "
                              "and an unprivileged analyzer. Recommended")
@@ -279,7 +335,8 @@ def main(argv=None) -> None:
                      trust_path=None if args.no_trust else trust_path,
                      inspect_storage=not args.no_storage_scan,
                      lock_policy=args.lock_policy,
-                     force_locked=forced_lock)
+                     force_locked=forced_lock,
+                     agent_socket=args.agent_socket if args.agent else None)
 
     if args.privsep:
         from . import privsep
@@ -291,6 +348,26 @@ def main(argv=None) -> None:
             sysfs.install_backend(GateBackend(gate_client))
             _serve()
             return 0
+
+        if args.agent:
+            # The analyzer will run as `nobody` and the agent as the desktop
+            # user; neither can grant the other access afterwards, so the
+            # directory is set up here, while still root.
+            try:
+                import grp
+                import pwd as _pwd
+                agent_user = args.agent_user or _active_session_user()
+                if agent_user is None:
+                    sys.exit("--agent needs --agent-user USER (could not "
+                             "detect the desktop user automatically)")
+                entry = _pwd.getpwnam(agent_user)
+                analyzer_uid = _pwd.getpwnam(args.privsep_user).pw_uid
+                agentlink.prepare_socket_dir(args.agent_socket,
+                                             analyzer_uid, entry.pw_gid)
+                print(f"[agent] {args.agent_socket.parent} prepared for "
+                      f"{agent_user}")
+            except (KeyError, OSError) as exc:
+                sys.exit(f"could not prepare the agent socket directory: {exc}")
 
         try:
             rc = privsep.start(analyzer_main, drop_to=args.privsep_user,

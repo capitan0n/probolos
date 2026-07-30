@@ -2,6 +2,36 @@
 
 All notable changes to Cerberus. Versioning is semantic.
 
+## [0.8.0] — approving from the desktop
+
+### Added
+- **Desktop notification agent** (`python -m cerberus.agent`). A third process
+  runs in the user's session, shows a notification when a device is waiting and
+  sends the answer back over a group-restricted Unix socket. Clicking the body
+  means allow; a second, differently worded notification must also be clicked
+  to confirm. Every other ending — dismissal, expiry, a closed session — is a
+  refusal.
+- A CRITICAL device is never offered as a clickable question. The agent shows a
+  warning with no way to allow anything and the decision stays in the terminal,
+  where the whole word `authorize` is required.
+- An agent that cannot answer is distinguished from one that answered "no": a
+  missing answer falls back to the terminal rather than refusing a device the
+  user never saw.
+- `--agent`, `--agent-socket`, `--agent-user`. The socket directory is prepared
+  by the root launcher with the setgid bit set, so a socket created by the
+  unprivileged analyzer is reachable by exactly the desktop user and nobody
+  else — a world-writable socket would let any local account approve hardware.
+- `python -m cerberus.agent --test` checks that notifications and body-clicks
+  work on a given desktop before relying on them.
+
+### Notes
+- The security property that makes a clickable prompt safe is that the device is
+  still unauthorized when the notification appears, so it cannot click its own
+  approval. This depends on the device being re-blocked after observation, which
+  is a tested invariant.
+- Run the suite with `-b` (`python -m unittest discover -b -s tests -t .`) to
+  keep daemon output from interleaving with test results.
+
 ## [0.7.2] — the deferred question
 
 ### Fixed
