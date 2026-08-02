@@ -3,13 +3,6 @@
 Το `cerberus/textsafe.py` και το `tests/test_textsafe.py` είναι πλήρη αρχεία.
 Εδώ είναι τα σημεία που πρέπει να το χρησιμοποιήσουν.
 
-> **Ενημέρωση μετά τα greps:** επιβεβαιώθηκε ότι το `descriptors_safe.py` ΔΕΝ
-> επικαλύπτεται με αυτή τη δουλειά — είναι ασφαλές byte-level parsing, δεν
-> αγγίζει καθόλου τα strings. Τα δύο συνυπάρχουν. Επίσης, το `report.py`
-> τυλίγει ήδη τα findings μέσω `_finding_lines` → `_wrap`, οπότε το κρίσιμο
-> σημείο μετατοπίζεται: το `_wrap` και οι γραμμές 106-108 του `render()`, όχι
-> το `_line`.
-
 ---
 
 ## Η αρχή: καθαρισμός στην **πηγή**, όχι στην έξοδο
@@ -127,14 +120,14 @@ CRITICAL να μένει για τον συνδυασμό `control-characters` *
 
 ## 3. `cerberus/report.py` — πλάτος οθόνης αντί για `len()`
 
-Δύο σημεία, και το δεύτερο είναι πιο σοβαρό απ' ό,τι νόμιζα.
-
 ### 3α. Το `_line()` (γραμμή ~40)
 
 **Πριν:**
 
 ```python
 def _line(text: str = "") -> str:
+    # Border(1) + space(1) + padded text(WIDTH-1) + border(1) == WIDTH + 2,
+    # which is exactly the width of the ─ rules above and below.
     return f"│ {text:<{WIDTH - 1}}│"
 ```
 
@@ -142,38 +135,22 @@ def _line(text: str = "") -> str:
 
 ```python
 def _line(text: str = "") -> str:
-    # Padded by COLUMNS, not by len(). A combining accent is a character with
-    # no column; an ideograph is one character in two columns. A Chinese
-    # product name is legitimate and used to push the right-hand border off
-    # the line all by itself.
+    # Border(1) + space(1) + padded text(WIDTH-1) + border(1) == WIDTH + 2,
+    # which is exactly the width of the ─ rules above and below.
+    #
+    # Padded by COLUMNS, not by len(). The two differ in both directions and
+    # only one of them is an attack: a combining accent is a character with no
+    # column, an ideograph is one character in two columns. A Chinese product
+    # name is legitimate and used to push the right-hand border off the line
+    # all by itself.
     return f"│ {textsafe.pad(text, WIDTH - 1)}│"
 ```
 
-### 3β. Οι γραμμές 106-108 του `render()` — ΤΟ ΠΡΑΓΜΑΤΙΚΟ ΚΕΝΟ
+### 3β. Το `_wrap()` (γραμμή ~48)
 
-Αυτές βάζουν το device string **κατευθείαν** στο `_line`, χωρίς `_wrap`:
-
-```python
-out.append(_line(f"Manufacturer:  {dev.manufacturer or '(none reported)'}"))
-out.append(_line(f"Product:       {dev.product or '(none reported)'}"))
-out.append(_line(f"Serial:        {dev.serial or '(none reported)'}"))
-```
-
-Μετά το F3 τα control chars έχουν φύγει, αλλά **το μήκος όχι**: ένα νόμιμο
-όνομα 200 χαρακτήρων ξεχειλίζει το κουτί. Το `_line` με `textsafe.pad` (3α)
-κόβει αυτόματα μέσω `fit()`, οπότε **αυτές οι γραμμές δεν χρειάζονται δική
-τους αλλαγή** — αρκεί το 3α. Αυτός ακριβώς είναι ο λόγος που το `pad` κάνει
-πρώτα `fit`: ένα σημείο, όχι τρία.
-
-Το ίδιο καλύπτει και τη γραμμή 114 (`ID ...`) και το `one_liner` (155): μόλις
-το `_line` σέβεται στήλες, καμία γραμμή δεν ξεχειλίζει, όποιο κι αν είναι το
-περιεχόμενο.
-
-### 3γ. Το `_wrap()` (γραμμή ~48) — σκληρό σπάσιμο
-
-Σπάει μόνο σε κενά, άρα ένα token χωρίς κενό δεν τυλίγεται. Χρησιμοποιείται
-από το `_finding_lines`· αν ένα finding περιέχει ένα μεγάλο device string
-(π.χ. στο evidence), τρέχει έξω:
+Η υπάρχουσα σπάει μόνο σε κενά, οπότε ένα όνομα 300 χαρακτήρων χωρίς κενό δεν
+τυλίγεται καθόλου. Πρόσθεσε σκληρό σπάσιμο για λέξεις που δεν χωράνε μόνες
+τους, και μέτρα σε στήλες:
 
 ```python
 def _wrap(text: str, width: int) -> List[str]:
@@ -182,7 +159,7 @@ def _wrap(text: str, width: int) -> List[str]:
     for word in text.split():
         # A single "word" wider than the box has no whitespace to break at.
         # Device strings have no obligation to contain spaces, so this is not
-        # hypothetical: without it one long token runs past the border and
+        # a hypothetical: without it one long token runs past the border and
         # takes the rest of the report's layout with it.
         while textsafe.display_width(word) > width:
             if current:
@@ -202,11 +179,14 @@ def _wrap(text: str, width: int) -> List[str]:
     return lines
 ```
 
-### 3δ. Import
+### 3γ. Import
 
 ```python
 from . import rules, sysfs, textsafe, usbclass
 ```
+
+Οι γραμμές 106-108 και 114 και 155 **δεν χρειάζονται αλλαγή** — τα strings
+φτάνουν εκεί ήδη καθαρά από το βήμα 1. Αυτό είναι το νόημα του chokepoint.
 
 ---
 
@@ -230,23 +210,8 @@ freedesktop notification, που υποστηρίζει `<b>`, `<i>`, `<u>` κα
 ## Τι θέλω για την επόμενη παρτίδα
 
 ```bash
-# 1. Επιβεβαίωση F16 — καλείται το descriptors_safe από πουθενά;
-#    Αν βγει άδειο για "descriptors_safe", ο κώδικας ασφαλείας είναι νεκρός.
-grep -n "descriptors_safe\|take(\|walk_descriptors\|walk_hid\|safe_parse" cerberus/descriptors.py | head -40
-
-# 2. Το ακριβές API του Finding + RuleConfig + το add() pattern
-sed -n '30,160p' cerberus/rules.py
-
-# 3. Πού μπαίνουν manufacturer/product/serial στη συσκευή (το chokepoint)
-grep -n "manufacturer\|product\|serial\|def __init__\|class .*Device\|@dataclass" cerberus/descriptors.py | head -50
-
-# 4. Οι υλοποιήσεις των backends (markup στο zenity/kdialog)
-sed -n '80,240p' cerberus/dialogs.py
-
-# 5. Το κομμάτι του render() που έκοψε η sed (γραμμές 95-120)
-sed -n '95,120p' cerberus/report.py
+cat cerberus/descriptors_safe.py
+sed -n '60,170p' cerberus/report.py
+grep -n "manufacturer\|product\|serial\|def \|Finding(" cerberus/rules.py | head -50
+sed -n '1,80p' cerberus/dialogs.py
 ```
-
-Το #1 είναι το σημαντικότερο: αν επιβεβαιωθεί το F16, ένα ολόκληρο αμυντικό
-στρώμα (guards για infinite-loop DoS, HID exhaustion) είναι γραμμένο αλλά
-ασύνδετο — μεγαλύτερο εύρημα από το ίδιο το F3, και δική του παρτίδα.
