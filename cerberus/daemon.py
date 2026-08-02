@@ -40,6 +40,7 @@ try:
 except ImportError:  # pragma: no cover - import guard for offline linting
     pyudev = None
 
+from . import deferred_bind
 from . import (agentlink, analyzers, gate, ledger as ledger_mod, quarantine,
                report, rules, safety, session as session_mod, storage, sysfs,
                trust as trust_mod, usbclass)
@@ -511,6 +512,20 @@ class Cerberus:
         print(f"  >>> DO NOT TOUCH IT for the next {self.observe:.0f} seconds. <<<")
         print()
 
+        if deferred_bind.supported(dev.syspath):
+            # No race window: driver does not bind until we are ready
+            # to grab. Interfaces are held unbound, device powered on,
+            # then interfaces released after the monitor is listening.
+            db = deferred_bind.DeferredBind(dev.syspath, log=print)
+            return quarantine.quarantine(
+                dev.syspath,
+                authorize_fn=db.authorize_device,
+                release_fn=db.release_interfaces,
+                bind_context=db,
+                duration=self.observe,
+                capture=self.capture_payload,
+            )
+        # Fallback: kernel/device without interface authorization.
         return quarantine.quarantine(
             dev.syspath,
             authorize_fn=lambda: sysfs.set_authorized(dev.syspath, 1),

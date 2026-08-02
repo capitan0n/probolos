@@ -243,6 +243,8 @@ def main(argv=None) -> None:
     parser.add_argument("--forget", metavar="PATTERN",
                         help="remove a remembered device: a number from "
                              "--trusted, a name/id substring, or 'all'")
+    parser.add_argument("--history", action="store_true",
+                        help="show the recorded history of every USB device seen, and exit")
     parser.add_argument("--no-trust", action="store_true",
                         help="ask about every device, ignore what is remembered")
     parser.add_argument("--trust-file", type=Path, metavar="FILE",
@@ -283,6 +285,11 @@ def main(argv=None) -> None:
 
     if args.trusted:
         cmd_trusted(trust_path)
+        return
+    if args.history:
+        from . import history
+        print(history.show_history(verbose=args.verbose,
+                                   path=args.ledger if args.ledger else None))
         return
     if args.forget:
         cmd_forget(trust_path, args.forget)

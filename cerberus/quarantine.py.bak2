@@ -140,8 +140,6 @@ class Observation:
     """What happened while the device was held in the closed room."""
     duration: float = 0.0
     race_window: float = 0.0        # seconds between authorize and first grab
-    exposure_window: float = 0.0    # seconds a live node existed BEFORE we grabbed it
-    first_node_at: float = 0.0      # internal: when the first input node appeared
     nodes: List[str] = field(default_factory=list)
     grabbed: List[str] = field(default_factory=list)
     grab_failures: List[str] = field(default_factory=list)
@@ -205,8 +203,7 @@ def find_input_nodes(usb_syspath: Path, context=None) -> List[str]:
 
 def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
                settle_timeout: float = 2.0,
-               capture: bool = False,
-               release_fn=None, bind_context=None) -> Observation:
+               capture: bool = False) -> Observation:
     """
     Authorize the device, immediately isolate its input nodes, and watch.
 
@@ -229,12 +226,8 @@ def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
     monitor.filter_by(subsystem="input")
     monitor.start()
 
-    cm = bind_context if bind_context is not None else _null_context()
-    with cm:
-        authorized_at = time.monotonic()
-        authorize_fn()                 # device on; interfaces still 0
-        if release_fn is not None:
-            release_fn()               # now drivers bind, nodes appear
+    authorized_at = time.monotonic()
+    authorize_fn()
 
     devices = []
     deadline = authorized_at + settle_timeout
@@ -248,14 +241,7 @@ def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
         if udev_dev is not None and udev_dev.action != "add":
             continue
 
-        _nodes_now = find_input_nodes(usb_syspath, ctx)
-        if _nodes_now and obs.first_node_at == 0.0:
-            # The instant a live node first exists: the exposure window
-            # opens here, not at authorization. With deferred bind this
-            # is ~50 ms after authorize (enumeration), but the grab
-            # follows within a poll tick, so exposure stays near zero.
-            obs.first_node_at = time.monotonic()
-        for node in _nodes_now:
+        for node in find_input_nodes(usb_syspath, ctx):
             if node in seen:
                 continue
             seen.add(node)
@@ -269,13 +255,7 @@ def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
                 devices.append(fd)
                 obs.grabbed.append(node)
                 if obs.race_window == 0.0:
-                    _now = time.monotonic()
-                    obs.race_window = _now - authorized_at
-                    # Exposure = how long a live node existed before we
-                    # grabbed it. This is the number that actually matters:
-                    # near zero means keystrokes had no window to land.
-                    if obs.first_node_at > 0.0:
-                        obs.exposure_window = _now - obs.first_node_at
+                    obs.race_window = time.monotonic() - authorized_at
             except OSError as exc:
                 obs.grab_failures.append(f"{node}: {exc}")
 

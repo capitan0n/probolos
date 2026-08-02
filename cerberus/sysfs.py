@@ -215,6 +215,11 @@ class _DirectBackend:
     def authorize(self, syspath: Path, value: int) -> None:
         (syspath / "authorized").write_text(str(value))
 
+    def authorize_interface(self, intf_dir, value: int) -> None:
+        # Interface-level authorization: controls whether the kernel
+        # binds a driver to ONE interface, not the whole device.
+        (intf_dir / "authorized").write_text(str(value))
+
     def set_default(self, hub: Path, value: int) -> None:
         (hub / "authorized_default").write_text(str(value))
 
@@ -234,6 +239,18 @@ def install_backend(backend) -> None:
     """Replace the privileged-write backend (used by privsep)."""
     global _backend
     _backend = backend
+
+
+def set_interface_authorized(intf_dir, value: int) -> None:
+    """
+    Authorize (1) or deauthorize (0) a single interface of a device.
+
+    An interface at 0 is configured but driverless: for HID that means
+    no evdev node is created, so the device has no path into the input
+    subsystem. This is what lets us authorize a device without opening
+    the grab race. Routed through the active backend, as set_authorized.
+    """
+    _backend.authorize_interface(intf_dir, value)
 
 
 def set_authorized(syspath: Path, value: int) -> None:

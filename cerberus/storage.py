@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from . import storage_hardening
+
 SECTOR = 512
 MBR_SIGNATURE = 0xAA55
 GPT_SIGNATURE = b"EFI PART"
@@ -82,6 +84,7 @@ class MediumReport:
     scheme: str = "unknown"          # mbr / gpt / none
     partitions: List[Partition] = field(default_factory=list)
     signatures: dict = field(default_factory=dict)  # partition index -> fs name
+    suspicious: List[str] = field(default_factory=list)  # impossible/hostile partitions
     error: Optional[str] = None
 
     @property
@@ -249,7 +252,16 @@ def inspect(device: str, open_fn=None) -> MediumReport:
     for part in report.partitions:
         if part.type_byte == PROTECTIVE_MBR_TYPE:
             continue
-        offset = part.start_lba * SECTOR
+        # HARDENING: never seek to a device-controlled offset without
+        # checking it fits inside the real device first. A partition
+        # claiming start_lba=0xFFFFFFFF would otherwise seek to ~2 TB.
+        offset = storage_hardening.safe_read_offset(
+            part.start_lba, report.size_sectors)
+        if offset is None:
+            report.suspicious.append(
+                f'partition {part.index}: start_lba {part.start_lba} '
+                f'does not fit the device; not read')
+            continue
         chunk = _read_at(device, offset, SECTOR, open_fn)
         if chunk:
             fs = sniff_filesystem(chunk)

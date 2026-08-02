@@ -486,7 +486,17 @@ def race_window_note(obs) -> Optional[str]:
     """
     if not obs.observed:
         return None
-    return (f"isolated {obs.race_window * 1000:.0f} ms after authorization; "
+    enum_ms = obs.race_window * 1000
+    exp_ms = obs.exposure_window * 1000
+    # Two distinct numbers, because conflating them hides the mechanism:
+    #   enumeration = authorize -> grab (kernel work; ~constant)
+    #   exposure    = live node existed -> grab (the real risk window)
+    if obs.first_node_at > 0.0 and exp_ms < enum_ms:
+        return (f"enumeration {enum_ms:.0f} ms; actual exposure {exp_ms:.0f} ms "
+                f"(a live input node existed for {exp_ms:.0f} ms before capture)")
+    # Fallback path (no deferred bind, or node timing unavailable): the
+    # old honest statement, where enumeration and exposure coincide.
+    return (f"isolated {enum_ms:.0f} ms after authorization; "
             f"anything sent in that window reached the session")
 
 
