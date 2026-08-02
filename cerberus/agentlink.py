@@ -39,13 +39,44 @@ cheap for a device that matches an attack pattern, and a person clicking through
 a popup is not in the same state of attention as one typing the word
 "authorize". For those, the agent is told to display a warning and refer the
 decision to the terminal.
+
+WHO IS ALLOWED TO BE THE AGENT
+------------------------------
+The socket is mode 0660 in a 2770 directory, so only the desktop user's group
+can open it at all. That is a real boundary, but it is filesystem permission
+alone, and three things have to hold on top of it before a click on a
+notification can be treated as a human decision:
+
+    1. The connecting process is who it claims to be. SO_PEERCRED is recorded
+       by the kernel at connect() time, cannot be forged by the peer, and is
+       the only identity claim here that the client does not simply assert.
+
+    2. A live agent cannot be displaced. Accepting each new connection over
+       the old one was written for the case where the agent restarts; it also
+       means anything that can open the socket can evict the running agent and
+       become the thing that answers questions about hardware.
+
+    3. An answer cannot precede its question. Request ids counting from 1 let
+       a client put replies into the buffer before anything is asked, so the
+       first real device question resolves instantly from a value chosen by
+       the client rather than by a person. Ids are therefore unguessable, and
+       whatever is buffered when a question is asked is discarded unread.
+
+What remains, deliberately: a process running as the desktop user can occupy
+the agent slot and never answer. That is not a bypass -- ask() times out and
+the daemon falls back to the terminal, which is the safe direction -- and it
+cannot be closed here, because a process with that uid can ptrace the real
+agent anyway. The trust boundary is the uid, and it is now enforced by the
+kernel rather than only by file permissions.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import socket
+import struct
 import threading
 import time
 from pathlib import Path
@@ -67,6 +98,61 @@ ANSWER_ALWAYS = "always"
 ANSWER_NO = "no"
 
 MAX_MESSAGE = 16384
+
+# struct ucred { pid_t pid; uid_t uid; gid_t gid; } -- a signed int followed by
+# two unsigned ones. Linux-specific, like the rest of this project.
+_UCRED = "iII"
+_UCRED_SIZE = struct.calcsize(_UCRED)
+
+
+def peer_credentials(conn) -> tuple:
+    """
+    Who is on the other end of a connected Unix socket, per the kernel.
+
+    Returns (pid, uid, gid). The kernel fills these in at connect() time from
+    the connecting process's real credentials, so they cannot be spoofed by
+    the peer and do not change if it later execs something setuid.
+    """
+    raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED_SIZE)
+    return struct.unpack(_UCRED, raw)
+
+
+def _still_connected(conn) -> bool:
+    """
+    True while the peer's end is still open.
+
+    MSG_PEEK looks without consuming, so a real answer already in flight is not
+    swallowed by the liveness check. An idle live connection has nothing to
+    read and raises BlockingIOError; a peer that has gone away returns b"".
+    Data waiting to be read also counts as alive, which is correct: something
+    is there, and if it turns out not to be a real agent the question put to it
+    simply times out into the terminal fallback.
+
+    The socket is switched to non-blocking explicitly rather than relying on
+    MSG_DONTWAIT. On a socket that has a timeout set -- which every accepted
+    connection here does -- CPython waits for readability BEFORE calling recv,
+    so MSG_DONTWAIT never gets a chance to take effect and the call blocks for
+    the full timeout and then raises socket.timeout. socket.timeout is an
+    OSError, so a perfectly healthy idle agent would be reported dead, and the
+    connection it is holding would be handed to whoever asked next -- turning
+    the fix for connection hijacking back into the hijack itself.
+    """
+    try:
+        previous = conn.gettimeout()
+        conn.setblocking(False)
+    except OSError:
+        return False
+    try:
+        return bool(conn.recv(1, socket.MSG_PEEK))
+    except (BlockingIOError, InterruptedError):
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            conn.settimeout(previous)
+        except OSError:
+            pass
 
 
 def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
@@ -94,19 +180,28 @@ class AgentLink:
     Server side. Accepts one agent at a time and asks it questions.
 
     Connections are accepted on a background thread so the udev loop is never
-    blocked waiting for a desktop process that may never appear. Only the most
-    recent connection is kept: an agent that restarts (logout, crash, session
-    change) simply replaces the old one.
+    blocked waiting for a desktop process that may never appear. One agent is
+    connected at a time: a dead one is replaced, a live one is never displaced.
+    An agent that restarts (logout, crash, session change) reconnects into the
+    slot its predecessor's closed socket freed.
+
+    `allowed_uids` is the set of uids permitted to be the agent -- normally the
+    single uid of the desktop session, which the launcher already knows because
+    it passes it to prepare_socket_dir(). When it is None no uid check is made
+    and the peer is only logged, which keeps existing callers working but
+    leaves the boundary at file permissions alone; pass it in.
     """
 
-    def __init__(self, path: Path = DEFAULT_SOCKET, log=print):
+    def __init__(self, path: Path = DEFAULT_SOCKET, log=print,
+                 allowed_uids=None):
         self.path = Path(path)
         self.log = log
+        self.allowed_uids = None if allowed_uids is None else set(allowed_uids)
         self._listener: Optional[socket.socket] = None
         self._conn: Optional[socket.socket] = None
+        self._peer: Optional[tuple] = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._next_id = 1
 
     # ---- lifecycle ----
 
@@ -128,6 +223,15 @@ class AgentLink:
             return False
 
         threading.Thread(target=self._accept_loop, daemon=True).start()
+        if self.allowed_uids is None:
+            # Visible rather than silent. Without a uid the only thing keeping
+            # other accounts off this socket is the 0660/2770 permission pair,
+            # and on a distribution whose useradd puts everyone in a shared
+            # primary group (`users`, gid 100) that is every interactive
+            # account on the machine. The caller is expected to pass a uid;
+            # saying so is cheaper than someone discovering it later.
+            self.log("[agent] WARNING: no permitted uid configured; any "
+                     "process that can open the socket may answer")
         return True
 
     def stop(self) -> None:
@@ -140,6 +244,7 @@ class AgentLink:
                     except OSError:
                         pass
             self._conn = self._listener = None
+            self._peer = None
         try:
             self.path.unlink()
         except OSError:
@@ -153,20 +258,55 @@ class AgentLink:
                 continue
             except OSError:
                 break
-            conn.settimeout(1.0)
-            with self._lock:
-                if self._conn:
-                    try:
-                        self._conn.close()
-                    except OSError:
-                        pass
-                self._conn = conn
-            self.log("[agent] desktop agent connected")
+            self._admit(conn)
+
+    def _admit(self, conn) -> None:
+        """
+        Decide whether a connecting process may become the agent.
+
+        Refusal is silent to the peer and logged here: an attacker learns
+        nothing from the socket, and the user has a record that something
+        tried. Both refusal paths close the connection rather than leaving it
+        open and ignored, so a rejected client cannot hold a descriptor open
+        waiting for the real agent to disconnect.
+        """
+        conn.settimeout(1.0)
+        try:
+            pid, uid, gid = peer_credentials(conn)
+        except OSError as exc:
+            self.log(f"[agent] refused: peer credentials unreadable ({exc})")
+            self._close(conn)
+            return
+
+        if self.allowed_uids is not None and uid not in self.allowed_uids:
+            self.log(f"[agent] REFUSED connection from uid={uid} pid={pid}: "
+                     f"not a permitted agent user")
+            self._close(conn)
+            return
+
+        with self._lock:
+            if self._conn is not None and _still_connected(self._conn):
+                self.log(f"[agent] REFUSED second agent from uid={uid} "
+                         f"pid={pid}: one is already connected")
+                self._close(conn)
+                return
+            if self._conn is not None:
+                self._close(self._conn)
+            self._conn = conn
+            self._peer = (pid, uid, gid)
+
+        self.log(f"[agent] desktop agent connected (pid={pid} uid={uid})")
 
     @property
     def connected(self) -> bool:
         with self._lock:
             return self._conn is not None
+
+    @property
+    def peer(self) -> Optional[tuple]:
+        """(pid, uid, gid) of the connected agent, or None."""
+        with self._lock:
+            return self._peer
 
     # ---- asking ----
 
@@ -186,8 +326,23 @@ class AgentLink:
         if conn is None:
             return None
 
-        request_id = self._next_id
-        self._next_id += 1
+        # Unguessable rather than sequential, and drawn from the CSPRNG rather
+        # than from `random`, whose output is reconstructible from a handful of
+        # samples. Unpredictability IS the mechanism here: it is what makes an
+        # answer to a question that has not been asked yet impossible to
+        # construct. 63 bits keeps it a positive, JSON-safe integer, so the
+        # agent -- which only echoes the id back -- needs no change at all.
+        #
+        # A second bug goes with it: `self._next_id += 1` ran outside the lock,
+        # so two devices attached at once could be given the same id and one
+        # answer could resolve both questions.
+        request_id = secrets.randbits(63)
+
+        # Whatever is already buffered was sent before this question existed
+        # and therefore cannot be an answer to it. Discard it unread rather
+        # than parse it -- parsing is what let pre-sent replies win the race.
+        self._drain(conn)
+
         message = {
             "type": MSG_DECIDE,
             "id": request_id,
@@ -206,24 +361,51 @@ class AgentLink:
 
         deadline = time.monotonic() + timeout
         buffer = b""
-        while time.monotonic() < deadline:
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                # Wait for what is LEFT of the budget, not a flat second. The
+                # loop used to check the deadline only before blocking for a
+                # full second, so an answer arriving up to a second after the
+                # deadline had passed was still accepted -- and the user had
+                # been shown a dialog counting down to that deadline. A
+                # decision must not be honoured after the window it was asked
+                # in has closed.
+                conn.settimeout(min(1.0, remaining))
+                try:
+                    chunk = conn.recv(MAX_MESSAGE)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    self._drop(conn)
+                    return None
+                if not chunk:
+                    self._drop(conn)
+                    return None
+                buffer += chunk
+                if len(buffer) > MAX_MESSAGE:
+                    # MAX_MESSAGE bounded each recv() but not their sum, so a
+                    # peer sending bytes and never a newline grew this without
+                    # limit until the timeout. An agent's answer is a few dozen
+                    # bytes; 16 KB with no line ending is not one, and is not
+                    # worth holding a connection open for.
+                    self.log("[agent] oversized reply, dropping connection")
+                    self._drop(conn)
+                    return None
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    answer = self._parse_answer(line, request_id)
+                    if answer is not None:
+                        return answer
+        finally:
+            # Leave the socket as the accept path set it up, whatever exit was
+            # taken, so the next question does not inherit a shrunken timeout.
             try:
-                chunk = conn.recv(MAX_MESSAGE)
-            except socket.timeout:
-                continue
+                conn.settimeout(1.0)
             except OSError:
-                self._drop(conn)
-                return None
-            if not chunk:
-                self._drop(conn)
-                return None
-            buffer += chunk
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                answer = self._parse_answer(line, request_id)
-                if answer is not None:
-                    return answer
-        return None
+                pass
 
     def notify_critical(self, title: str, body: str) -> None:
         """
@@ -261,11 +443,51 @@ class AgentLink:
         answer = obj.get("answer")
         return answer if answer in (ANSWER_YES, ANSWER_ALWAYS, ANSWER_NO) else None
 
-    def _drop(self, conn) -> None:
-        with self._lock:
-            if self._conn is conn:
-                self._conn = None
+    def _drain(self, conn) -> int:
+        """
+        Discard everything already buffered. Returns the number of bytes thrown
+        away, which is non-zero only when someone was speaking out of turn.
+        """
+        discarded = 0
+        try:
+            previous = conn.gettimeout()
+            conn.setblocking(False)
+        except OSError:
+            return 0
+        try:
+            while True:
+                try:
+                    chunk = conn.recv(MAX_MESSAGE)
+                except (BlockingIOError, InterruptedError):
+                    break            # nothing left waiting: buffer is clear
+                except OSError:
+                    break
+                if not chunk:
+                    break            # peer closed; ask() will notice shortly
+                discarded += len(chunk)
+        finally:
+            # Restore what was there rather than assuming: leaving the socket
+            # non-blocking would turn ask()'s recv loop into a busy spin.
+            try:
+                conn.settimeout(previous)
+            except OSError:
+                pass
+        if discarded:
+            self.log(f"[agent] discarded {discarded} unsolicited bytes before "
+                     f"asking -- an agent should only speak when asked")
+        return discarded
+
+    @staticmethod
+    def _close(conn) -> None:
+        """Close without touching shared state, so it is safe under the lock."""
         try:
             conn.close()
         except OSError:
             pass
+
+    def _drop(self, conn) -> None:
+        with self._lock:
+            if self._conn is conn:
+                self._conn = None
+                self._peer = None
+        self._close(conn)

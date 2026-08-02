@@ -33,7 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -74,6 +74,78 @@ class Entry:
     # list itself is the evidence of drift; length > 1 means the device has
     # changed what it says it is.
     known_hashes: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_raw(cls, raw) -> Optional["Entry"]:
+        """
+        Build an Entry from untrusted JSON, or return None if it is not one.
+
+        WHY THIS EXISTS
+        ---------------
+        `Entry(**raw)` treats the file's contents as state. They are input. The
+        ledger is written by the unprivileged half and lives on disk, so its
+        shape is whatever was last written there -- and one unexpected key, one
+        missing key or one null value raises TypeError out of __init__, from
+        inside load(), from inside Ledger.__init__. Nothing catches it, the
+        daemon never finishes starting, `authorized_default` is never set to 0,
+        and the gate stays open. A file that cannot be trusted must not be able
+        to decide whether the gate closes.
+
+        Unknown keys are dropped rather than rejected, so a ledger written by a
+        newer version degrades to what this version understands instead of
+        being thrown away in full.
+        """
+        if not isinstance(raw, dict):
+            return None
+
+        def as_str(value) -> Optional[str]:
+            return value if isinstance(value, str) else None
+
+        def as_time(value) -> Optional[float]:
+            # bool is a subclass of int in Python, so an explicit check is
+            # needed: a JSON `true` is not a timestamp.
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            return float(value)
+
+        def as_str_list(value) -> List[str]:
+            # Individual bad elements are dropped, not the whole list: a
+            # truncated port history is still usable history.
+            if not isinstance(value, list):
+                return []
+            return [item for item in value if isinstance(item, str)]
+
+        identity = as_str(raw.get("identity"))
+        digest = as_str(raw.get("descriptor_hash"))
+        first_seen = as_time(raw.get("first_seen"))
+        last_seen = as_time(raw.get("last_seen"))
+        if identity is None or digest is None:
+            return None
+        if first_seen is None or last_seen is None:
+            return None
+
+        times_seen = raw.get("times_seen", 1)
+        if isinstance(times_seen, bool) or not isinstance(times_seen, int):
+            times_seen = 1
+
+        return cls(
+            identity=identity,
+            descriptor_hash=digest,
+            first_seen=first_seen,
+            last_seen=last_seen,
+            times_seen=max(1, times_seen),
+            ports=as_str_list(raw.get("ports")),
+            decisions=as_str_list(raw.get("decisions")),
+            known_hashes=as_str_list(raw.get("known_hashes")),
+        )
+
+
+# from_raw() names every field of Entry explicitly. If a field is added to the
+# dataclass and not to from_raw, a ledger that HAS that data would silently
+# load it as the default -- history quietly lost rather than loudly refused.
+# The test suite compares this set against what from_raw round-trips, so the
+# two cannot drift apart unnoticed.
+ENTRY_FIELD_NAMES = frozenset(f.name for f in fields(Entry))
 
 
 def descriptor_fingerprint(dev) -> Optional[str]:
@@ -123,8 +195,38 @@ class Ledger:
         if data.get("schema") != SCHEMA_VERSION:
             self.load_error = f"unsupported ledger schema {data.get('schema')}"
             return
-        for key, raw in (data.get("entries") or {}).items():
-            self.entries[key] = Entry(**raw)
+        entries = data.get("entries")
+        if entries is None:
+            return
+        if not isinstance(entries, dict):
+            # `"entries": []` is valid JSON of the right schema version and
+            # would raise AttributeError on .items(). Same class of problem as
+            # the one below, same answer: no history rather than no gate.
+            self.load_error = "ledger 'entries' is not an object"
+            return
+
+        skipped = 0
+        for key, raw in entries.items():
+            if not isinstance(key, str):
+                skipped += 1
+                continue
+            entry = Entry.from_raw(raw)
+            if entry is None:
+                skipped += 1
+                continue
+            self.entries[key] = entry
+
+        if skipped:
+            # Loud on purpose. A dropped entry is a device whose history is
+            # gone, so its next appearance looks like a first sighting and no
+            # drift can be reported for it. Silently ignoring malformed entries
+            # would turn a corrupt file into a way of ERASING the ledger's
+            # memory of one chosen device -- which is precisely the attack the
+            # ledger exists to catch.
+            self.load_error = (
+                f"{skipped} malformed ledger "
+                f"{'entry' if skipped == 1 else 'entries'} ignored -- "
+                f"drift detection for those devices is lost")
 
     def save(self) -> Optional[str]:
         """
