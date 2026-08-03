@@ -207,8 +207,13 @@ class AgentSocketHardening(unittest.TestCase):
         client = self.client(link)
 
         def flood():
+            # Keep sending until the server closes the connection on us. The
+            # exact iteration count is not the point -- the point is that the
+            # sum crosses MAX_MESSAGE before any newline arrives. Looping until
+            # OSError makes that independent of how the two threads interleave,
+            # which differs between interpreter versions.
             try:
-                for _ in range(8):
+                while True:
                     client.sendall(b"A" * 4096)
             except OSError:
                 pass

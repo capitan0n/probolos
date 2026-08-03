@@ -6,6 +6,7 @@ up unable to use their own computer, and asserts that it cannot happen. They
 are the tests that must never be deleted to make a feature pass.
 """
 
+import os
 import tempfile
 import time
 import unittest
@@ -69,7 +70,12 @@ class TestWatchdog(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.panic = Path(self.tmp.name) / "panic"
-        self.policy = safety.SafetyPolicy(panic_file=self.panic)
+        # The panic file must normally be root-owned in a root-owned directory.
+        # Under test we create it as the current user in a user-owned tmpdir,
+        # so tell the policy to accept that uid; the ownership LOGIC is exercised
+        # by test_safety_panic.py, not here.
+        self.policy = safety.SafetyPolicy(panic_file=self.panic,
+                                          panic_file_uid=os.getuid())
         self.stalls = []
 
     def tearDown(self):

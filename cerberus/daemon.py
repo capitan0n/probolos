@@ -282,22 +282,12 @@ class Cerberus:
         # ---- stage 3: behavioural quarantine, for input devices only ----
         # An input device is the only kind that can act against you the instant
         # it is authorized, so it is the only kind worth the risk of switching
-        # on early. Storage and everything else stay blocked until approved.
-        # ---- stage 4: look inside storage media, without mounting --------
-        if self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds:
-            medium = self._inspect_medium(dev)
-            if medium is not None:
-                storage_findings = analyzers.run(
-                    analyzers.Context(device=dev, config=self.rule_config,
-                                      extra={"medium": medium}),
-                    analyzers=[analyzers.StorageAnalyzer()])
-                print()
-                print(report.render_medium(medium, storage_findings))
-                print()
-                findings = sorted(list(findings) + storage_findings,
-                                  key=lambda f: f.severity, reverse=True)
-
-        if self.observe > 0 and usbclass.KIND_INPUT in dev.kinds:
+        # on early -- and even then only under an EVIOCGRAB that swallows its
+        # events. This MUST run before stage 4: stage 4 authorizes the whole
+        # device to read its medium, and on a composite storage+keyboard device
+        # that same authorization would switch the keyboard on as well.
+        has_input = usbclass.KIND_INPUT in dev.kinds
+        if self.observe > 0 and has_input:
             obs = self._quarantine(dev)
             # THE DEVICE GOES STRAIGHT BACK TO BLOCKED.
             #
@@ -327,6 +317,35 @@ class Cerberus:
             print()
             findings = sorted(list(findings) + behaviour,
                               key=lambda f: f.severity, reverse=True)
+
+        # ---- stage 4: look inside storage media, without mounting --------
+        # Storage inspection authorizes the whole device so its block node
+        # appears. That is safe for a pure storage device, but on a composite
+        # storage+input device it would switch the input half on WITHOUT a grab,
+        # handing a BadUSB up to ~3 seconds of live keystrokes. There is nothing
+        # to gain either: such a device has already earned a CRITICAL "storage
+        # device that can also type" finding, and its partition table cannot
+        # make that verdict any safer. So storage is read only when the device
+        # cannot also type.
+        if (self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds
+                and not has_input):
+            medium = self._inspect_medium(dev)
+            if medium is not None:
+                storage_findings = analyzers.run(
+                    analyzers.Context(device=dev, config=self.rule_config,
+                                      extra={"medium": medium}),
+                    analyzers=[analyzers.StorageAnalyzer()])
+                print()
+                print(report.render_medium(medium, storage_findings))
+                print()
+                findings = sorted(list(findings) + storage_findings,
+                                  key=lambda f: f.severity, reverse=True)
+        elif (self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds
+                and has_input):
+            print("  This device declares BOTH storage and an input interface.")
+            print("  Its medium will NOT be read: authorizing it to look would")
+            print("  also switch the input half on without a grab. It is held")
+            print("  for your decision on the strength of that alone.\n")
 
         if was_held and self.trust is not None and self.trust.is_trusted(dev):
             print("  Note: this device is on your remembered list, but it was")
