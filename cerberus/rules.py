@@ -33,6 +33,7 @@ from enum import IntEnum
 from typing import Dict, List, Optional, Sequence, Set
 
 from . import usbclass
+from .textsafe import NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE
 
 # Class codes referenced by the rules
 CLS_AUDIO = 0x01
@@ -97,6 +98,47 @@ BENIGN_CLASS_GROUPS: List[Set[int]] = [
 
 # Words in a device's own strings that suggest it is storage. Used only for
 # self-contradiction checks -- never for matching against an external database.
+# USB descriptor string fields, mapped to a phrase an operator can read.
+# The keys are the names descriptors.py attaches to string_note_fields.
+_STRING_FIELD_PHRASES = {
+    "iManufacturer": "manufacturer name",
+    "iProduct": "product name",
+    "iSerialNumber": "serial number",
+    "manufacturer": "manufacturer name",
+    "product": "product name",
+    "serial": "serial number",
+}
+
+
+def _crafted_field_phrases(per_field: Dict[str, Sequence[str]],
+                           wanted: Set[str]) -> List[str]:
+    """
+    Names of the fields whose sanitiser notes intersect `wanted`.
+
+    per_field maps a descriptor field name to the list of textsafe notes it
+    triggered. We return the human phrase for each field that carries at least
+    one of the notes we care about, in a stable order so the message and the
+    tests are deterministic.
+    """
+    out: List[str] = []
+    for field_name, field_notes in per_field.items():
+        if set(field_notes) & wanted:
+            phrase = _STRING_FIELD_PHRASES.get(field_name, field_name)
+            if phrase not in out:
+                out.append(phrase)
+    return out
+
+
+def _join_phrases(phrases: Sequence[str]) -> str:
+    """Join phrases for prose: 'a', 'a and b', 'a, b and c'."""
+    items = list(phrases)
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
 STORAGE_WORDS = ("flash", "drive", "disk", "storage", "stick", "cruzer",
                  "datatraveler", "memory", "sd card", "card reader", "ssd")
 
@@ -191,20 +233,25 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
             "combination is not one of the patterns known to be routine.")
 
     # -- 6. Structural anomalies in the descriptors ------------------------
-    if dev.parse_error:
+    # These attributes are read with getattr so the rule engine stays
+    # trivially unit-testable with lightweight stubs that only carry the
+    # fields a given rule needs. A real sysfs.UsbDevice always defines them.
+    parse_error = getattr(dev, "parse_error", None)
+    if parse_error:
         add("unreadable-descriptors", Severity.WARNING,
             "Device descriptors could not be read",
-            f"{dev.parse_error}. A device whose own descriptors do not parse "
+            f"{parse_error}. A device whose own descriptors do not parse "
             "is either broken or deliberately malformed. Either way its claims "
             "cannot be checked, so it cannot be assessed.")
 
-    if dev.descriptor_set and dev.descriptor_set.declared_interface_mismatch():
+    descriptor_set = getattr(dev, "descriptor_set", None)
+    if descriptor_set and descriptor_set.declared_interface_mismatch():
         add("interface-count-mismatch", Severity.WARNING,
             "Device disagrees with itself about its own structure",
             "A configuration declares a different number of interfaces than it "
             "actually contains. Honest hardware is internally consistent.")
 
-    if dev.descriptor_set and not ifaces:
+    if descriptor_set and not ifaces:
         add("no-interfaces", Severity.NOTICE,
             "Device declares no interfaces",
             "Nothing can be said about what this device does, because it "
@@ -218,6 +265,51 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
             "full-speed. High-speed is typical of devices built on flash-drive "
             "hardware. This signal is weak on its own: keyboards with built-in "
             "hubs or USB passthrough are legitimately high-speed.")
+
+    # -- 7b. The device's own strings were crafted, not just messy ---------
+    # textsafe.py sanitises every USB string and records WHY it had to. Those
+    # notes surface here as findings. The split matters: control characters and
+    # bidi overrides are active deception (they rewrite what the operator reads
+    # in the prompt), while zero-width/invisible characters are a weaker signal
+    # that is often just sloppy Unicode. So the first two escalate together and
+    # the third is only ever a NOTICE.
+    notes = set(getattr(dev, "string_notes", ()) or ())
+    per_field = getattr(dev, "string_note_fields", {}) or {}
+
+    deceptive = notes & {NOTE_CONTROL, NOTE_BIDI}
+    if deceptive:
+        fields = _crafted_field_phrases(per_field, {NOTE_CONTROL, NOTE_BIDI})
+        where = _join_phrases(fields)
+        detail = (f" The {where} contains characters that do not print as "
+                  "themselves." if where else "")
+        add("crafted-strings", Severity.WARNING,
+            "Device strings contain characters designed to mislead",
+            "One of this device's text fields carries control characters or a "
+            "right-to-left override. Those do not describe anything -- their "
+            "only effect is to change what this prompt shows you versus what "
+            "the device really is." + detail)
+
+        # Escalation: a device that can TYPE and also lies about its own name
+        # is expressing intent, not manufacturing sloppiness. Treated like the
+        # other BadUSB signatures.
+        if has_keyboard:
+            add("crafted-strings-hid", Severity.CRITICAL,
+                "A device that can type also disguised its own name",
+                "This device declares a keyboard interface AND hides deceptive "
+                "characters in its identity strings." + detail + " A real "
+                "keyboard has no reason to obfuscate its name; combined with "
+                "the ability to inject keystrokes this matches a BadUSB that is "
+                "trying not to be recognised.")
+
+    if NOTE_INVISIBLE in notes:
+        fields = _crafted_field_phrases(per_field, {NOTE_INVISIBLE})
+        where = _join_phrases(fields)
+        detail = (f" Seen in the {where}." if where else "")
+        add("invisible-string-characters", Severity.NOTICE,
+            "Device strings contain invisible characters",
+            "One or more zero-width or otherwise invisible characters appear in "
+            "this device's text. This is often just careless Unicode rather "
+            "than an attack, so it is flagged only for awareness." + detail)
 
     # -- 8. What the device says about its own power draw ------------------
     findings.extend(_power_findings(dev, cfg))
@@ -319,9 +411,12 @@ def _is_benign_group(classes: Set[int], cfg: RuleConfig) -> bool:
 
 
 def _speed_mbps(dev) -> Optional[float]:
+    # AttributeError is caught alongside the value errors so a device (or a
+    # test stub) that simply does not carry a speed reads as "unknown speed"
+    # rather than crashing the whole evaluation.
     try:
         return float(dev.speed)
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return None
 
 

@@ -39,9 +39,30 @@ devices nobody was ever shown.
 
 from __future__ import annotations
 
+import html
 import shutil
 import subprocess
 from typing import Optional
+
+
+def _markup_safe(text: str) -> str:
+    """
+    Neutralise markup for backends that render rich text.
+
+    kdialog renders Qt rich text and zenity renders Pango markup, so a device
+    whose iProduct is '<a href="file:///etc/shadow">Kingston</a>' would draw a
+    live link -- or worse, restyle the prompt to look reassuring -- right next
+    to the Allow button. That is the one surface where the decision is actually
+    made, so it must show the name literally.
+
+    This escapes the five characters that begin or end markup (& < > " ')
+    via html.escape. A legitimate name like 'A<B & C>D' survives intact, just
+    inert: it renders as written instead of being interpreted. Backends that
+    render PLAIN text (tkinter, the terminal) must NOT call this -- there the
+    escaped entities would show up literally as '&lt;', which is its own kind
+    of corruption.
+    """
+    return html.escape(text, quote=True)
 
 
 # Three-way answers, matching the terminal prompt's [y]es once / [a]lways / [N]o.
@@ -98,9 +119,12 @@ class KDialogBackend(DialogBackend):
         # --warningyesno gives a warning icon and two labelled buttons. Exit
         # code 0 means the first (yes) button; anything else is a refusal,
         # including the window being closed.
-        args = [self._binary, "--title", title,
+        # kdialog renders the body as Qt rich text, so the device-controlled
+        # text is escaped; the title is our own string but escaped too for
+        # uniformity and in case a device name is ever folded into it.
+        args = [self._binary, "--title", _markup_safe(title),
                 "--yes-label", yes_label, "--no-label", no_label,
-                "--warningyesno", text]
+                "--warningyesno", _markup_safe(text)]
         try:
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
@@ -118,11 +142,11 @@ class KDialogBackend(DialogBackend):
         # least privileged choice (once) is the primary button and the most
         # privileged (always) is the secondary one -- the default should be the
         # smaller grant, not the larger.
-        args = [self._binary, "--title", title,
+        args = [self._binary, "--title", _markup_safe(title),
                 "--yes-label", once_label,
                 "--no-label", always_label,
                 "--cancel-label", no_label,
-                "--warningyesnocancel", text]
+                "--warningyesnocancel", _markup_safe(text)]
         try:
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
@@ -150,8 +174,12 @@ class ZenityBackend(DialogBackend):
 
     def confirm(self, title: str, text: str, yes_label: str,
                 no_label: str, timeout: float) -> Optional[bool]:
-        args = [self._binary, "--question", "--title", title,
-                "--text", text,
+        # zenity's --text is interpreted as Pango markup by default. We escape
+        # rather than pass --no-markup because --no-markup is absent on older
+        # zenity builds and would make the call fail outright; html.escape
+        # neutralises the same five characters Pango uses and works everywhere.
+        args = [self._binary, "--question", "--title", _markup_safe(title),
+                "--text", _markup_safe(text),
                 "--ok-label", yes_label, "--cancel-label", no_label,
                 "--default-cancel"]
         try:
@@ -169,8 +197,8 @@ class ZenityBackend(DialogBackend):
         # zenity has no third button, but --extra-button adds one that prints
         # its own label on stdout and exits non-zero. So: OK means once, the
         # extra button means always, and anything else is a refusal.
-        args = [self._binary, "--question", "--title", title,
-                "--text", text,
+        args = [self._binary, "--question", "--title", _markup_safe(title),
+                "--text", _markup_safe(text),
                 "--ok-label", once_label, "--cancel-label", no_label,
                 "--extra-button", always_label, "--default-cancel"]
         try:
