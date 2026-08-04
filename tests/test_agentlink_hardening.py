@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from cerberus.agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_YES,
@@ -244,6 +245,59 @@ class AgentSocketHardening(unittest.TestCase):
 
         self.assertIsNone(link.ask("first", "body", "INFO", True, 0.4))
         self.assertIsNone(link.ask("second", "body", "INFO", True, 0.4))
+
+
+class SocketOwnership(unittest.TestCase):
+    """
+    Regression for the no-privsep agent socket being unreachable.
+
+    Observed on a real run: `sudo python -m cerberus --agent` (no --privsep)
+    left /run/cerberus/agent.sock owned root:root 0660, so the agent -- which
+    runs as the desktop user -- got EACCES on connect(). start() must chown the
+    socket to the desktop owner when it bound it as root.
+
+    os.geteuid and os.chown are patched so the logic is exercised without
+    actually being root and without touching real ownership.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+
+    def _link(self, **kw):
+        from cerberus.agentlink import AgentLink
+        return AgentLink(Path(self._dir.name) / "s.sock",
+                         log=lambda *_: None, **kw)
+
+    def test_root_bind_chowns_socket_to_owner(self):
+        from cerberus import agentlink
+        link = self._link(owner_uid=1000, owner_gid=1000)
+        calls = []
+        with mock.patch.object(agentlink.os, "geteuid", return_value=0), \
+             mock.patch.object(agentlink.os, "chown",
+                               side_effect=lambda p, u, g: calls.append((u, g))):
+            self.assertTrue(link.start())
+        link.stop()
+        self.assertIn((1000, 1000), calls,
+                      "socket was not handed to the desktop user")
+
+    def test_non_root_does_not_attempt_chown(self):
+        from cerberus import agentlink
+        link = self._link(owner_uid=1000, owner_gid=1000)
+        with mock.patch.object(agentlink.os, "geteuid", return_value=1000), \
+             mock.patch.object(agentlink.os, "chown") as chown:
+            self.assertTrue(link.start())
+        link.stop()
+        chown.assert_not_called()
+
+    def test_no_owner_does_not_attempt_chown(self):
+        from cerberus import agentlink
+        link = self._link()   # owner_uid None: --privsep case
+        with mock.patch.object(agentlink.os, "geteuid", return_value=0), \
+             mock.patch.object(agentlink.os, "chown") as chown:
+            self.assertTrue(link.start())
+        link.stop()
+        chown.assert_not_called()
 
 
 if __name__ == "__main__":

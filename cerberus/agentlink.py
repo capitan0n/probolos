@@ -193,10 +193,18 @@ class AgentLink:
     """
 
     def __init__(self, path: Path = DEFAULT_SOCKET, log=print,
-                 allowed_uids=None):
+                 allowed_uids=None, owner_uid=None, owner_gid=None):
         self.path = Path(path)
         self.log = log
         self.allowed_uids = None if allowed_uids is None else set(allowed_uids)
+        # When set, start() chowns the socket (and the directory it had to
+        # create) to this owner. This is the no-privsep case: root binds the
+        # socket directly, so without a chown it stays root:root 0660 and the
+        # desktop agent -- which runs as the user, not root -- gets EACCES on
+        # connect(). Under --privsep the directory is prepared by the launcher
+        # instead and these stay None.
+        self.owner_uid = owner_uid
+        self.owner_gid = owner_gid
         self._listener: Optional[socket.socket] = None
         self._conn: Optional[socket.socket] = None
         self._peer: Optional[tuple] = None
@@ -207,14 +215,17 @@ class AgentLink:
 
     def start(self) -> bool:
         try:
+            created_dir = not self.path.parent.exists()
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.exists():
                 self.path.unlink()
             self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._listener.bind(str(self.path))
-            # Group-accessible only. The group was set on the directory by the
-            # launcher and inherited via its setgid bit.
+            # Group-accessible only. Under --privsep the group was set on the
+            # directory by the launcher and inherited via its setgid bit; in
+            # the no-privsep case we chown below to reach the same end.
             os.chmod(self.path, 0o660)
+            self._chown_for_owner(created_dir)
             self._listener.listen(1)
             self._listener.settimeout(0.5)
         except OSError as exc:
@@ -233,6 +244,34 @@ class AgentLink:
             self.log("[agent] WARNING: no permitted uid configured; any "
                      "process that can open the socket may answer")
         return True
+
+    def _chown_for_owner(self, created_dir: bool) -> None:
+        """
+        Hand the socket to the desktop user when we bound it as root.
+
+        Without this the socket is root:root 0660 and the agent -- which runs
+        as the user, not root -- cannot connect. It only applies when an owner
+        was supplied AND we are actually root; a non-root daemon has nothing to
+        grant and silently skips. The directory is only chowned if THIS call
+        created it, so a shared /run/cerberus set up by something else is left
+        as it was found.
+
+        SO_PEERCRED still guards who may answer, so widening filesystem access
+        to the socket does not widen who is trusted: an unauthorized uid can
+        open it and is then refused in _admit().
+        """
+        if self.owner_uid is None or os.geteuid() != 0:
+            return
+        gid = self.owner_gid if self.owner_gid is not None else -1
+        try:
+            os.chown(self.path, self.owner_uid, gid)
+            if created_dir:
+                os.chown(self.path.parent, self.owner_uid, gid)
+        except OSError as exc:
+            # Non-fatal: the socket still exists and root can use it. Log it so
+            # a failed agent connection has an explanation.
+            self.log(f"[agent] could not chown {self.path} to uid "
+                     f"{self.owner_uid}: {exc}")
 
     def stop(self) -> None:
         self._stop.set()

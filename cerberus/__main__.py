@@ -143,6 +143,37 @@ def _active_session_user() -> Optional[str]:
     return os.environ.get("SUDO_USER")
 
 
+def _resolve_agent_identity(args):
+    """
+    Who is allowed to answer questions about hardware: (uid, gid, name).
+
+    Resolved once, before the privsep branch, because both halves need it from
+    different angles: prepare_socket_dir needs the GID, to make the socket
+    reachable from the session; AgentLink needs the UID, to check SO_PEERCRED
+    against. Deriving them separately invites them to disagree, and the failure
+    that produces is quiet -- an agent that connects, shows a dialog, and has
+    its answer silently refused.
+
+    Failing here rather than later is deliberate: --agent with an unresolvable
+    user is a configuration error, and it should not be discovered only after
+    the gate has already closed on every USB port.
+    """
+    if not getattr(args, "agent", False):
+        return None
+
+    import pwd
+
+    name = args.agent_user or _active_session_user()
+    if name is None:
+        sys.exit("--agent needs --agent-user USER (could not detect the "
+                 "desktop user automatically)")
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        sys.exit(f"--agent-user {name}: no such user")
+    return entry.pw_uid, entry.pw_gid, name
+
+
 def cmd_trusted(path) -> None:
     """Show what this machine currently lets in without asking, numbered."""
     store = trust_mod.TrustStore(path)
@@ -331,6 +362,13 @@ def main(argv=None) -> None:
     ledger_path = (None if args.no_ledger
                    else (args.ledger or ledger_mod.default_path()))
 
+    # Resolved once here, before the privsep branch, so the socket's group
+    # (set by prepare_socket_dir) and the uid AgentLink checks against can
+    # never drift apart. None when --agent is off.
+    agent_identity = _resolve_agent_identity(args)
+    agent_uid = agent_identity[0] if agent_identity else None
+    agent_gid = agent_identity[1] if agent_identity else None
+
     def _serve():
         daemon.serve(dry_run=args.dry_run, timeout=args.timeout,
                      json_log=args.log, rule_config=rule_config,
@@ -343,7 +381,9 @@ def main(argv=None) -> None:
                      inspect_storage=not args.no_storage_scan,
                      lock_policy=args.lock_policy,
                      force_locked=forced_lock,
-                     agent_socket=args.agent_socket if args.agent else None)
+                     agent_socket=args.agent_socket if args.agent else None,
+                     agent_uid=agent_uid,
+                     agent_gid=agent_gid)
 
     if args.privsep:
         from . import privsep
@@ -359,20 +399,17 @@ def main(argv=None) -> None:
         if args.agent:
             # The analyzer will run as `nobody` and the agent as the desktop
             # user; neither can grant the other access afterwards, so the
-            # directory is set up here, while still root.
+            # directory is set up here, while still root. The identity was
+            # already resolved above -- reused here so the socket's group and
+            # the uid AgentLink enforces cannot disagree.
             try:
-                import grp
                 import pwd as _pwd
-                agent_user = args.agent_user or _active_session_user()
-                if agent_user is None:
-                    sys.exit("--agent needs --agent-user USER (could not "
-                             "detect the desktop user automatically)")
-                entry = _pwd.getpwnam(agent_user)
+                uid, gid, agent_user = agent_identity
                 analyzer_uid = _pwd.getpwnam(args.privsep_user).pw_uid
                 agentlink.prepare_socket_dir(args.agent_socket,
-                                             analyzer_uid, entry.pw_gid)
+                                             analyzer_uid, gid)
                 print(f"[agent] {args.agent_socket.parent} prepared for "
-                      f"{agent_user}")
+                      f"{agent_user} (uid {uid})")
             except (KeyError, OSError) as exc:
                 sys.exit(f"could not prepare the agent socket directory: {exc}")
 

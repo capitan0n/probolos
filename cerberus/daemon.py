@@ -727,14 +727,25 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
           inspect_storage: bool = True,
           lock_policy: str = session_mod.POLICY_QUEUE,
           force_locked: Optional[bool] = None,
-          agent_socket: Optional[Path] = None) -> None:
+          agent_socket: Optional[Path] = None,
+          agent_uid: Optional[int] = None,
+          agent_gid: Optional[int] = None) -> None:
     """Wire the gate, the safety net and the loop together."""
     policy = policy or safety.SafetyPolicy()
     link = None
     if agent_socket is not None:
-        link = agentlink.AgentLink(agent_socket)
+        # uid 0 is included because refusing it buys nothing: root can write
+        # sysfs `authorized` directly and does not need the socket to admit a
+        # device. Excluding it would only make `sudo python -m cerberus.agent`
+        # fail confusingly while debugging. The uid that matters is the desktop
+        # one -- everything else is refused and logged.
+        permitted = None if agent_uid is None else {agent_uid, 0}
+        link = agentlink.AgentLink(agent_socket, allowed_uids=permitted,
+                                   owner_uid=agent_uid, owner_gid=agent_gid)
         if link.start():
-            print(f"  - desktop agent socket: {agent_socket}")
+            who = "any local process" if permitted is None else f"uid {agent_uid}"
+            print(f"  - desktop agent socket: {agent_socket} "
+                  f"(answers accepted from {who})")
             print(f"    start the agent in your session with: "
                   f"python -m cerberus.agent")
         else:

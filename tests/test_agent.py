@@ -495,3 +495,53 @@ class TestKdialogThreeWayMapping(unittest.TestCase):
             self.assertEqual(
                 self.backend().choose("t", "x", "once", "always", "no", 1),
                 dialogs.CHOICE_NO)
+
+
+class TestServePassesAgentUid(unittest.TestCase):
+    """
+    Regression for audit finding C2: the SO_PEERCRED check in AgentLink._admit
+    is only armed when allowed_uids is passed. It was never passed from serve(),
+    so the check was dead code and any local process could answer prompts.
+
+    These tests pin the wiring, not the check itself (agentlink's own tests
+    cover the check). serve() is short-circuited right after it builds the link
+    so the pyudev loop never runs.
+    """
+
+    def _run_serve(self, **kwargs):
+        captured = {}
+        sentinel = RuntimeError("stop here")
+
+        def fake_link(path, allowed_uids=None, owner_uid=None, owner_gid=None):
+            captured["allowed_uids"] = allowed_uids
+            captured["owner_uid"] = owner_uid
+            link = mock.Mock()
+            # Stop serve() the instant the link is built, before it tries to
+            # open the real USB gate (which needs /sys/bus/usb we do not have).
+            link.start.side_effect = sentinel
+            return link
+
+        with mock.patch.object(daemon_mod.agentlink, "AgentLink",
+                               side_effect=fake_link):
+            try:
+                daemon_mod.serve(**kwargs)
+            except RuntimeError as exc:
+                if exc is not sentinel:
+                    raise
+        return captured
+
+    def test_agent_uid_is_forwarded_as_allowed_uids(self):
+        with tempfile.TemporaryDirectory() as d:
+            sock = Path(d) / "sock"
+            captured = self._run_serve(agent_socket=sock, agent_uid=1000)
+        # root is always allowed alongside the desktop uid; see the comment in
+        # serve() for why refusing uid 0 would buy nothing.
+        self.assertEqual(captured["allowed_uids"], {1000, 0})
+
+    def test_no_agent_uid_means_no_restriction_recorded(self):
+        with tempfile.TemporaryDirectory() as d:
+            sock = Path(d) / "sock"
+            captured = self._run_serve(agent_socket=sock, agent_uid=None)
+        # None is the documented "any local process" fallback -- but note
+        # AgentLink.start() prints a warning in that case so it is not silent.
+        self.assertIsNone(captured["allowed_uids"])
