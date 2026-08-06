@@ -96,6 +96,10 @@ MSG_HELLO = "hello"
 ANSWER_YES = "yes"
 ANSWER_ALWAYS = "always"
 ANSWER_NO = "no"
+# Not a decision. Sent by the agent when it has no way to show a dialog at all,
+# so the analyzer can tell "the user refused" apart from "the user was never
+# asked" and fall back to the terminal instead of silently denying everything.
+ANSWER_UNAVAILABLE = "unavailable"
 
 MAX_MESSAGE = 16384
 

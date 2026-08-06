@@ -76,6 +76,10 @@ class GateClient:
         if not resp.ok:
             raise GateError(f"authorize failed: {resp.status}: {resp.detail}")
 
+    def authorize_interface(self, intf_dir, value: int) -> None:
+        self._round_trip(protocol.Request(protocol.REQ_AUTHORIZE_INTERFACE,
+                                          path=str(intf_dir), value=value))
+
     def set_default(self, hubpath, value: int) -> None:
         resp, _ = self._round_trip(protocol.Request(
             protocol.REQ_SET_DEFAULT, path=str(hubpath), value=value))
@@ -120,6 +124,12 @@ class GateBackend:
 
     def authorize(self, syspath, value: int) -> None:
         self.client.authorize(syspath, value)
+
+    def authorize_interface(self, intf_dir, value: int) -> None:
+        # Was missing entirely: sysfs.set_interface_authorized() routes through
+        # the active backend, so under --privsep the deferred-bind path raised
+        # AttributeError instead of authorizing an interface.
+        self.client.authorize_interface(intf_dir, value)
 
     def set_default(self, hub, value: int) -> None:
         self.client.set_default(hub, value)

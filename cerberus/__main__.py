@@ -314,6 +314,12 @@ def main(argv=None) -> None:
 
     trust_path = args.trust_file or trust_mod.default_path()
 
+    if args.list:
+        # Dispatched here with the other read-only commands. Without this the
+        # flag parsed but fell through to require_root() and CLOSED THE GATE --
+        # a documented inventory command that instead disabled every USB port.
+        cmd_list(verbose=args.verbose)
+        return
     if args.trusted:
         cmd_trusted(trust_path)
         return
@@ -414,9 +420,20 @@ def main(argv=None) -> None:
                 sys.exit(f"could not prepare the agent socket directory: {exc}")
 
         try:
+            # ONLY the ledger directory is handed to the analyzer. The trust
+            # store is deliberately excluded: whoever can write a directory can
+            # replace any file in it, so handing over the trust store's
+            # directory would let a hostile process running as the same shared
+            # `nobody` account forge an entry that admits its own device with
+            # no prompt. The analyzer reads trust and cannot rewrite it; the
+            # cost is that "always" cannot be persisted from the unprivileged
+            # half, which serve() reports plainly when it happens.
+            # Trust is read-only to the analyzer: readable file, root-owned
+            # directory. Done before the drop, while we still can.
+            if not args.no_trust and trust_path:
+                privsep.prepare_trust_readable(trust_path)
             rc = privsep.start(analyzer_main, drop_to=args.privsep_user,
-                               state_paths=[p for p in (ledger_path, trust_path)
-                                            if p])
+                               state_paths=[p for p in (ledger_path,) if p])
         except privsep.PrivsepError as exc:
             sys.exit(f"privsep: {exc}")
         sys.exit(rc)

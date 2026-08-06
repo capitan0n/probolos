@@ -54,7 +54,8 @@ from pathlib import Path
 from typing import Optional
 
 from . import dialogs
-from .agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_YES, DEFAULT_SOCKET,
+from .agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_UNAVAILABLE,
+                        ANSWER_YES, DEFAULT_SOCKET,
                         MAX_MESSAGE, MSG_ANSWER, MSG_CRITICAL, MSG_DECIDE)
 
 APP_NAME = "Cerberus"
@@ -300,9 +301,16 @@ class Agent:
                 yes_label="Allow", no_label="Keep blocked",
                 timeout=max(timeout - 5, 10))
             if allowed is None:
-                # No way to ask. Not an answer: the analyzer will fall back to
-                # the terminal rather than treat this as a refusal.
-                return ANSWER_NO if False else ANSWER_NO
+                # No way to ask -- no kdialog, no zenity, no tkinter. This is
+                # NOT a refusal: the user never saw anything to refuse. Return
+                # a value the analyzer does not recognise as a decision, which
+                # it treats as "no answer" and falls back to the terminal.
+                #
+                # (Returning ANSWER_NO here, as this line used to, meant that a
+                # machine without a dialog backend silently denied EVERY device
+                # while appearing to have asked. Fail-closed in the worst way:
+                # invisible, and indistinguishable from the user saying no.)
+                return ANSWER_UNAVAILABLE
             if not allowed:
                 return ANSWER_NO
 

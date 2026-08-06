@@ -329,7 +329,17 @@ class Cerberus:
         # cannot also type.
         if (self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds
                 and not has_input):
-            medium = self._inspect_medium(dev)
+            # BOTH guards are needed and they do different jobs. The timeout
+            # inside inspect_safely guarantees the scan ENDS; paused() stops
+            # the watchdog from counting the (now bounded) scan as the daemon
+            # wedging. paused() alone would be the obvious but WRONG fix: it
+            # converts a hostile stall from a fail-open into a permanent
+            # freeze. Mirrors the existing paused() around _ask().
+            if self.watchdog:
+                with self.watchdog.paused():
+                    medium = self._inspect_medium(dev)
+            else:
+                medium = self._inspect_medium(dev)
             if medium is not None:
                 storage_findings = analyzers.run(
                     analyzers.Context(device=dev, config=self.rule_config,
@@ -508,8 +518,8 @@ class Cerberus:
                 if not devices:
                     time.sleep(0.1)
             if devices:
-                medium = storage.inspect(devices[0],
-                                         open_fn=sysfs.open_block_device)
+                medium = storage.inspect_safely(
+                    devices[0], open_fn=sysfs.open_block_device)
             else:
                 medium = storage.MediumReport(error="no block device appeared")
         finally:

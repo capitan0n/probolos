@@ -37,20 +37,38 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from . import atomicio
+
 def default_path() -> Path:
     """
     Where the ledger lives.
 
-    Under root (systemd service) this is /var/lib/cerberus. Run by hand as a
-    normal user it is the XDG state dir, so a --dry-run or a --list never trips
-    over a permission error on a directory only root can write. Falling back to
-    a writable location is not laziness: a history file the user cannot write
-    is the same as no history, and it should fail that way quietly rather than
-    erroring on every device.
+    Under root (systemd service) this is /var/lib/cerberus/state/. Run by hand
+    as a normal user it is the XDG state dir, so a --dry-run or a --list never
+    trips over a permission error on a directory only root can write. Falling
+    back to a writable location is not laziness: a history file the user cannot
+    write is the same as no history, and it should fail that way quietly rather
+    than erroring on every device.
+
+    WHY THE `state/` SUBDIRECTORY (audit finding C3)
+    ------------------------------------------------
+    Under --privsep the analyzer runs as `nobody` and must be able to write the
+    ledger, so its directory is chowned to that account. Directory write
+    permission is stronger than it looks: it allows unlinking and replacing ANY
+    file in that directory, whatever the file's own owner and mode. So while
+    the ledger and the trust store shared one directory, handing it to `nobody`
+    also handed over the trust store -- and a hostile process running as the
+    same shared account could drop in an entry that admits its own BadUSB
+    without a prompt.
+
+    Separating them fixes that structurally rather than by permissions alone:
+    only `state/` is handed over. /var/lib/cerberus/ itself, which holds
+    trusted.json, stays root-owned, so the analyzer can read trust but can
+    neither rewrite nor replace it.
     """
     import os
     if os.geteuid() == 0:
-        return Path("/var/lib/cerberus/ledger.json")
+        return Path("/var/lib/cerberus/state/ledger.json")
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     return Path(base) / "cerberus" / "ledger.json"
 
@@ -237,16 +255,14 @@ class Ledger:
         bury the findings the user actually needs to read.
         """
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
             payload = {
                 "schema": SCHEMA_VERSION,
                 "entries": {k: asdict(v) for k, v in self.entries.items()},
             }
-            tmp.write_text(json.dumps(payload, indent=1))
-            # Rename is atomic on the same filesystem: a crash mid-write leaves
-            # the previous ledger intact rather than a truncated file.
-            tmp.replace(self.path)
+            # Symlink-safe atomic write: the state dir is nobody-owned under
+            # --privsep, so the staging path must not be followable. See
+            # atomicio for the full rationale.
+            atomicio.write_json_atomic(self.path, payload)
             return None
         except OSError as exc:
             message = str(exc)

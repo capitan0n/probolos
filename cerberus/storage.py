@@ -199,6 +199,89 @@ def sniff_filesystem(data: bytes) -> Optional[str]:
     return None
 
 
+def _inspect_worker(device: str, conn, fd=None) -> None:
+    """Runs inspect() in a child so a stalled read can be killed."""
+    try:
+        open_fn = (lambda _dev: fd) if fd is not None else None
+        conn.send(("ok", inspect(device, open_fn=open_fn)))
+    except Exception as exc:              # noqa: BLE001 -- fail closed
+        conn.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        conn.close()
+
+
+def inspect_safely(device: str, timeout: float = 10.0,
+                   open_fn=None) -> MediumReport:
+    """
+    inspect() under a hard time limit. This is what the daemon should call.
+
+    A storage device can stall a read forever -- ordinary for flaky USB, a
+    deliberate move for a hostile one. Without a bound the daemon freezes, and
+    with the watchdog running that freeze becomes the watchdog opening the gate
+    for the whole system: a stall in the SECURITY SCAN causing a system-wide
+    fail-open. So inspect() runs in a child process that is killed if it
+    overruns, and the timeout becomes a finding -- a device that will not let
+    itself be inspected has told you something.
+
+    A child process rather than signal.alarm, for two independent reasons:
+    inspect() runs off the main thread and POSIX signals are delivered to the
+    main thread only, and a read wedged in uninterruptible sleep ignores
+    signals entirely. Only killing the process reliably ends it.
+
+    This wraps the whole of inspect() rather than each os.read, so BOTH read
+    paths (the header read and read_at) are bounded by one guard.
+
+    WHY open_fn IS CALLED IN THE PARENT
+    -----------------------------------
+    Under --privsep, open_fn asks the root gate for a descriptor over a socket
+    the child does not have. So the parent opens (a bounded, fast request) and
+    the child only READS (the unbounded, stallable part). The fd crosses the
+    fork by inheritance, which is why the child is handed a plain integer and
+    a trivial open_fn that returns it.
+    """
+    import multiprocessing
+    import os as _os
+
+    fd = None
+    try:
+        if open_fn is not None:
+            fd = open_fn(device)
+    except OSError as exc:
+        return MediumReport(device=device, error=str(exc))
+
+    parent_conn, child_conn = multiprocessing.Pipe()
+    proc = multiprocessing.Process(
+        target=_inspect_worker, args=(device, child_conn, fd), daemon=True)
+    try:
+        proc.start()
+        proc.join(timeout)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(1.0)
+            if proc.is_alive():
+                proc.kill()
+            # `inspected` stays False (scheme unknown), so no rule mistakes a
+            # stalled device for one that passed. The silence is the finding.
+            return MediumReport(
+                device=device,
+                error=f"device did not respond within {timeout:.0f}s -- "
+                      f"inspection abandoned")
+        if parent_conn.poll():
+            kind, payload = parent_conn.recv()
+            return payload if kind == "ok" else MediumReport(device=device,
+                                                             error=payload)
+        return MediumReport(device=device,
+                            error="inspection process produced no result")
+    finally:
+        # The child has its own copy (or was killed); ours must not leak. This
+        # matters most on the timeout path, where the child never ran finally.
+        if fd is not None:
+            try:
+                _os.close(fd)
+            except OSError:
+                pass
+
+
 def inspect(device: str, open_fn=None) -> MediumReport:
     """
     Read and parse the start of a block device. Never mounts, never writes.

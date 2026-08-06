@@ -48,6 +48,9 @@ REQ_AUTHORIZE = "authorize"
 REQ_SET_DEFAULT = "set_default"
 REQ_OPEN_INPUT = "open_input"
 REQ_OPEN_BLOCK = "open_block"
+# Interface-level authorization: bind/unbind a driver for ONE interface of a
+# device rather than the whole device. Used by the deferred-bind path.
+REQ_AUTHORIZE_INTERFACE = "authorize_interface"
 REQ_PING = "ping"
 
 # Response status
@@ -75,7 +78,7 @@ class Request:
         obj = _load(data)
         kind = obj.get("kind")
         if kind not in (REQ_AUTHORIZE, REQ_SET_DEFAULT, REQ_OPEN_INPUT,
-                        REQ_OPEN_BLOCK, REQ_PING):
+                        REQ_OPEN_BLOCK, REQ_AUTHORIZE_INTERFACE, REQ_PING):
             raise ValueError(f"unknown request kind: {kind!r}")
         value = obj.get("value")
         if value is not None and not isinstance(value, int):

@@ -153,7 +153,12 @@ class TestDefaultPath(unittest.TestCase):
         real = os.geteuid
         os.geteuid = lambda: 0
         try:
-            self.assertEqual(str(l.default_path()), "/var/lib/cerberus/ledger.json")
+            # The `state/` subdirectory is load-bearing, not cosmetic: it is
+            # the only directory handed to the analyzer under --privsep, which
+            # is what keeps trusted.json (in the root-owned parent) out of a
+            # hostile `nobody` process's reach. See ledger.default_path.
+            self.assertEqual(str(l.default_path()),
+                             "/var/lib/cerberus/state/ledger.json")
         finally:
             os.geteuid = real
 

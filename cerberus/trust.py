@@ -43,6 +43,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from . import atomicio
+
 SCHEMA_VERSION = 1
 
 
@@ -66,6 +68,68 @@ class TrustedDevice:
     times_admitted: int = 0
     note: str = ""
     ports: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_raw(cls, key: str, raw) -> Optional["TrustedDevice"]:
+        """
+        Build a TrustedDevice from untrusted JSON, or None if it is not one.
+
+        The ledger already validates this way; the trust store did not, which
+        was backwards -- the ledger is history, but THIS file decides whether a
+        device is admitted without asking. `TrustedDevice(**raw)` accepted
+        whatever types the file happened to contain, so a hand-edited or
+        hostile store could put a non-string where a string is expected and
+        have it flow into comparisons and display.
+
+        Two extra rules beyond the ledger's, both specific to trust meaning
+        admission:
+
+          * the entry's own `key` field must match the dict key it was filed
+            under. A mismatch is how forget_index used to raise KeyError and
+            make trust un-revocable, and it is also the shape a crafted file
+            would take to hide an entry from the revoke path.
+          * key and descriptor_hash must be non-empty. An entry with no
+            fingerprint pins trust to nothing.
+        """
+        if not isinstance(raw, dict) or not isinstance(key, str):
+            return None
+
+        def as_str(value) -> Optional[str]:
+            return value if isinstance(value, str) else None
+
+        def as_time(value) -> Optional[float]:
+            # bool is a subclass of int, so exclude it explicitly: JSON `true`
+            # is not a timestamp.
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            return float(value)
+
+        entry_key = as_str(raw.get("key"))
+        identity = as_str(raw.get("identity"))
+        label = as_str(raw.get("label"))
+        digest = as_str(raw.get("descriptor_hash"))
+        trusted_at = as_time(raw.get("trusted_at"))
+        last_seen = as_time(raw.get("last_seen"))
+
+        if not entry_key or not digest or entry_key != key:
+            return None
+        if identity is None or label is None:
+            return None
+        if trusted_at is None or last_seen is None:
+            return None
+
+        times = raw.get("times_admitted", 0)
+        if isinstance(times, bool) or not isinstance(times, int) or times < 0:
+            times = 0
+        note = as_str(raw.get("note")) or ""
+        ports_raw = raw.get("ports")
+        ports = ([p for p in ports_raw if isinstance(p, str)]
+                 if isinstance(ports_raw, list) else [])
+
+        return cls(key=entry_key, identity=identity, label=label,
+                   descriptor_hash=digest, trusted_at=trusted_at,
+                   last_seen=last_seen, times_admitted=times,
+                   note=note, ports=ports)
 
 
 def descriptor_hash(dev) -> Optional[str]:
@@ -117,21 +181,26 @@ class TrustStore:
         if data.get("schema") != SCHEMA_VERSION:
             self.load_error = f"unsupported trust schema {data.get('schema')}"
             return
+        skipped = 0
         for key, raw in (data.get("devices") or {}).items():
-            try:
-                self.devices[key] = TrustedDevice(**raw)
-            except TypeError:
-                continue  # skip malformed entries rather than trusting them
+            entry = TrustedDevice.from_raw(key, raw)
+            if entry is None:
+                # Skipped, never trusted. Counted rather than silently dropped:
+                # entries disappearing from a file that grants admission is
+                # something the operator should be told about.
+                skipped += 1
+                continue
+            self.devices[key] = entry
+        if skipped:
+            self.load_error = (f"{skipped} malformed trust entr"
+                               f"{'y' if skipped == 1 else 'ies'} ignored")
 
     def save(self) -> Optional[str]:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({
+            atomicio.write_json_atomic(self.path, {
                 "schema": SCHEMA_VERSION,
                 "devices": {k: asdict(v) for k, v in self.devices.items()},
-            }, indent=1))
-            tmp.replace(self.path)
+            })
             return None
         except OSError as exc:
             message = str(exc)
@@ -200,7 +269,16 @@ class TrustStore:
         if not (1 <= index <= len(entries)):
             return None
         entry = entries[index - 1]
-        del self.devices[entry.key]
+        # Delete by the dict key we actually filed it under, not by entry.key.
+        # from_raw now guarantees the two agree, but revocation must not be the
+        # thing that breaks if they ever diverge again: a trust store you cannot
+        # revoke from is worse than one that lost an entry.
+        for dict_key, candidate in list(self.devices.items()):
+            if candidate is entry:
+                del self.devices[dict_key]
+                break
+        else:
+            self.devices.pop(entry.key, None)
         return entry.identity
 
     def forget(self, pattern: str) -> List[str]:

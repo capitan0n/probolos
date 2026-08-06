@@ -87,6 +87,62 @@ def drop_privileges(uid: int, gid: int) -> None:
         pass  # exactly what we want: root is unreachable now
 
 
+# Directories the launcher is willing to hand to the analyzer.
+#
+# prepare_state_dir takes a path from --ledger and chowns its PARENT to the
+# unprivileged uid, then chmods it 0700. With no bound on which parent,
+# `sudo cerberus --ledger /etc/x.json` makes /etc owned by nobody and mode
+# 0700 -- which takes sudo, ssh and PAM with it, on a running system,
+# irreversibly. That needs no attacker: a typo in a flag is enough.
+#
+# So the launcher refuses instead of chowning. The cost of refusing is that the
+# analyzer keeps no history; the cost of not refusing is the machine.
+STATE_ROOTS = ("/var/lib/cerberus", "/run/cerberus")
+
+
+def _within_allowed_root(directory: str) -> bool:
+    """
+    True if `directory` is one of STATE_ROOTS or lies beneath one.
+
+    realpath first, so that --ledger /var/lib/cerberus/../../etc/x.json is
+    judged as /etc rather than as something under /var/lib/cerberus. The
+    separator is appended before the prefix comparison so that a sibling named
+    /var/lib/cerberus-evil does not match a root it merely starts with.
+    """
+    resolved = os.path.realpath(directory)
+    for root in STATE_ROOTS:
+        root = os.path.realpath(root)
+        if resolved == root or resolved.startswith(root + os.sep):
+            return True
+    return False
+
+
+def prepare_trust_readable(path, log=print) -> None:
+    """
+    Let the analyzer READ the trust store without being able to write it.
+
+    The trust store stays root-owned in a root-owned directory (see
+    ledger.default_path for why that separation exists). But the analyzer still
+    has to consult it to know whether a device was remembered, and it runs as
+    an unprivileged account -- so the file itself is made world-readable while
+    its directory stays root-only-writable.
+
+    That trade is deliberate and worth stating: the contents are device
+    identities and labels, not secrets, and anyone who can read /var/lib can
+    already see which devices exist. What must not leak is WRITE access, and
+    that is what the directory ownership protects.
+    """
+    import os as _os
+    target = str(path)
+    if not _os.path.exists(target):
+        return
+    try:
+        _os.chmod(target, 0o644)
+    except OSError as exc:
+        log(f"[privsep] could not make {target} readable by the analyzer: "
+            f"{exc}\n[privsep] remembered devices will be asked about again.")
+
+
 def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
     """
     Make a state directory writable by the analyzer, before privilege drops.
@@ -97,9 +153,36 @@ def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
     serialisation format inside the trusted process, exactly what the split
     exists to avoid -- the launcher hands ownership of one directory to the
     analyzer while it still can.
+
+    REFUSES in two cases, both before any side effect:
+
+      * a directory outside STATE_ROOTS. Chowning an arbitrary parent to an
+        unprivileged account is a one-typo way to destroy a running system.
+      * a directory that holds a trust store. Whoever can write a directory
+        can unlink and replace any file in it regardless of that file's own
+        owner, so handing over a directory containing trusted.json would
+        silently hand over trust itself -- the exact escalation this split
+        exists to prevent.
     """
     import os as _os
     directory = _os.path.dirname(_os.path.abspath(str(path)))
+
+    # Checked BEFORE anything is created or chowned. Both guards must run
+    # before the first side effect: refusing after makedirs would already have
+    # left a directory behind in a place that was never allowed.
+    if not _within_allowed_root(directory):
+        log(f"[privsep] REFUSING to hand {directory} to uid {uid}: state "
+            f"files must live under one of {', '.join(STATE_ROOTS)}.\n"
+            f"[privsep] chowning it would give an unprivileged account "
+            f"ownership of a directory the system depends on. Continuing "
+            f"without device history.")
+        return
+
+    if _os.path.exists(_os.path.join(directory, "trusted.json")):
+        log(f"[privsep] REFUSING to hand {directory} to uid {uid}: it holds a "
+            f"trust store, and directory write access would allow replacing "
+            f"it. The ledger belongs in its own subdirectory.")
+        return
     try:
         _os.makedirs(directory, exist_ok=True)
         _os.chown(directory, uid, gid)

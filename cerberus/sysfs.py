@@ -12,11 +12,11 @@ Nothing here parses, judges, or decides. That belongs in higher layers.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from . import descriptors, usbclass
+from . import descriptors, textsafe, usbclass
 
 USB_DEVICES = Path("/sys/bus/usb/devices")
 
@@ -73,6 +73,13 @@ class UsbDevice:
     # wants to change quietly would put it.
     raw_descriptors: Optional[bytes] = None
     removable: Optional[str] = None
+    # Why the device's own strings had to be cleaned, if they did. These are
+    # evidence, not bookkeeping: no legitimate device puts an escape character
+    # in its manufacturer string, so a cleaned string with nothing recording
+    # WHY would throw away the strongest signal that a descriptor was crafted
+    # rather than merely filled in. rules.py turns these into findings.
+    string_notes: List[str] = field(default_factory=list)
+    string_note_fields: Dict[str, List[str]] = field(default_factory=dict)
 
     # ---------- derived views ----------
 
@@ -146,14 +153,32 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
     except OSError as exc:
         parse_error = f"read error: {exc}"
 
+    # Clean the device's own strings HERE, at the one place raw sysfs bytes
+    # become Python strings. Cleaning at each display site instead would mean
+    # remembering eight destinations -- terminal, kdialog, zenity, tkinter,
+    # notification, JSON log, trust store, ledger -- and one of them is not a
+    # screen until it is: a `cat cerberus.jsonl` three days later would replay
+    # an escape-sequence attack in a terminal nobody was guarding.
+    #
+    # Nothing is lost: raw_descriptors keeps the original bytes, so the ledger
+    # still hashes what the device really sent and drift detection is intact.
+    _manufacturer = textsafe.sanitize(read_attr(syspath, "manufacturer"))
+    _product = textsafe.sanitize(read_attr(syspath, "product"))
+    _serial = textsafe.sanitize(read_attr(syspath, "serial"))
+    _fields = {
+        "iManufacturer": _manufacturer.notes,
+        "iProduct": _product.notes,
+        "iSerialNumber": _serial.notes,
+    }
+
     return UsbDevice(
         syspath=syspath,
         name=syspath.name,
         vendor_id=vid,
         product_id=pid,
-        manufacturer=read_attr(syspath, "manufacturer"),
-        product=read_attr(syspath, "product"),
-        serial=read_attr(syspath, "serial"),
+        manufacturer=_manufacturer.text,
+        product=_product.text,
+        serial=_serial.text,
         bus=read_int_attr(syspath, "busnum"),
         device_num=read_int_attr(syspath, "devnum"),
         speed=read_attr(syspath, "speed"),
@@ -165,6 +190,8 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
         # "fixed" means the port is not user-accessible: a soldered-in webcam,
         # or the built-in keyboard. Cerberus must never gate those.
         removable=read_attr(syspath, "removable"),
+        string_notes=sorted({n for notes in _fields.values() for n in notes}),
+        string_note_fields={k: v for k, v in _fields.items() if v},
     )
 
 
