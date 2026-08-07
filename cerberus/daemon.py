@@ -510,13 +510,27 @@ class Cerberus:
 
         medium = None
         try:
-            # The block device takes a moment to appear after authorization.
+            # The block node appears shortly after authorization. Poll FAST and
+            # briefly: every millisecond the device is authorized is a
+            # millisecond udisks2 may use to automount it (see the honest
+            # caveat below). 20 ms steps up to 1.5 s finds the node about as
+            # quickly as the kernel can create it, without a 100 ms coarse wait
+            # sitting open for no reason.
+            #
+            # NOTE (known limitation, tracked as the interface-authorization
+            # work): this authorizes the WHOLE device to make its block node
+            # visible, so a race with udisks2 automount exists for the length of
+            # this window. The real fix is interface-level authorization --
+            # authorize the device but hold the mass-storage interface at 0, so
+            # no block node is ever created for udisks2 to see. Until then the
+            # window is kept as short as possible and the device is re-blocked
+            # in the finally below the instant the read returns.
             devices = []
-            deadline = time.monotonic() + 3.0
+            deadline = time.monotonic() + 1.5
             while time.monotonic() < deadline and not devices:
                 devices = storage.find_block_devices(dev.syspath)
                 if not devices:
-                    time.sleep(0.1)
+                    time.sleep(0.02)
             if devices:
                 medium = storage.inspect_safely(
                     devices[0], open_fn=sysfs.open_block_device)

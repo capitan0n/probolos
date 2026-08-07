@@ -249,8 +249,15 @@ def inspect_safely(device: str, timeout: float = 10.0,
     except OSError as exc:
         return MediumReport(device=device, error=str(exc))
 
-    parent_conn, child_conn = multiprocessing.Pipe()
-    proc = multiprocessing.Process(
+    # fork, explicitly. The default start method on some setups is "spawn"
+    # (or "forkserver"), which re-imports the whole cerberus package in the
+    # child on every single inspection -- seconds of latency, and worse, it
+    # lengthens the window in which the device is authorized and udisks2 can
+    # automount it. fork inherits the already-loaded interpreter and the open
+    # fd directly, so the child is ready in microseconds.
+    ctx = multiprocessing.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe()
+    proc = ctx.Process(
         target=_inspect_worker, args=(device, child_conn, fd), daemon=True)
     try:
         proc.start()

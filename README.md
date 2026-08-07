@@ -1,92 +1,168 @@
-# Running Cerberus as a service
+# Cerberus
 
-Two units, because the two halves live in different places: the gate is a
-**system** service (it needs root and udev), and the agent is a **user** service
-(it needs your graphical session, which is the only place a dialog can appear).
+**A deny-by-default USB admission gate for Linux.**
 
-## Install
+New USB devices do not work until a human approves them. While a device waits,
+Cerberus inspects it — and the device is dead the whole time.
+
+```
+identity · consistency · behaviour
+```
+
+---
+
+## The idea
+
+Every USB defence has the same problem: the kernel binds a driver the moment a
+device is enumerated. By the time anything notices a keyboard is a BadUSB, it
+has already typed.
+
+Cerberus sets `authorized_default=0` on every root hub, so a new device arrives
+*inert*. It is then examined across four stages, and only a human decision
+authorizes it.
+
+| Stage | What it asks | Device state |
+|---|---|---|
+| 1 · Identity | What does it claim to be? | blocked |
+| 2 · Consistency | Do its own claims agree with each other? | blocked |
+| 3 · Behaviour | What does it do when switched on and gagged? | live, input grabbed |
+| 4 · Contents | What is on the medium? | live, read-only, never mounted |
+
+The stage-3 window is the only moment the device is live before approval, and
+its input is held under `EVIOCGRAB` throughout — nothing it sends reaches your
+session. It is re-blocked the instant observation ends, *before* you are asked.
+
+**The contribution is the pre-authorization quarantine window**: observation
+time is decoupled from attack success. Existing tools (USBGuard, usbauth, ukip)
+decide from descriptors alone, or watch a device that is already live.
+
+---
+
+## Quick start
 
 ```bash
-# the gate, as root
-sudo cp systemd/cerberus.service /etc/systemd/system/
-sudo systemctl daemon-reload
-
-# the agent, as you
-mkdir -p ~/.config/systemd/user
-cp systemd/cerberus-agent.service ~/.config/systemd/user/
-systemctl --user daemon-reload
+git clone https://github.com/capitan0n/cerberus
+cd cerberus
+sudo python3 -m cerberus --observe 3
 ```
 
-Cerberus must be importable by the system Python, either installed as a package
-or with the source directory on `PYTHONPATH`. For a source checkout, add to the
-system unit:
+Plug in a device. You will get a report and a prompt.
 
-```ini
-Environment=PYTHONPATH=/opt/cerberus
-```
+> **Keep a second way in while testing** — SSH, or your built-in keyboard.
+> Internal (`removable=fixed`) ports are never gated, so a laptop keyboard on
+> the PS/2 controller is unaffected, but check before you rely on it.
 
-and put the source at `/opt/cerberus`.
+Stop with `Ctrl-C`; the gate reopens on every exit path.
 
-## Start
+### Recommended: privilege separation
 
 ```bash
-sudo systemctl enable --now cerberus.service
-systemctl --user enable --now cerberus-agent.service
+sudo python3 -m cerberus --privsep --agent --agent-user "$USER"
+python3 -m cerberus.agent          # in your graphical session
 ```
 
-Check both:
+`--privsep` keeps root to a ~150-line gate; everything else runs as `nobody`.
+`--agent` moves the prompt into a desktop dialog.
+
+### Stop automount racing the scan
+
+Stage 4 authorizes the device briefly to read its partition table, and udisks2
+may automount the medium in that window — the exact kernel-filesystem exposure
+stage 4 exists to avoid. Install the inhibitor:
 
 ```bash
-systemctl status cerberus.service
-systemctl --user status cerberus-agent.service
-sudo journalctl -u cerberus -f
+sudo cp systemd/60-cerberus-inhibit-automount.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=block
 ```
 
-## Before enabling it at boot
+USB storage will no longer auto-mount. Cerberus reads the raw node itself, so
+it loses nothing; you mount approved devices deliberately afterwards.
 
-**Test it in the foreground first.** A service that closes the USB gate at boot
-and then fails to start its agent will leave you approving devices from a
-terminal you have to find. Run it by hand until you are satisfied:
+---
 
-```bash
-sudo python -m cerberus --privsep --agent
-python -m cerberus.agent
-```
+## Common options
 
-Note the gate is started with `--timeout 0`, meaning a question waits
-indefinitely rather than expiring into a refusal. That is right for a background
-service: a device you plugged in and walked away from should still be waiting
-when you come back, not silently rejected. Set a timeout if you prefer the
-opposite.
-
-## What the sandboxing does
-
-The gate needs root, so the units restrict what root can still reach:
-
-| Setting | Effect |
+| Flag | Effect |
 |---|---|
-| `ProtectSystem=strict` | the whole filesystem read-only except the state and runtime directories |
-| `PrivateNetwork=yes` | no sockets at all — a compromised analyzer cannot send anything anywhere |
-| `DevicePolicy=closed` | only input nodes and block devices; no sound, video, tty or GPU |
-| `MemoryDenyWriteExecute=yes` | no writable-executable memory |
-| `SystemCallFilter` | denies module loading, raw I/O, mounting, reboot, and the rest |
-| `CapabilityBoundingSet` | only the five capabilities the privilege drop and directory setup need |
+| `--observe SEC` | length of the behavioural quarantine (`0` disables stage 3) |
+| `--privsep` | run the analyzer as `nobody` behind a minimal root gate |
+| `--agent` | ask via a desktop dialog instead of the terminal |
+| `--dry-run` | report everything, change nothing |
+| `--list` | read-only inventory of attached devices; never closes the gate |
+| `--trusted` / `--forget N` | list and revoke remembered devices |
+| `--no-storage-scan` | skip stage 4 entirely |
+| `--allow-port PORT` | keep a rescue port always open |
+| `--capture-payload` | reconstruct what a quarantined device typed (opt-in) |
+| `--release` | reopen the gate after a crash |
 
-`ProtectKernelTunables` is deliberately **not** enabled: writing
-`/sys/bus/usb/devices/*/authorized` is the entire mechanism. That is the one
-broad permission the design cannot do without, and it is the reason the
-privileged half is kept to about 150 auditable lines.
+---
 
-## Removing it
+## If something goes wrong
 
-```bash
-sudo systemctl disable --now cerberus.service
-systemctl --user disable --now cerberus-agent.service
-```
-
-Stopping the service reopens the gate, as every exit path does. If something has
-gone wrong and devices are left blocked:
+The gate restores on exit, on signals, and via `atexit`. If a device is still
+blocked:
 
 ```bash
-sudo python -m cerberus --release
+sudo python3 -m cerberus --release
 ```
+
+If Cerberus itself is wedged, the panic file forces the gate open from another
+TTY or over SSH:
+
+```bash
+sudo touch /run/cerberus.panic
+```
+
+It must be **root-owned** — a panic file anyone could create would be a way for
+any local account to switch the tool off. Last resort, one line:
+
+```bash
+echo 1 | sudo tee /sys/bus/usb/devices/usb1/authorized_default
+```
+
+---
+
+## Running as a service
+
+See [`systemd/README.md`](systemd/README.md) for the two units (a system
+service for the gate, a user service for the agent) and what the sandboxing
+does.
+
+---
+
+## Requirements
+
+- Linux with sysfs USB authorization (`/sys/bus/usb/devices/*/authorized`)
+- Python 3.10+
+- `pyudev` for the event loop
+- Optional: `kdialog`, `zenity`, or `tkinter` for the desktop agent
+
+No `python-evdev`: the quarantine talks to the kernel directly through one
+`EVIOCGRAB` ioctl.
+
+---
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests        # 328 tests
+python3 -m unittest discover -b -s tests -t . # quieter: suppresses daemon output
+```
+
+`testbed/` emulates USB devices in software via `dummy_hcd` + `raw_gadget`,
+with presets for BadUSB, descriptor drift and overpowered devices — so the
+CRITICAL paths can be exercised with no hardware.
+
+---
+
+## Scope
+
+Read [`SECURITY.md`](SECURITY.md) before trusting this with anything. It is
+explicit about what Cerberus does **not** stop: USB stack vulnerabilities, a
+patient attacker, descriptor forgery, Thunderbolt/DMA, and wireless gateways.
+
+Status: **beta.** All four critical findings from the security audit are fixed
+and covered by regression tests, but the tool has been exercised on a limited
+range of hardware. Treat real-world results as data, and report anything that
+surprises you.
