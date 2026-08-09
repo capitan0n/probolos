@@ -50,6 +50,27 @@ decide from descriptors alone, or watch a device that is already live.
 
 ---
 
+## How it compares
+
+|   | USBGuard | usbauth | ukip | GoodUSB | **Probolos** |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **Policy basis** | descriptors | descriptors + udev rules | keystroke timing | descriptors + user intent | descriptors + behaviour + storage |
+| **Device state during decision** | live (driver bound) | live (driver bound) | live (driver bound) | live (driver bound) | **blocked** (`authorized=0`) |
+| **Pre-authorization observation** | ✗ | ✗ | ✗ | ✗ | **✓** (configurable window) |
+| **Input interception** | ✗ | ✗ | monitors keystrokes | ✗ | **`EVIOCGRAB`** (nothing reaches session) |
+| **Storage inspection before mount** | ✗ | ✗ | ✗ | ✗ | **✓** (raw read, never mounted) |
+| **Human approval required** | optional | ✗ (rule-based) | ✗ (automatic) | ✓ | **✓** (always) |
+| **Race window** | full (post-bind) | full (post-bind) | partial (post-bind) | full (post-bind) | **41–85 ms** (pre-bind) |
+| **Privilege separation** | daemon | PAM module | daemon | daemon | **✓** (root gate ≈ 150 LOC) |
+
+The key difference is *when* the decision happens. Every other tool listed
+reacts to a device that the kernel has already handed to a driver — so a
+malicious device can act before the tool acts. Probolos holds the device
+**inert** from the moment the kernel sees it, inspects it while it is dead or
+gagged, and only then asks the human.
+
+---
+
 ## Quick start
 
 ```bash
