@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cerberus import safety
+from probolos import safety
 
 
 class PanicFileValidation(unittest.TestCase):
@@ -27,7 +27,7 @@ class PanicFileValidation(unittest.TestCase):
         self.dir = Path(self._dir.name)
         os.chmod(self.dir, 0o700)
         self.uid = os.getuid()
-        self.panic = self.dir / "cerberus.panic"
+        self.panic = self.dir / "probolos.panic"
         self.messages = []
 
     def tearDown(self):
@@ -93,7 +93,7 @@ class PanicFileValidation(unittest.TestCase):
         loose = Path(tempfile.mkdtemp())
         try:
             os.chmod(loose, 0o777)
-            panic = loose / "cerberus.panic"
+            panic = loose / "probolos.panic"
             panic.touch()
             self.assertFalse(self.valid(panic))
             self.assertIn("writable by others", self.messages[-1])
@@ -104,10 +104,10 @@ class PanicFileValidation(unittest.TestCase):
 
     def test_the_default_location_is_not_world_writable(self):
         """
-        /tmp is 1777 and /run/cerberus is chowned to 2770 by
+        /tmp is 1777 and /run/probolos is chowned to 2770 by
         prepare_socket_dir. Neither can hold the off switch.
         """
-        self.assertEqual(safety.DEFAULT_PANIC_FILE, Path("/run/cerberus.panic"))
+        self.assertEqual(safety.DEFAULT_PANIC_FILE, Path("/run/probolos.panic"))
         self.assertEqual(safety.DEFAULT_PANIC_FILE.parent, Path("/run"))
 
 
@@ -117,7 +117,7 @@ class WatchdogPanic(unittest.TestCase):
         self._dir = tempfile.TemporaryDirectory()
         self.dir = Path(self._dir.name)
         os.chmod(self.dir, 0o700)
-        self.panic = self.dir / "cerberus.panic"
+        self.panic = self.dir / "probolos.panic"
         self.messages = []
         self.policy = safety.SafetyPolicy(panic_file=self.panic,
                                           panic_file_uid=os.getuid())

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Spawn emulated USB devices for testing Cerberus, with no hardware.
+Spawn emulated USB devices for testing Probolos, with no hardware.
 
 Requires dummy_hcd and raw_gadget loaded, and root:
 
@@ -9,16 +9,16 @@ Requires dummy_hcd and raw_gadget loaded, and root:
     sudo python -m testbed.spawn badusb
     sudo python -m testbed.spawn flashdrive
 
-Run Cerberus in another terminal first:
+Run Probolos in another terminal first:
 
-    sudo python -m cerberus --dry-run          # watch it appear, block nothing
-    sudo python -m cerberus                     # the real gate
+    sudo python -m probolos --dry-run          # watch it appear, block nothing
+    sudo python -m probolos                     # the real gate
 
-WHY --dry-run ON THE CERBERUS SIDE
+WHY --dry-run ON THE PROBOLOS SIDE
 ----------------------------------
 The emulated device lives only as long as this process holds the gadget open.
-If Cerberus blocks it (authorized=0) and waits for you to answer, the device is
-frozen mid-enumeration and this side may stall. For a first look, run Cerberus
+If Probolos blocks it (authorized=0) and waits for you to answer, the device is
+frozen mid-enumeration and this side may stall. For a first look, run Probolos
 with --dry-run so it reports and releases; switch to the real gate once you
 have seen the report you expect.
 
@@ -31,7 +31,7 @@ import argparse
 import sys
 import time
 
-from cerberus import descriptors, rules, usbclass
+from probolos import descriptors, rules, usbclass
 from testbed.emulate import EmulatedDevice, Interface, Responder
 from testbed.rawgadget import RawGadget, RawGadgetError
 
@@ -50,7 +50,7 @@ def badusb() -> EmulatedDevice:
     The signature attack: storage that is also a boot keyboard.
 
     This is the device you cannot easily test without hardware, and the whole
-    reason the testbed exists. Cerberus should raise storage-with-keyboard at
+    reason the testbed exists. Probolos should raise storage-with-keyboard at
     CRITICAL.
     """
     return EmulatedDevice(
@@ -114,7 +114,7 @@ PRESETS = {
 
 
 def preview(dev: EmulatedDevice) -> None:
-    """Parse the device locally and print what Cerberus should conclude."""
+    """Parse the device locally and print what Probolos should conclude."""
     blob = dev.full_descriptors_blob()
     parsed = descriptors.parse(blob)
     claims = [usbclass.describe_interface(i.interface_class,
@@ -160,7 +160,7 @@ def spawn(dev: EmulatedDevice, hold: float, wait: bool = False) -> None:
             ok = responder.serve()
             if not ok:
                 print("[!] device did not reach 'configured'. It may still "
-                      "have enumerated far enough for Cerberus to see it.")
+                      "have enumerated far enough for Probolos to see it.")
             else:
                 print("[+] device is live and visible to the kernel")
             # Hold it plugged in so the other terminal can inspect it AND so

@@ -8,7 +8,7 @@ machine. That was the reason for splitting observation from judgement.
 
 import unittest
 
-from cerberus import quarantine, rules
+from probolos import quarantine, rules
 
 
 def obs_with(intervals_ms, start_ms=800.0, **kwargs):
@@ -157,7 +157,7 @@ class TestInputNodeDiscovery(unittest.TestCase):
         import tempfile
         from pathlib import Path
         from unittest import mock
-        from cerberus import quarantine
+        from probolos import quarantine
 
         with tempfile.TemporaryDirectory() as tmp:
             real = Path(tmp) / "devices" / "pci0000:00" / "3-1"
@@ -197,7 +197,7 @@ class TestInputNodeDiscovery(unittest.TestCase):
         import tempfile
         from pathlib import Path
         from unittest import mock
-        from cerberus import quarantine
+        from probolos import quarantine
 
         with tempfile.TemporaryDirectory() as tmp:
             ours = Path(tmp) / "devices" / "usb1" / "1-1"
@@ -233,7 +233,7 @@ class TestNoLiveWindowAfterObservation(unittest.TestCase):
     def test_device_is_reblocked_before_the_prompt(self):
         from pathlib import Path
         from unittest import mock
-        from cerberus import daemon as daemon_mod, quarantine, sysfs, usbclass
+        from probolos import daemon as daemon_mod, quarantine, sysfs, usbclass
 
         dev = mock.Mock(spec=sysfs.UsbDevice)
         dev.name = "1-4"
@@ -244,7 +244,7 @@ class TestNoLiveWindowAfterObservation(unittest.TestCase):
         dev.vendor_id, dev.product_id = "1234", "5678"
         dev.label.return_value = "Test Keyboard"
 
-        engine = daemon_mod.Cerberus(observe=1.0)
+        engine = daemon_mod.Probolos(observe=1.0)
         calls = []
 
         obs = quarantine.Observation(duration=1.0, race_window=0.01,

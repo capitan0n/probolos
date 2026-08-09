@@ -12,7 +12,7 @@ import time
 import unittest
 from pathlib import Path
 
-from cerberus import safety
+from probolos import safety
 
 
 class Dev:
@@ -147,7 +147,7 @@ class TestGateDoesNotPerpetuateLockout(unittest.TestCase):
     def test_zero_is_not_recorded_as_the_state_to_restore(self):
         from unittest import mock
         from pathlib import Path
-        from cerberus import gate as gate_mod
+        from probolos import gate as gate_mod
 
         hub = Path("/sys/bus/usb/devices/usb1")
         with mock.patch.object(gate_mod.sysfs, "list_root_hubs",
@@ -164,7 +164,7 @@ class TestGateDoesNotPerpetuateLockout(unittest.TestCase):
         """Value 2 (internal ports only) must be restored as 2, not as 1."""
         from unittest import mock
         from pathlib import Path
-        from cerberus import gate as gate_mod
+        from probolos import gate as gate_mod
 
         hub = Path("/sys/bus/usb/devices/usb1")
         with mock.patch.object(gate_mod.sysfs, "list_root_hubs",

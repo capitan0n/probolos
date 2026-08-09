@@ -9,7 +9,7 @@ A deliberately corrupted filesystem image is a well-established way to attack
 that code, and the automount in a desktop session will do it the moment the
 device is authorized, before anyone has looked at anything.
 
-So Cerberus reads the raw block device itself, as bytes, and parses only the
+So Probolos reads the raw block device itself, as bytes, and parses only the
 partition table and filesystem signatures -- structures simple enough to parse
 safely in Python, with every length checked. Nothing is executed, nothing is
 interpreted as a filesystem, and the device is opened read-only.
@@ -250,7 +250,7 @@ def inspect_safely(device: str, timeout: float = 10.0,
         return MediumReport(device=device, error=str(exc))
 
     # fork, explicitly. The default start method on some setups is "spawn"
-    # (or "forkserver"), which re-imports the whole cerberus package in the
+    # (or "forkserver"), which re-imports the whole probolos package in the
     # child on every single inspection -- seconds of latency, and worse, it
     # lengthens the window in which the device is authorized and udisks2 can
     # automount it. fork inherits the already-loaded interpreter and the open

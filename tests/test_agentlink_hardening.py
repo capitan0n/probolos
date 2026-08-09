@@ -22,7 +22,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from cerberus.agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_YES,
+from probolos.agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_YES,
                                 AgentLink, MSG_ANSWER, peer_credentials)
 
 SETTLE = 0.15           # let the accept thread run before asserting on it
@@ -251,8 +251,8 @@ class SocketOwnership(unittest.TestCase):
     """
     Regression for the no-privsep agent socket being unreachable.
 
-    Observed on a real run: `sudo python -m cerberus --agent` (no --privsep)
-    left /run/cerberus/agent.sock owned root:root 0660, so the agent -- which
+    Observed on a real run: `sudo python -m probolos --agent` (no --privsep)
+    left /run/probolos/agent.sock owned root:root 0660, so the agent -- which
     runs as the desktop user -- got EACCES on connect(). start() must chown the
     socket to the desktop owner when it bound it as root.
 
@@ -265,12 +265,12 @@ class SocketOwnership(unittest.TestCase):
         self.addCleanup(self._dir.cleanup)
 
     def _link(self, **kw):
-        from cerberus.agentlink import AgentLink
+        from probolos.agentlink import AgentLink
         return AgentLink(Path(self._dir.name) / "s.sock",
                          log=lambda *_: None, **kw)
 
     def test_root_bind_chowns_socket_to_owner(self):
-        from cerberus import agentlink
+        from probolos import agentlink
         link = self._link(owner_uid=1000, owner_gid=1000)
         calls = []
         with mock.patch.object(agentlink.os, "geteuid", return_value=0), \
@@ -282,7 +282,7 @@ class SocketOwnership(unittest.TestCase):
                       "socket was not handed to the desktop user")
 
     def test_non_root_does_not_attempt_chown(self):
-        from cerberus import agentlink
+        from probolos import agentlink
         link = self._link(owner_uid=1000, owner_gid=1000)
         with mock.patch.object(agentlink.os, "geteuid", return_value=1000), \
              mock.patch.object(agentlink.os, "chown") as chown:
@@ -291,7 +291,7 @@ class SocketOwnership(unittest.TestCase):
         chown.assert_not_called()
 
     def test_no_owner_does_not_attempt_chown(self):
-        from cerberus import agentlink
+        from probolos import agentlink
         link = self._link()   # owner_uid None: --privsep case
         with mock.patch.object(agentlink.os, "geteuid", return_value=0), \
              mock.patch.object(agentlink.os, "chown") as chown:

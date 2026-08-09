@@ -43,7 +43,7 @@ def default_path() -> Path:
     """
     Where the ledger lives.
 
-    Under root (systemd service) this is /var/lib/cerberus/state/. Run by hand
+    Under root (systemd service) this is /var/lib/probolos/state/. Run by hand
     as a normal user it is the XDG state dir, so a --dry-run or a --list never
     trips over a permission error on a directory only root can write. Falling
     back to a writable location is not laziness: a history file the user cannot
@@ -62,15 +62,15 @@ def default_path() -> Path:
     without a prompt.
 
     Separating them fixes that structurally rather than by permissions alone:
-    only `state/` is handed over. /var/lib/cerberus/ itself, which holds
+    only `state/` is handed over. /var/lib/probolos/ itself, which holds
     trusted.json, stays root-owned, so the analyzer can read trust but can
     neither rewrite nor replace it.
     """
     import os
     if os.geteuid() == 0:
-        return Path("/var/lib/cerberus/state/ledger.json")
+        return Path("/var/lib/probolos/state/ledger.json")
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    return Path(base) / "cerberus" / "ledger.json"
+    return Path(base) / "probolos" / "ledger.json"
 
 
 DEFAULT_PATH = default_path()

@@ -31,7 +31,7 @@ After dropping, the code asserts it cannot regain root (setuid(0) must fail).
 A privilege drop you did not verify is a privilege drop you cannot rely on.
 
 The target user is 'nobody' by default -- present on every Linux system, owns
-nothing. A dedicated 'cerberus' user is better for production and is what the
+nothing. A dedicated 'probolos' user is better for production and is what the
 systemd unit will use; this launcher accepts either.
 """
 
@@ -91,23 +91,23 @@ def drop_privileges(uid: int, gid: int) -> None:
 #
 # prepare_state_dir takes a path from --ledger and chowns its PARENT to the
 # unprivileged uid, then chmods it 0700. With no bound on which parent,
-# `sudo cerberus --ledger /etc/x.json` makes /etc owned by nobody and mode
+# `sudo probolos --ledger /etc/x.json` makes /etc owned by nobody and mode
 # 0700 -- which takes sudo, ssh and PAM with it, on a running system,
 # irreversibly. That needs no attacker: a typo in a flag is enough.
 #
 # So the launcher refuses instead of chowning. The cost of refusing is that the
 # analyzer keeps no history; the cost of not refusing is the machine.
-STATE_ROOTS = ("/var/lib/cerberus", "/run/cerberus")
+STATE_ROOTS = ("/var/lib/probolos", "/run/probolos")
 
 
 def _within_allowed_root(directory: str) -> bool:
     """
     True if `directory` is one of STATE_ROOTS or lies beneath one.
 
-    realpath first, so that --ledger /var/lib/cerberus/../../etc/x.json is
-    judged as /etc rather than as something under /var/lib/cerberus. The
+    realpath first, so that --ledger /var/lib/probolos/../../etc/x.json is
+    judged as /etc rather than as something under /var/lib/probolos. The
     separator is appended before the prefix comparison so that a sibling named
-    /var/lib/cerberus-evil does not match a root it merely starts with.
+    /var/lib/probolos-evil does not match a root it merely starts with.
     """
     resolved = os.path.realpath(directory)
     for root in STATE_ROOTS:
@@ -148,7 +148,7 @@ def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
     Make a state directory writable by the analyzer, before privilege drops.
 
     The analyzer runs as an unprivileged user and cannot create or write
-    /var/lib/cerberus, which is root-owned. Rather than routing ledger writes
+    /var/lib/probolos, which is root-owned. Rather than routing ledger writes
     through the privileged gate -- which would mean putting file I/O and a
     serialisation format inside the trusted process, exactly what the split
     exists to avoid -- the launcher hands ownership of one directory to the

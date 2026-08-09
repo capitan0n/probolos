@@ -1,7 +1,7 @@
 """
 test_descriptors_malformed.py — Regression tests για το αμυντικό parsing.
 
-Στη λογική των υπόλοιπων tests του Cerberus, κάθε test ονομάζεται από το
+Στη λογική των υπόλοιπων tests του Probolos, κάθε test ονομάζεται από το
 σενάριο που το γέννησε. Εδώ όμως τα σενάρια δεν ήρθαν από πραγματικό υλικό
 αλλά από ανάλυση απειλών — γι' αυτό ονομάζονται από την επίθεση.
 
@@ -15,7 +15,7 @@ import sys
 # Δουλεύει και ως μέρος του πακέτου (pytest από τη ρίζα του repo)
 # και σκέτο (python test_descriptors_malformed.py μέσα στον φάκελο).
 try:
-    from cerberus.descriptors_safe import (        # type: ignore
+    from probolos.descriptors_safe import (        # type: ignore
         DescriptorParsingError,
         effective_total_length,
         safe_parse,

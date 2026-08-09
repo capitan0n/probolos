@@ -54,7 +54,7 @@ class Decision:
     timestamp: float
 
 
-class Cerberus:
+class Probolos:
     def __init__(self,
                  dry_run: bool = False,
                  timeout: float = 0.0,
@@ -110,7 +110,7 @@ class Cerberus:
         for dev in sysfs.list_devices():
             # A device sitting at authorized=0 is NOT a device that is working
             # fine and should be left alone -- it is one something already
-            # blocked, almost always a previous Cerberus run that exited before
+            # blocked, almost always a previous Probolos run that exited before
             # a decision was made. Treating it as baseline would leave it dead
             # AND never ask about it, so its owner would have to unplug and
             # replug hardware to get a question they never got the chance to
@@ -438,7 +438,7 @@ class Cerberus:
         """
         Say plainly which devices are being left switched off.
 
-        Cerberus will not silently authorize a device nobody approved, so
+        Probolos will not silently authorize a device nobody approved, so
         anything undecided stays blocked. But leaving hardware dead without
         saying so is how a tool earns a reputation for breaking things, and the
         user has no way to guess why a stick stopped working.
@@ -449,9 +449,9 @@ class Cerberus:
               f"no decision was made:")
         for name in self.pending:
             print(f"      {name}")
-        print("    They stay blocked on purpose. Start Cerberus again and you "
+        print("    They stay blocked on purpose. Start Probolos again and you "
               "will be asked,")
-        print("    or release them now with:  sudo python -m cerberus --release")
+        print("    or release them now with:  sudo python -m probolos --release")
 
     def _hold_until_unlocked(self, dev: sysfs.UsbDevice) -> None:
         """Keep a device blocked and remember to ask about it later."""
@@ -499,7 +499,7 @@ class Cerberus:
         is opened read-only and never mounted, so the kernel's filesystem
         drivers never see its contents.
         """
-        print("  This is a storage device. Cerberus will read its partition")
+        print("  This is a storage device. Probolos will read its partition")
         print("  table directly, without mounting it.")
 
         try:
@@ -550,7 +550,7 @@ class Cerberus:
         The instruction to the user is the experiment: if nobody touches the
         device, then anything it sends is something it decided to send.
         """
-        print("  This is an input device. Cerberus will switch it on with its")
+        print("  This is an input device. Probolos will switch it on with its")
         print("  input captured, so nothing it sends can reach your session.")
         print(f"  >>> DO NOT TOUCH IT for the next {self.observe:.0f} seconds. <<<")
         print()
@@ -760,7 +760,7 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
     if agent_socket is not None:
         # uid 0 is included because refusing it buys nothing: root can write
         # sysfs `authorized` directly and does not need the socket to admit a
-        # device. Excluding it would only make `sudo python -m cerberus.agent`
+        # device. Excluding it would only make `sudo python -m probolos.agent`
         # fail confusingly while debugging. The uid that matters is the desktop
         # one -- everything else is refused and logged.
         permitted = None if agent_uid is None else {agent_uid, 0}
@@ -771,7 +771,7 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
             print(f"  - desktop agent socket: {agent_socket} "
                   f"(answers accepted from {who})")
             print(f"    start the agent in your session with: "
-                  f"python -m cerberus.agent")
+                  f"python -m probolos.agent")
         else:
             link = None
 
@@ -820,7 +820,7 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
             print(f"  - watchdog armed ({watchdog_timeout:.0f}s), "
                   f"panic file: {policy.panic_file}")
 
-        engine = Cerberus(dry_run=dry_run, timeout=timeout, json_log=json_log,
+        engine = Probolos(dry_run=dry_run, timeout=timeout, json_log=json_log,
                           rule_config=rule_config, observe=observe,
                           policy=policy, ledger=store,
                           capture_payload=capture_payload, watchdog=dog,

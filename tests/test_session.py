@@ -13,8 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from cerberus import daemon as daemon_mod
-from cerberus import session, sysfs, usbclass
+from probolos import daemon as daemon_mod
+from probolos import session, sysfs, usbclass
 
 
 def make_device(name="3-9", kinds=None):
@@ -63,7 +63,7 @@ class TestLockedBehaviour(unittest.TestCase):
 
     def setUp(self):
         self.writes = []
-        self.engine = daemon_mod.Cerberus(
+        self.engine = daemon_mod.Probolos(
             monitor=session.FixedState(True),
             lock_policy=session.POLICY_QUEUE,
             observe=0)
@@ -113,7 +113,7 @@ class TestLockedBehaviour(unittest.TestCase):
         self.assertNotIn(1, self.writes)
 
     def test_deny_policy_does_not_queue(self):
-        engine = daemon_mod.Cerberus(monitor=session.FixedState(True),
+        engine = daemon_mod.Probolos(monitor=session.FixedState(True),
                                      lock_policy=session.POLICY_DENY,
                                      observe=0)
         dev = make_device()
@@ -124,7 +124,7 @@ class TestLockedBehaviour(unittest.TestCase):
         self.assertEqual(engine.pending, {})
 
     def test_ignore_policy_asks_normally(self):
-        engine = daemon_mod.Cerberus(monitor=session.FixedState(True),
+        engine = daemon_mod.Probolos(monitor=session.FixedState(True),
                                      lock_policy=session.POLICY_IGNORE,
                                      observe=0)
         dev = make_device()
@@ -142,7 +142,7 @@ class TestUnlockDrainsTheQueue(unittest.TestCase):
 
     def test_held_devices_are_asked_about_on_unlock(self):
         """The requirement: no unplug-and-replug just because you stepped away."""
-        engine = daemon_mod.Cerberus(monitor=session.FixedState(True),
+        engine = daemon_mod.Probolos(monitor=session.FixedState(True),
                                      lock_policy=session.POLICY_QUEUE,
                                      observe=0)
         engine.pending["3-9"] = Path("/sys/bus/usb/devices/3-9")
@@ -157,7 +157,7 @@ class TestUnlockDrainsTheQueue(unittest.TestCase):
         self.assertEqual(engine.pending, {})
 
     def test_a_device_unplugged_while_held_is_not_asked_about(self):
-        engine = daemon_mod.Cerberus(monitor=session.FixedState(True),
+        engine = daemon_mod.Probolos(monitor=session.FixedState(True),
                                      observe=0)
         engine.pending["3-9"] = Path("/sys/bus/usb/devices/3-9")
 
@@ -170,13 +170,13 @@ class TestUnlockDrainsTheQueue(unittest.TestCase):
         self.assertEqual(asked, [])
 
     def test_removal_withdraws_a_held_question(self):
-        engine = daemon_mod.Cerberus(observe=0)
+        engine = daemon_mod.Probolos(observe=0)
         engine.pending["3-9"] = Path("/sys/bus/usb/devices/3-9")
         engine._on_remove("/sys/bus/usb/devices/3-9")
         self.assertEqual(engine.pending, {})
 
     def test_queue_preserves_arrival_order(self):
-        engine = daemon_mod.Cerberus(observe=0)
+        engine = daemon_mod.Probolos(observe=0)
         for name in ("3-1", "3-2", "3-3"):
             engine.pending[name] = Path(f"/sys/bus/usb/devices/{name}")
 
@@ -189,7 +189,7 @@ class TestUnlockDrainsTheQueue(unittest.TestCase):
         self.assertEqual(asked, ["3-1", "3-2", "3-3"])
 
     def test_draining_an_empty_queue_is_harmless(self):
-        engine = daemon_mod.Cerberus(observe=0)
+        engine = daemon_mod.Probolos(observe=0)
         engine._drain_pending()      # must not raise
         self.assertEqual(engine.pending, {})
 
@@ -200,7 +200,7 @@ if __name__ == "__main__":
 
 class TestStrandedDevicesAtStartup(unittest.TestCase):
     """
-    Found in use: after Ctrl-C with a device still held, restarting Cerberus
+    Found in use: after Ctrl-C with a device still held, restarting Probolos
     treated that device as part of the baseline. It stayed at authorized=0 --
     dead -- and was never asked about, so the only way to get a question was to
     unplug and replug the hardware. Exactly what the hold queue exists to avoid.
@@ -218,7 +218,7 @@ class TestStrandedDevicesAtStartup(unittest.TestCase):
         return dev
 
     def test_blocked_devices_are_queued_not_ignored(self):
-        engine = daemon_mod.Cerberus(observe=0)
+        engine = daemon_mod.Probolos(observe=0)
         devices = [self.make("3-1", 1), self.make("3-9", 0)]
 
         with mock.patch.object(daemon_mod.sysfs, "list_devices",
@@ -231,7 +231,7 @@ class TestStrandedDevicesAtStartup(unittest.TestCase):
         self.assertIn("3-9", engine.pending, "blocked device must be queued")
 
     def test_root_hubs_are_never_queued(self):
-        engine = daemon_mod.Cerberus(observe=0)
+        engine = daemon_mod.Probolos(observe=0)
         hub = self.make("usb1", 0)
         hub.is_root_hub = True
 
@@ -244,7 +244,7 @@ class TestStrandedDevicesAtStartup(unittest.TestCase):
 
     def test_devices_with_unknown_state_stay_in_baseline(self):
         """Only an explicit 0 means blocked; None means we could not read it."""
-        engine = daemon_mod.Cerberus(observe=0)
+        engine = daemon_mod.Probolos(observe=0)
         with mock.patch.object(daemon_mod.sysfs, "list_devices",
                                return_value=[self.make("3-4", None)]), \
              mock.patch.object(daemon_mod.report, "one_liner", return_value="x"):
@@ -255,7 +255,7 @@ class TestStrandedDevicesAtStartup(unittest.TestCase):
     def test_exit_reports_what_is_left_blocked(self):
         """Leaving hardware dead without saying so is how a tool gets a name
         for breaking things."""
-        engine = daemon_mod.Cerberus(observe=0)
+        engine = daemon_mod.Probolos(observe=0)
         engine.pending["3-9"] = Path("/sys/bus/usb/devices/3-9")
         with mock.patch("builtins.print") as printed:
             engine.report_blocked_on_exit()
@@ -278,7 +278,7 @@ class TestHeldDevicesBypassTrust(unittest.TestCase):
         dev = make_device()
         trust_store = mock.Mock()
         trust_store.is_trusted.return_value = True
-        engine = daemon_mod.Cerberus(observe=0, trust_store=trust_store,
+        engine = daemon_mod.Probolos(observe=0, trust_store=trust_store,
                                      monitor=session.FixedState(False),
                                      lock_policy=session.POLICY_IGNORE,
                                      inspect_storage=False)

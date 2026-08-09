@@ -2,7 +2,7 @@
 """
 Standalone verbose USB inventory.
 
-Run from the project root (the directory containing cerberus/ and tests/):
+Run from the project root (the directory containing probolos/ and tests/):
 
     python usbinv.py
 
@@ -16,10 +16,10 @@ you to ignore it.
 import sys
 
 try:
-    from cerberus import sysfs, usbclass
+    from probolos import sysfs, usbclass
 except ImportError:
     sys.exit("Run this from the project root — the folder that contains "
-             "the cerberus/ package directory.")
+             "the probolos/ package directory.")
 
 
 def main():

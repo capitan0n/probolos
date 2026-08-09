@@ -7,8 +7,8 @@ READS it (never writes) and presents it.
 
 Wired into __main__.py as a new command:
 
-    python -m cerberus --history          # all devices, summary
-    python -m cerberus --history -v       # with hashes and full decisions
+    python -m probolos --history          # all devices, summary
+    python -m probolos --history -v       # with hashes and full decisions
 
 Read-only: touches no device, needs no root beyond ledger access, runs no daemon.
 """

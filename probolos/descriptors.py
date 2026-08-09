@@ -19,7 +19,7 @@ hardware, so it tells us nothing either.
 The `descriptors` binary attribute is the escape hatch: it contains the device
 descriptor followed by the full configuration descriptors, including every
 interface descriptor, and it IS populated while the device is still blocked.
-Parsing it ourselves is what lets Cerberus answer "what does this claim to be?"
+Parsing it ourselves is what lets Probolos answer "what does this claim to be?"
 *before* granting authorization.  (USBGuard takes the same approach.)
 
 BYTE ORDER

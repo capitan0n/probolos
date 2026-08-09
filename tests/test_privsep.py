@@ -18,8 +18,8 @@ import threading
 import unittest
 from pathlib import Path
 
-from cerberus import gate_server, protocol
-from cerberus.gate_client import GateClient
+from probolos import gate_server, protocol
+from probolos.gate_client import GateClient
 
 
 class TestProtocol(unittest.TestCase):
@@ -152,18 +152,18 @@ class TestGateRefusesBadRequests(unittest.TestCase):
         self.assertTrue(self.client.ping())
 
     def test_authorize_outside_usb_tree_is_denied(self):
-        from cerberus.gate_client import GateError
+        from probolos.gate_client import GateError
         with self.assertRaises(GateError):
             self.client.authorize("/etc/shadow", 1)
 
     def test_authorize_with_bad_value_errors(self):
-        from cerberus.gate_client import GateError
+        from probolos.gate_client import GateError
         with self.assertRaises(GateError):
             # value 7 is neither 0 nor 1
             self.client.authorize("/sys/bus/usb/devices/usb1", 7)
 
     def test_open_input_outside_tree_is_denied(self):
-        from cerberus.gate_client import GateError
+        from probolos.gate_client import GateError
         with self.assertRaises(GateError):
             self.client.open_input("/etc/passwd")
 
@@ -219,18 +219,18 @@ class TestPrivilegeDrop(unittest.TestCase):
     """
 
     def test_drop_is_a_noop_when_not_root(self):
-        from cerberus import privsep
+        from probolos import privsep
         # We are not root in CI; this must return quietly, not blow up.
         if os.getuid() != 0:
             privsep.drop_privileges(12345, 12345)  # should not raise
 
     def test_resolve_user_rejects_unknown(self):
-        from cerberus import privsep
+        from probolos import privsep
         with self.assertRaises(privsep.PrivsepError):
-            privsep.resolve_user("no-such-user-cerberus-xyz")
+            privsep.resolve_user("no-such-user-probolos-xyz")
 
     def test_resolve_nobody_exists(self):
-        from cerberus import privsep
+        from probolos import privsep
         uid, gid = privsep.resolve_user("nobody")
         self.assertIsInstance(uid, int)
 

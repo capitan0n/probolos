@@ -3,23 +3,23 @@
 Στόχος: αριθμημένο, ασφαλές πριν/μετά. Πόσα key events ενός BadUSB payload
 διαρρέουν στη συνεδρία **με** deferred bind vs **χωρίς**.
 
-Τρία αρχεία, όλα στο ίδιο σημείο (π.χ. `~/Lab/personal/cerberus/testbed/hidexp/`):
+Τρία αρχεία, όλα στο ίδιο σημείο (π.χ. `~/Lab/personal/probolos/testbed/hidexp/`):
 
 ```bash
-mkdir -p ~/Lab/personal/cerberus/testbed/hidexp
+mkdir -p ~/Lab/personal/probolos/testbed/hidexp
 \cp -f ~/Downloads/hid_gadget_up.sh ~/Downloads/hid_gadget_down.sh \
-       ~/Downloads/hid_attack.py ~/Lab/personal/cerberus/testbed/hidexp/
-chmod +x ~/Lab/personal/cerberus/testbed/hidexp/*.sh
+       ~/Downloads/hid_attack.py ~/Lab/personal/probolos/testbed/hidexp/
+chmod +x ~/Lab/personal/probolos/testbed/hidexp/*.sh
 ```
 
 ---
 
-## Βήμα 0 — Smoke test (ΧΩΡΙΣ Cerberus, δες ότι δουλεύει το gadget)
+## Βήμα 0 — Smoke test (ΧΩΡΙΣ Probolos, δες ότι δουλεύει το gadget)
 
 Πρώτα βεβαιώσου ότι το gadget στήνεται και παράγει `/dev/hidg0`:
 
 ```bash
-cd ~/Lab/personal/cerberus/testbed/hidexp
+cd ~/Lab/personal/probolos/testbed/hidexp
 sudo ./hid_gadget_up.sh
 ```
 
@@ -33,7 +33,7 @@ sudo dmesg | tail -5        # θα δεις "hid-generic ... Keyboard"
 ```
 
 **ΠΡΟΣΟΧΗ:** αυτή τη στιγμή το gadget είναι πραγματικό πληκτρολόγιο δεμένο
-στη συνεδρία σου. Αν τρέξεις το attack ΤΩΡΑ (χωρίς Cerberus), τα markers
+στη συνεδρία σου. Αν τρέξεις το attack ΤΩΡΑ (χωρίς Probolos), τα markers
 ΘΑ πληκτρολογηθούν όπου έχεις focus. Άνοιξε έναν κενό editor και δες:
 
 ```bash
@@ -50,31 +50,31 @@ sudo ./hid_gadget_down.sh
 
 ---
 
-## Βήμα 1 — ΜΕ Cerberus, deferred bind ON (η κανονική κατάσταση)
+## Βήμα 1 — ΜΕ Probolos, deferred bind ON (η κανονική κατάσταση)
 
 Δύο terminals.
 
-**Terminal A** — ο Cerberus, με capture ώστε να μετρήσει keystrokes:
+**Terminal A** — ο Probolos, με capture ώστε να μετρήσει keystrokes:
 
 ```bash
-cd ~/Lab/personal/cerberus
-sudo python -m cerberus --observe 3 --capture-payload
+cd ~/Lab/personal/probolos
+sudo python -m probolos --observe 3 --capture-payload
 ```
 
 Άφησέ τον να ακούει.
 
-**Terminal B** — στήσε το gadget (ο Cerberus θα το πιάσει ως νέα συσκευή)
+**Terminal B** — στήσε το gadget (ο Probolos θα το πιάσει ως νέα συσκευή)
 και μετά επίθεση:
 
 ```bash
-cd ~/Lab/personal/cerberus/testbed/hidexp
+cd ~/Lab/personal/probolos/testbed/hidexp
 sudo ./hid_gadget_up.sh
-# Ο Cerberus στο Α τυπώνει τώρα "NEW USB DEVICE — keyboard".
+# Ο Probolos στο Α τυπώνει τώρα "NEW USB DEVICE — keyboard".
 # Μόλις μπει σε καραντίνα (DO NOT TOUCH), τρέξε ΑΜΕΣΩΣ:
 sudo python3 hid_attack.py --markers 8
 ```
 
-**Τι να κοιτάξεις στο report του Cerberus (Terminal A):**
+**Τι να κοιτάξεις στο report του Probolos (Terminal A):**
 
 - `Keystrokes captured : 41` (ή όσα έστειλες) — τα έπιασε ΟΛΑ
 - Finding: `machine-generated-keystrokes` (CRITICAL) — αναγνώρισε τον ρυθμό
@@ -82,19 +82,19 @@ sudo python3 hid_attack.py --markers 8
 - Το exposure: `actual exposure 0 ms` — δεν πρόλαβαν να διαρρεύσουν
 
 **ΤΟ ΚΡΙΣΙΜΟ:** στο Terminal B, ΚΑΝΕΝΑΣ χαρακτήρας δεν πρέπει να εμφανιστεί.
-Ο Cerberus κρατά το grab· τα markers πάνε σε αυτόν, όχι στη συνεδρία.
+Ο Probolos κρατά το grab· τα markers πάνε σε αυτόν, όχι στη συνεδρία.
 Αυτό είναι το «0 keystrokes leaked».
 
 Καθάρισε:
 
 ```bash
 sudo ./hid_gadget_down.sh
-# Ctrl-C στον Cerberus (Terminal A)
+# Ctrl-C στον Probolos (Terminal A)
 ```
 
 ---
 
-## Βήμα 2 — ΜΕ Cerberus, deferred bind OFF (το control πείραμα)
+## Βήμα 2 — ΜΕ Probolos, deferred bind OFF (το control πείραμα)
 
 Για να δείξεις τη ΔΙΑΦΟΡΑ, χρειάζεσαι το ίδιο σενάριο χωρίς το deferred
 bind. Πρόσθεσε προσωρινό flag ή, πιο απλά, force το fallback:
@@ -118,9 +118,9 @@ bind. Πρόσθεσε προσωρινό flag ή, πιο απλά, force το f
 
 | Συνθήκη | enumeration | exposure | keystrokes leaked |
 |---|---|---|---|
-| Χωρίς Cerberus | — | ∞ | ΟΛΑ (41/41) |
-| Cerberus, deferred OFF | ~50 ms | ~50 ms | μερικά (π.χ. 3-8) |
-| Cerberus, deferred ON | ~50 ms | ~0 ms | 0 |
+| Χωρίς Probolos | — | ∞ | ΟΛΑ (41/41) |
+| Probolos, deferred OFF | ~50 ms | ~50 ms | μερικά (π.χ. 3-8) |
+| Probolos, deferred ON | ~50 ms | ~0 ms | 0 |
 
 Αυτός ο πίνακας είναι το αποτέλεσμα. Δείχνει μετρημένη, όχι θεωρητική,
 βελτίωση — και μάλιστα με πραγματικό kernel gadget, όχι mock.
@@ -139,10 +139,10 @@ bind. Πρόσθεσε προσωρινό flag ή, πιο απλά, force το f
 κρατά τον UDC. `cat /sys/class/udc/dummy_udc.0/state` — αν λέει
 "configured", τρέξε πρώτα το down script.
 
-**Ο Cerberus δεν βλέπει το gadget:** το `dummy_hcd` δημιουργεί συσκευές
-στο bus 5 (`usb5`). Βεβαιώσου ότι ο Cerberus δεν φιλτράρει το bus 5 —
+**Ο Probolos δεν βλέπει το gadget:** το `dummy_hcd` δημιουργεί συσκευές
+στο bus 5 (`usb5`). Βεβαιώσου ότι ο Probolos δεν φιλτράρει το bus 5 —
 στο baseline output πρέπει να δεις `usb5: closed`.
 
-**Το down script αφήνει σκουπίδια:** `find /sys/kernel/config/usb_gadget/cerberus_test`
+**Το down script αφήνει σκουπίδια:** `find /sys/kernel/config/usb_gadget/probolos_test`
 δείχνει τι έμεινε. Σχεδόν πάντα είναι το UDC ακόμη δεμένο — 
-`echo "" > .../cerberus_test/UDC` και ξανά.
+`echo "" > .../probolos_test/UDC` και ξανά.

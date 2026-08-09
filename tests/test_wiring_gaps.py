@@ -17,7 +17,7 @@ was never wired to the path it was written for.
 import unittest
 from unittest import mock
 
-from cerberus import agentlink, gate_client, protocol, sysfs
+from probolos import agentlink, gate_client, protocol, sysfs
 
 
 class GateBackendCompleteness(unittest.TestCase):
@@ -53,7 +53,7 @@ class GateBackendCompleteness(unittest.TestCase):
 class ListIsDispatched(unittest.TestCase):
 
     def test_list_runs_the_inventory_and_never_closes_the_gate(self):
-        from cerberus import __main__ as m
+        from probolos import __main__ as m
         with mock.patch.object(m, "cmd_list") as listing, \
              mock.patch.object(m, "require_root") as root, \
              mock.patch.object(m, "require_usb"):

@@ -82,7 +82,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_SOCKET = Path("/run/cerberus/agent.sock")
+DEFAULT_SOCKET = Path("/run/probolos/agent.sock")
 
 # Message kinds, analyzer -> agent
 MSG_DECIDE = "decide"
@@ -257,7 +257,7 @@ class AgentLink:
         as the user, not root -- cannot connect. It only applies when an owner
         was supplied AND we are actually root; a non-root daemon has nothing to
         grant and silently skips. The directory is only chowned if THIS call
-        created it, so a shared /run/cerberus set up by something else is left
+        created it, so a shared /run/probolos set up by something else is left
         as it was found.
 
         SO_PEERCRED still guards who may answer, so widening filesystem access

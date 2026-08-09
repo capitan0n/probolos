@@ -1,7 +1,7 @@
 """
 Translation of raw USB class/subclass/protocol codes into human language.
 
-The whole point of Cerberus is that a human is asked a question they can
+The whole point of Probolos is that a human is asked a question they can
 actually answer.  "bInterfaceClass=0x03, bInterfaceProtocol=0x01" is not a
 question anyone can answer.  "This device claims to be a KEYBOARD" is.
 """
@@ -82,7 +82,7 @@ _KIND_BY_CLASS = {
     0x09: KIND_HUB,
     # Wireless controllers get their own bucket because they are gateways:
     # a Bluetooth adapter can admit a keyboard later, with no USB event at all.
-    # Cerberus cannot see that happen. Naming the bucket keeps the blind spot
+    # Probolos cannot see that happen. Naming the bucket keeps the blind spot
     # visible instead of hiding it inside "other".
     0xE0: KIND_WIRELESS,
 }

@@ -16,8 +16,8 @@ import html
 import unittest
 from types import SimpleNamespace
 
-from cerberus import rules, textsafe
-from cerberus.textsafe import NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE
+from probolos import rules, textsafe
+from probolos.textsafe import NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE
 
 
 def _device(*, notes=(), per_field=None, keyboard=False, classes=(),
@@ -138,7 +138,7 @@ class DialogMarkupEscaping(unittest.TestCase):
     """
 
     def setUp(self):
-        from cerberus import dialogs
+        from probolos import dialogs
         self.dialogs = dialogs
 
     def test_markup_safe_neutralises_tags(self):

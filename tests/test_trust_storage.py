@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cerberus import rules, storage, trust
+from probolos import rules, storage, trust
 
 
 # ---------------------------------------------------------------------------

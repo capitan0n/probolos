@@ -25,7 +25,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from cerberus import agentlink, daemon as daemon_mod, rules, sysfs, usbclass
+from probolos import agentlink, daemon as daemon_mod, rules, sysfs, usbclass
 
 
 class FakeAgent:
@@ -204,7 +204,7 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
         """
         link = mock.Mock()
         link.connected = True
-        engine = daemon_mod.Cerberus(agent=link, observe=0)
+        engine = daemon_mod.Probolos(agent=link, observe=0)
         finding = rules.Finding("storage-with-keyboard", rules.Severity.CRITICAL,
                                 "Storage device that can also type", "")
 
@@ -218,7 +218,7 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
         link = mock.Mock()
         link.connected = True
         link.ask.return_value = agentlink.ANSWER_YES
-        engine = daemon_mod.Cerberus(agent=link, observe=0)
+        engine = daemon_mod.Probolos(agent=link, observe=0)
 
         self.assertTrue(engine._ask(self.device(), []))
         link.ask.assert_called_once()
@@ -227,7 +227,7 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
         link = mock.Mock()
         link.connected = True
         link.ask.return_value = agentlink.ANSWER_ALWAYS
-        engine = daemon_mod.Cerberus(agent=link, trust_store=mock.Mock(),
+        engine = daemon_mod.Probolos(agent=link, trust_store=mock.Mock(),
                                      observe=0)
         engine._remember = False
 
@@ -242,7 +242,7 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
         link = mock.Mock()
         link.connected = True
         link.ask.return_value = None
-        engine = daemon_mod.Cerberus(agent=link, observe=0)
+        engine = daemon_mod.Probolos(agent=link, observe=0)
 
         with mock.patch("sys.stdin", io.StringIO("y\n")):
             self.assertTrue(engine._ask(self.device(), []),
@@ -253,7 +253,7 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
         link = mock.Mock()
         link.connected = True
         link.ask.return_value = agentlink.ANSWER_NO
-        engine = daemon_mod.Cerberus(agent=link, observe=0)
+        engine = daemon_mod.Probolos(agent=link, observe=0)
 
         # stdin is left empty: if the terminal were consulted at all the test
         # would read EOF and deny, so the assertion below only proves the point
@@ -271,7 +271,7 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
         findings = [rules.Finding(f"r{i}", rules.Severity.NOTICE,
                                   f"Finding number {i}", "long explanation")
                     for i in range(6)]
-        body = daemon_mod.Cerberus._agent_body(self.device(), findings)
+        body = daemon_mod.Probolos._agent_body(self.device(), findings)
         self.assertLessEqual(len(body.splitlines()), 6)
         self.assertIn("more finding", body)
 
@@ -287,14 +287,14 @@ class TestDialogBackends(unittest.TestCase):
     """
 
     def test_detect_returns_none_when_nothing_is_installed(self):
-        from cerberus import dialogs
+        from probolos import dialogs
         with mock.patch.object(dialogs.shutil, "which", return_value=None), \
              mock.patch.object(dialogs.TkinterBackend, "available",
                                return_value=False):
             self.assertIsNone(dialogs.detect(log=lambda *a: None))
 
     def test_detect_prefers_kdialog(self):
-        from cerberus import dialogs
+        from probolos import dialogs
         with mock.patch.object(dialogs.shutil, "which",
                                side_effect=lambda n: f"/usr/bin/{n}"):
             self.assertEqual(dialogs.detect(log=lambda *a: None).name,
@@ -305,7 +305,7 @@ class TestDialogBackends(unittest.TestCase):
         Left unanswered means no. A dialog nobody dealt with must not become an
         approval just because it went away.
         """
-        from cerberus import dialogs
+        from probolos import dialogs
         backend = dialogs.KDialogBackend()
         backend._binary = "/usr/bin/kdialog"
         with mock.patch.object(dialogs.subprocess, "run",
@@ -318,7 +318,7 @@ class TestDialogBackends(unittest.TestCase):
         None means "could not ask", which is different from "was refused" -- the
         caller falls back to the terminal instead of rejecting silently.
         """
-        from cerberus import dialogs
+        from probolos import dialogs
         backend = dialogs.KDialogBackend()
         backend._binary = "/usr/bin/kdialog"
         with mock.patch.object(dialogs.subprocess, "run",
@@ -326,7 +326,7 @@ class TestDialogBackends(unittest.TestCase):
             self.assertIsNone(backend.confirm("t", "x", "y", "n", 1.0))
 
     def test_nonzero_exit_is_a_refusal(self):
-        from cerberus import dialogs
+        from probolos import dialogs
         backend = dialogs.KDialogBackend()
         backend._binary = "/usr/bin/kdialog"
         completed = mock.Mock(returncode=1)
@@ -335,7 +335,7 @@ class TestDialogBackends(unittest.TestCase):
             self.assertIs(backend.confirm("t", "x", "y", "n", 1.0), False)
 
     def test_zero_exit_is_an_approval(self):
-        from cerberus import dialogs
+        from probolos import dialogs
         backend = dialogs.KDialogBackend()
         backend._binary = "/usr/bin/kdialog"
         completed = mock.Mock(returncode=0)
@@ -348,7 +348,7 @@ class TestAgentNeedsTwoYeses(unittest.TestCase):
     """One misplaced click must never energise unknown hardware."""
 
     def build(self):
-        from cerberus import agent as agent_mod
+        from probolos import agent as agent_mod
         instance = agent_mod.Agent.__new__(agent_mod.Agent)
         instance.log = lambda *a: None
         instance.notifier = mock.Mock()
@@ -358,7 +358,7 @@ class TestAgentNeedsTwoYeses(unittest.TestCase):
         return instance
 
     def test_both_dialogs_must_be_confirmed(self):
-        from cerberus.agentlink import ANSWER_NO, ANSWER_YES
+        from probolos.agentlink import ANSWER_NO, ANSWER_YES
         agent = self.build()
 
         agent.dialog.confirm.side_effect = [True, True]
@@ -378,8 +378,8 @@ class TestAgentNeedsTwoYeses(unittest.TestCase):
         With a trust store the second dialog is the three-way one, so 'always'
         still needs the first dialog approved AND the choice made explicitly.
         """
-        from cerberus import dialogs
-        from cerberus.agentlink import ANSWER_ALWAYS, ANSWER_NO
+        from probolos import dialogs
+        from probolos.agentlink import ANSWER_ALWAYS, ANSWER_NO
         agent = self.build()
 
         agent.dialog.confirm.return_value = True
@@ -408,7 +408,7 @@ class TestThreeWayChoice(unittest.TestCase):
     """
 
     def build(self):
-        from cerberus import agent as agent_mod
+        from probolos import agent as agent_mod
         instance = agent_mod.Agent.__new__(agent_mod.Agent)
         instance.log = lambda *a: None
         instance.notifier = mock.Mock()
@@ -418,8 +418,8 @@ class TestThreeWayChoice(unittest.TestCase):
         return instance
 
     def test_once_is_reachable_without_being_remembered(self):
-        from cerberus import dialogs
-        from cerberus.agentlink import ANSWER_YES
+        from probolos import dialogs
+        from probolos.agentlink import ANSWER_YES
         agent = self.build()
         agent.dialog.confirm.return_value = True
         agent.dialog.choose.return_value = dialogs.CHOICE_ONCE
@@ -430,8 +430,8 @@ class TestThreeWayChoice(unittest.TestCase):
                          "'just this once' must not create a trust entry")
 
     def test_always_is_reachable_and_distinct(self):
-        from cerberus import dialogs
-        from cerberus.agentlink import ANSWER_ALWAYS
+        from probolos import dialogs
+        from probolos.agentlink import ANSWER_ALWAYS
         agent = self.build()
         agent.dialog.confirm.return_value = True
         agent.dialog.choose.return_value = dialogs.CHOICE_ALWAYS
@@ -442,8 +442,8 @@ class TestThreeWayChoice(unittest.TestCase):
             ANSWER_ALWAYS)
 
     def test_cancel_on_the_second_dialog_refuses(self):
-        from cerberus import dialogs
-        from cerberus.agentlink import ANSWER_NO
+        from probolos import dialogs
+        from probolos.agentlink import ANSWER_NO
         agent = self.build()
         agent.dialog.confirm.return_value = True
         agent.dialog.choose.return_value = dialogs.CHOICE_NO
@@ -456,7 +456,7 @@ class TestThreeWayChoice(unittest.TestCase):
     def test_without_a_trust_store_only_two_buttons_are_used(self):
         """No trust store means nothing to remember, so the three-way question
         would offer a choice that does nothing."""
-        from cerberus.agentlink import ANSWER_YES
+        from probolos.agentlink import ANSWER_YES
         agent = self.build()
         agent.dialog.confirm.side_effect = [True, True]
 
@@ -471,13 +471,13 @@ class TestKdialogThreeWayMapping(unittest.TestCase):
     """kdialog exit codes: 0 = yes, 1 = no, 2 = cancel."""
 
     def backend(self):
-        from cerberus import dialogs
+        from probolos import dialogs
         b = dialogs.KDialogBackend()
         b._binary = "/usr/bin/kdialog"
         return b
 
     def test_exit_codes_map_to_the_three_choices(self):
-        from cerberus import dialogs
+        from probolos import dialogs
         cases = {0: dialogs.CHOICE_ONCE, 1: dialogs.CHOICE_ALWAYS,
                  2: dialogs.CHOICE_NO}
         for code, expected in cases.items():
@@ -488,7 +488,7 @@ class TestKdialogThreeWayMapping(unittest.TestCase):
                     expected)
 
     def test_a_timeout_refuses(self):
-        from cerberus import dialogs
+        from probolos import dialogs
         with mock.patch.object(dialogs.subprocess, "run",
                                side_effect=dialogs.subprocess.TimeoutExpired(
                                    cmd="kdialog", timeout=1)):

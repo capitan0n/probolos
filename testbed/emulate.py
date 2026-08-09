@@ -7,7 +7,7 @@ Two halves:
   * a responder that runs the raw-gadget event loop and replies to each
     standard control request with those bytes
 
-The builders intentionally mirror the STRUCTURE that cerberus/descriptors.py
+The builders intentionally mirror the STRUCTURE that probolos/descriptors.py
 parses, so a device emulated here and a device in a unit test are the same
 shape of thing. The point of the testbed is to prove the parser and rules that
 pass in CI also fire when a device physically enumerates.
@@ -45,7 +45,7 @@ class EmulatedDevice:
     product_id: int = 0x0104
     bcd_usb: int = 0x0200
     device_class: int = 0x00
-    manufacturer: str = "Cerberus"
+    manufacturer: str = "Probolos"
     product: str = "Testbed Device"
     serial: str = "TB-0001"
     max_power_ma: int = 100
@@ -96,7 +96,7 @@ class EmulatedDevice:
         """
         The device + config blob, in the exact form sysfs would expose.
 
-        Handy for feeding cerberus.descriptors.parse directly, so the emulated
+        Handy for feeding probolos.descriptors.parse directly, so the emulated
         device can be checked against the parser without enumerating at all.
         """
         return self.device_descriptor() + self.config_descriptor()
@@ -108,7 +108,7 @@ class Responder:
 
     Answers the standard GET_DESCRIPTOR / SET_CONFIGURATION requests and stops
     once the host has selected a configuration -- at which point the device is
-    fully visible to the kernel and to Cerberus.
+    fully visible to the kernel and to Probolos.
     """
 
     def __init__(self, gadget: RawGadget, device: EmulatedDevice, log=print):

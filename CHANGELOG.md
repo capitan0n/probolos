@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Cerberus. Versioning is semantic.
+All notable changes to Probolos. Versioning is semantic.
 
 ## [0.9.0] — the audit
 
@@ -74,13 +74,13 @@ dispatched. The bugs were rarely bad code; they were unwired code.
   shared a directory, and that directory was chowned to the analyzer. Directory
   write permission allows replacing any file inside it whatever the file's own
   owner, so trust was handed over with it. The ledger moved to
-  `/var/lib/cerberus/state/`; `/var/lib/cerberus/` stays root-owned. The
+  `/var/lib/probolos/state/`; `/var/lib/probolos/` stays root-owned. The
   launcher now refuses outright to hand over a directory holding a trust store.
 - **`--ledger /etc/x.json` would chown `/etc` to `nobody` at mode 0700**,
   taking sudo, ssh and PAM with it on a running system — no attacker needed, a
   typo was enough. State directories are restricted to a fixed allowlist,
   resolved with `realpath` first so `../` cannot escape and a sibling like
-  `/var/lib/cerberus-evil` does not match on prefix.
+  `/var/lib/probolos-evil` does not match on prefix.
 - **A stalled storage read opened the gate system-wide.** A device that stalls
   its own security scan froze the daemon; with the watchdog running, that freeze
   became the watchdog reopening `authorized_default` for every port. The read
@@ -114,11 +114,11 @@ dispatched. The bugs were rarely bad code; they were unwired code.
   decision is actually made. Escaped for those two backends only: the terminal
   and tkinter render plain text, where a legitimate `A<B & C>D` must show as
   typed.
-- **`systemd/60-cerberus-inhibit-automount.rules`.** Stage 4 must briefly
+- **`systemd/60-probolos-inhibit-automount.rules`.** Stage 4 must briefly
   authorize the device for its block node to appear, and udisks2 would automount
   the medium in that window — the exact kernel-filesystem exposure stage 4
   exists to avoid. The rule sets `UDISKS_IGNORE=1` on USB block devices;
-  Cerberus reads the raw node itself and loses nothing. *Found in use: the
+  Probolos reads the raw node itself and loses nothing. *Found in use: the
   operator was able to mount the stick by hand while the scan was running.*
 - **`atomicio.py`** — symlink-safe atomic JSON writes, shared by the trust
   store and the ledger.
@@ -127,9 +127,9 @@ dispatched. The bugs were rarely bad code; they were unwired code.
 
 ### Changed
 
-- The ledger moved from `/var/lib/cerberus/ledger.json` to
-  `/var/lib/cerberus/state/ledger.json`. To keep existing history:
-  `sudo mkdir -p /var/lib/cerberus/state && sudo mv /var/lib/cerberus/ledger.json /var/lib/cerberus/state/`
+- The ledger moved from `/var/lib/probolos/ledger.json` to
+  `/var/lib/probolos/state/ledger.json`. To keep existing history:
+  `sudo mkdir -p /var/lib/probolos/state && sudo mv /var/lib/probolos/ledger.json /var/lib/probolos/state/`
 - Storage inspection uses an explicit `fork` start method. The default is
   `spawn` on some configurations, which re-imports the whole package per
   inspection — seconds of latency, and worse, a longer window in which the
@@ -143,8 +143,8 @@ dispatched. The bugs were rarely bad code; they were unwired code.
 - SECURITY.md previously stated the quarantine race as "typically 10–20 ms".
   The measured figure on real hardware is 41–85 ms, as the 0.6.0 notes already
   recorded. Corrected.
-- The panic file moved to `/run/cerberus.panic` and must be root-owned;
-  SECURITY.md still documented `/tmp/cerberus-panic`. Corrected.
+- The panic file moved to `/run/probolos.panic` and must be root-owned;
+  SECURITY.md still documented `/tmp/probolos-panic`. Corrected.
 - `descriptors_safe.py` remains orphaned — 816 lines of hardening reachable
   from no running code path. It is a known outstanding item, not dead weight to
   be deleted casually; either wire it in or remove it deliberately.
@@ -181,7 +181,7 @@ dispatched. The bugs were rarely bad code; they were unwired code.
 ## [0.8.0] — approving from the desktop
 
 ### Added
-- **Desktop notification agent** (`python -m cerberus.agent`). A third process
+- **Desktop notification agent** (`python -m probolos.agent`). A third process
   runs in the user's session, shows a notification when a device is waiting and
   sends the answer back over a group-restricted Unix socket. Clicking the body
   means allow; a second, differently worded notification must also be clicked
@@ -197,7 +197,7 @@ dispatched. The bugs were rarely bad code; they were unwired code.
   by the root launcher with the setgid bit set, so a socket created by the
   unprivileged analyzer is reachable by exactly the desktop user and nobody
   else — a world-writable socket would let any local account approve hardware.
-- `python -m cerberus.agent --test` checks that notifications and body-clicks
+- `python -m probolos.agent --test` checks that notifications and body-clicks
   work on a given desktop before relying on them.
 
 ### Notes
@@ -223,14 +223,14 @@ dispatched. The bugs were rarely bad code; they were unwired code.
 ## [0.7.1] — found in use
 
 ### Fixed
-- **A device held when Cerberus exited was stranded.** It stayed at
+- **A device held when Probolos exited was stranded.** It stayed at
   `authorized=0` — dead — and on the next run was counted as part of the
   baseline, so it was never asked about. The only way to get a question was to
   unplug and replug the hardware, which is precisely what the hold queue exists
   to avoid. A device at `authorized=0` is no longer treated as "already working,
   leave it alone"; it is queued for decision at startup.
 - Exiting with undecided devices now says which ones are being left blocked and
-  how to release them. Cerberus will not authorize something nobody approved,
+  how to release them. Probolos will not authorize something nobody approved,
   but leaving hardware dead in silence is how a tool earns a reputation for
   breaking things.
 - Approving with `always` now counts as the first admission, and the state
@@ -255,7 +255,7 @@ dispatched. The bugs were rarely bad code; they were unwired code.
   even remembered devices, and the device is never powered up — so neither
   quarantine nor the storage scan runs with nobody present. Held devices are
   queued and asked about the moment the screen unlocks, with no need to unplug
-  and replug. State comes from logind; if it cannot be determined, Cerberus
+  and replug. State comes from logind; if it cannot be determined, Probolos
   says so rather than silently disabling the protection.
 - `OPEN_BLOCK` in the gate protocol, so the unprivileged analyzer can read a
   whole disk read-only through the privileged gate. Restricted to whole

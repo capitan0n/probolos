@@ -1,7 +1,7 @@
 """
 The analyzer plugin layer.
 
-Every check Cerberus performs is an object with one method:
+Every check Probolos performs is an object with one method:
 
     analyze(ctx) -> List[Finding]
 

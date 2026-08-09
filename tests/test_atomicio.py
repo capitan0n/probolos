@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cerberus import atomicio
+from probolos import atomicio
 
 
 class WriteJsonAtomic(unittest.TestCase):
@@ -83,7 +83,7 @@ class SaveMethodsRefuseSymlink(unittest.TestCase):
         self.root = Path(self._dir.name)
 
     def test_trust_store_save_refuses_symlink(self):
-        from cerberus import trust
+        from probolos import trust
         victim = self.root / "victim"
         victim.write_text("SACRED")
         store = trust.TrustStore(self.root / "trusted.json")
@@ -94,7 +94,7 @@ class SaveMethodsRefuseSymlink(unittest.TestCase):
         self.assertEqual(victim.read_text(), "SACRED")
 
     def test_ledger_save_refuses_symlink(self):
-        from cerberus import ledger
+        from probolos import ledger
         victim = self.root / "victim"
         victim.write_text("SACRED")
         store = ledger.Ledger(self.root / "ledger.json")

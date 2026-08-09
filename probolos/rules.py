@@ -453,7 +453,7 @@ def load_config(path) -> RuleConfig:
     except ImportError:
         raise RuntimeError(
             "PyYAML is not installed (Manjaro: sudo pacman -S python-yaml). "
-            "Cerberus runs fine without it using the built-in rules.")
+            "Probolos runs fine without it using the built-in rules.")
 
     with open(path) as fh:
         data = yaml.safe_load(fh) or {}
@@ -476,7 +476,7 @@ def load_config(path) -> RuleConfig:
 # ---------------------------------------------------------------------------
 # Stage 3: judging observed behaviour
 #
-# Kept here, next to the identity rules, so that every judgement Cerberus makes
+# Kept here, next to the identity rules, so that every judgement Probolos makes
 # lives in one auditable place. quarantine.py only observes; it never decides.
 # This module deliberately does not import evdev -- it takes a plain data object
 # and can therefore be tested on any machine, with no hardware and no root.
@@ -548,7 +548,7 @@ def behaviour_findings(obs, config: Optional[RuleConfig] = None) -> List[Finding
             f"device, averaging {mean_gap * 1000:.0f} ms apart with a timing "
             f"variation of {cv:.2f}. Human typing is slower and markedly more "
             "irregular; this rhythm is automated. The keystrokes were captured "
-            "by Cerberus and did not reach your session.")
+            "by Probolos and did not reach your session.")
     elif len(keys) >= _ACCIDENT_THRESHOLD:
         add("unprompted-typing", Severity.CRITICAL,
             "Device typed on its own",

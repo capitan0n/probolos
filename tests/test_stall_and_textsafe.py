@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from cerberus import storage, sysfs, textsafe
+from probolos import storage, sysfs, textsafe
 
 
 class StorageStall(unittest.TestCase):

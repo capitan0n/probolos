@@ -16,12 +16,12 @@ ls -l /dev/raw-gadget       # expect a character device
 To load on every boot:
 
 ```bash
-echo -e "dummy_hcd\nraw_gadget" | sudo tee /etc/modules-load.d/cerberus-testbed.conf
+echo -e "dummy_hcd\nraw_gadget" | sudo tee /etc/modules-load.d/probolos-testbed.conf
 ```
 
 ## Preview without root or hardware
 
-Every preset can be parsed locally, printing what Cerberus should conclude,
+Every preset can be parsed locally, printing what Probolos should conclude,
 without spawning anything:
 
 ```bash
@@ -39,7 +39,7 @@ Two terminals.
 Terminal 1 — watch, block nothing:
 
 ```bash
-sudo python -m cerberus --dry-run
+sudo python -m probolos --dry-run
 ```
 
 Terminal 2 — present the attack:
@@ -50,9 +50,9 @@ sudo python -m testbed.spawn badusb
 
 Terminal 1 should show `!! CRITICAL: Storage device that can also type`.
 
-Start with `--dry-run` on the Cerberus side: a blocked device waiting for your
+Start with `--dry-run` on the Probolos side: a blocked device waiting for your
 answer is frozen mid-enumeration, which can stall the gadget. Once you have seen
-the report, switch to the real gate (`sudo python -m cerberus`) and, because the
+the report, switch to the real gate (`sudo python -m probolos`) and, because the
 finding is CRITICAL, the prompt will require you to type the whole word
 `authorize` rather than `y`.
 
@@ -109,4 +109,4 @@ If `state` reads `configured` or `addressed`, something still holds it; check
 reboot to clear the module state entirely.
 
 Note that loading dummy_hcd adds a virtual root hub (you will see an extra
-`usbN` in Cerberus's baseline). That is expected and harmless.
+`usbN` in Probolos's baseline). That is expected and harmless.

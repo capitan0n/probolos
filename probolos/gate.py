@@ -3,7 +3,7 @@ Lifecycle management for the global authorization gate.
 
 THE FAILURE MODE THIS FILE EXISTS TO PREVENT
 --------------------------------------------
-`authorized_default = 0` is global per root hub and it *persists*. If Cerberus
+`authorized_default = 0` is global per root hub and it *persists*. If Probolos
 sets it and then dies -- crash, kill -9, closed laptop lid, unhandled traceback
 -- every USB device plugged in afterwards stays dead until someone restores the
 flag by hand. On a machine whose keyboard is USB, that is a lockout.
@@ -136,7 +136,7 @@ def unauthorized_devices() -> List[sysfs.UsbDevice]:
     """
     Devices currently sitting blocked.
 
-    Useful for diagnostics: if Cerberus previously died hard, this shows what
+    Useful for diagnostics: if Probolos previously died hard, this shows what
     got stranded, and the CLI can offer to release them.
     """
     return [d for d in sysfs.list_devices()

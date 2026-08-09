@@ -44,7 +44,7 @@ SELF-HEALING
 ------------
 A grab is held by an open file descriptor. If this process dies for any reason,
 the kernel closes the fd and the grab is released automatically. There is no
-way for Cerberus to leave a keyboard permanently captured.
+way for Probolos to leave a keyboard permanently captured.
 """
 
 from __future__ import annotations

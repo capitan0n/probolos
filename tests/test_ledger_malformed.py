@@ -16,7 +16,7 @@ import unittest
 from dataclasses import asdict
 from pathlib import Path
 
-from cerberus.ledger import ENTRY_FIELD_NAMES, Entry, Ledger
+from probolos.ledger import ENTRY_FIELD_NAMES, Entry, Ledger
 
 GOOD = {
     "identity": "1234:5678:-",

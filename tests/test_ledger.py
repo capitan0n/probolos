@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cerberus import analyzers, ledger as ledger_mod, rules
+from probolos import analyzers, ledger as ledger_mod, rules
 
 
 class Dev:
@@ -149,7 +149,7 @@ class TestDefaultPath(unittest.TestCase):
 
     def test_root_uses_var_lib(self):
         import os
-        from cerberus import ledger as l
+        from probolos import ledger as l
         real = os.geteuid
         os.geteuid = lambda: 0
         try:
@@ -158,18 +158,18 @@ class TestDefaultPath(unittest.TestCase):
             # is what keeps trusted.json (in the root-owned parent) out of a
             # hostile `nobody` process's reach. See ledger.default_path.
             self.assertEqual(str(l.default_path()),
-                             "/var/lib/cerberus/state/ledger.json")
+                             "/var/lib/probolos/state/ledger.json")
         finally:
             os.geteuid = real
 
     def test_non_root_uses_a_writable_location(self):
         import os
-        from cerberus import ledger as l
+        from probolos import ledger as l
         real = os.geteuid
         os.geteuid = lambda: 1000
         try:
             path = l.default_path()
             self.assertNotIn("/var/lib", str(path))
-            self.assertIn("cerberus", str(path))
+            self.assertIn("probolos", str(path))
         finally:
             os.geteuid = real

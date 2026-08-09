@@ -60,7 +60,7 @@ INPUT_PREFIX = "/dev/input/"
 # tests can point the scope check at a synthetic sysfs tree.
 SYS_CLASS_PREFIX = "/sys/class/"
 # Whole disks only: sda, sdb... never a partition (sda1) and never a mapper or
-# loop device. Cerberus inspects the medium it was handed, not whatever else
+# loop device. Probolos inspects the medium it was handed, not whatever else
 # happens to be attached, and a partition node would let a caller reach into a
 # disk it was never asked about.
 BLOCK_PREFIX = "/dev/"
@@ -174,7 +174,7 @@ class GateServer:
     #
     # The invariant that closes this is: the gate only ever acts on a USB device
     # whose kernel `authorized` flag is currently 0. That is precisely the set of
-    # devices Cerberus is holding for a decision. A device you are using is
+    # devices Probolos is holding for a decision. A device you are using is
     # authorized=1 and is refused; the built-in keyboard is not a USB device at
     # all and is refused; a raw disk whose USB parent is authorized=1 is refused.
     #

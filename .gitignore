@@ -1,8 +1,39 @@
+# --- Python ---
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
+.eggs/
+
+# --- Virtual environments ---
 .venv/
 venv/
+env/
+
+# --- Probolos runtime & state (never commit) ---
+# Audit logs and per-run captures
 *.jsonl
+cerb.jsonl
+# On-disk trust store / ledger (may reveal your real devices' VID:PID/serials)
 ledger.json
 trusted.json
+state/
+# Panic file, if a stray one ever lands in the tree
+*.panic
+
+# --- Tooling / coverage ---
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Editors / OS cruft ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

@@ -1,6 +1,6 @@
 [Unit]
-Description=Cerberus USB authorization gate
-Documentation=https://github.com/capitan0n/cerberus
+Description=Probolos USB authorization gate
+Documentation=https://github.com/capitan0n/probolos
 # udev must be up: the whole design depends on receiving attach events, and
 # starting before it would mean missing devices attached during boot.
 After=systemd-udevd.service systemd-logind.service
@@ -11,7 +11,7 @@ Type=simple
 # --privsep is not optional here. As a long-running service the analyzer would
 # otherwise sit as root for weeks; the split keeps that surface to a small
 # audited gate.
-ExecStart=/usr/bin/python3 -m cerberus --privsep --agent --timeout 0
+ExecStart=/usr/bin/python3 -m probolos --privsep --agent --timeout 0
 Restart=on-failure
 RestartSec=5
 
@@ -20,7 +20,7 @@ RestartSec=5
 #
 # The gate legitimately needs root, so the question is not whether to drop
 # privilege -- privsep already does that internally -- but how much of the
-# system root can still reach. Each line below removes something Cerberus has
+# system root can still reach. Each line below removes something Probolos has
 # no business touching, so a compromise of even the privileged half is boxed in.
 #
 # What is deliberately NOT restricted is explained inline: over-tightening a
@@ -30,9 +30,9 @@ RestartSec=5
 # Filesystem: everything read-only except the two paths that must be written.
 ProtectSystem=strict
 ProtectHome=yes
-StateDirectory=cerberus
+StateDirectory=probolos
 StateDirectoryMode=0700
-RuntimeDirectory=cerberus
+RuntimeDirectory=probolos
 RuntimeDirectoryMode=0750
 # /sys must be writable: the entire mechanism is writing `authorized` and
 # `authorized_default`. This is the one broad permission the design requires,
@@ -61,7 +61,7 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_SETUID CAP_SETGID CAP_FOWNER
 AmbientCapabilities=
 
-# Network: Cerberus has no reason to speak to anything. Removing this entirely
+# Network: Probolos has no reason to speak to anything. Removing this entirely
 # means an analyzer compromise cannot exfiltrate what it observed.
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX

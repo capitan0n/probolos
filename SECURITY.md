@@ -5,7 +5,7 @@
 Open a GitHub issue for anything that is already public. For anything else,
 contact the maintainer directly before disclosing.
 
-## What Cerberus is trying to stop
+## What Probolos is trying to stop
 
 An attacker with brief physical access who leaves behind, or persuades someone
 to plug in, a USB device whose declared function differs from its real one.
@@ -14,15 +14,15 @@ drive.
 
 ## What it assumes
 
-- The machine and its kernel are trustworthy at the moment Cerberus starts.
+- The machine and its kernel are trustworthy at the moment Probolos starts.
 - The operator can answer a prompt using an input device that was already
   present and already trusted.
-- Root is not already compromised. Cerberus is not a rootkit detector.
+- Root is not already compromised. Probolos is not a rootkit detector.
 
 ## What it does not stop
 
 **Vulnerabilities in the USB stack itself.** The gate acts *after* the kernel
-has parsed descriptors. A bug in that parsing is reached before Cerberus sees
+has parsed descriptors. A bug in that parsing is reached before Probolos sees
 anything. This defends against malicious device *functionality*, not against
 memory corruption during enumeration. Only a separate physical machine
 (`usbip` to a sacrificial host) removes this exposure.
@@ -106,7 +106,7 @@ USB keyboard that imitates a specific user's typing characteristics in order to
 defeat continuous keystroke-dynamics verification, evading the detection tools
 tested in 83–100% of cases.
 
-Cerberus's timing statistics are vulnerable to exactly that technique, and the
+Probolos's timing statistics are vulnerable to exactly that technique, and the
 `machine-generated-keystrokes` rule should be assumed defeated by a
 sufficiently careful attacker.
 
@@ -119,7 +119,7 @@ its cadence. That rule, not the timing analysis, is the one carrying the weight.
 
 ## Keystroke capture and privacy
 
-Cerberus can reconstruct what a quarantined device typed. That capability is
+Probolos can reconstruct what a quarantined device typed. That capability is
 constrained structurally, not by policy:
 
 1. **Devices attached before startup are recorded in a baseline and never
@@ -133,7 +133,7 @@ constrained structurally, not by policy:
 
 Points 1–3 are asserted in `tests/test_payload.py` and `tests/test_safety.py`.
 
-There is therefore no configuration in which Cerberus records a device that
+There is therefore no configuration in which Probolos records a device that
 somebody has approved and is using. If you find one, that is a security bug and
 should be reported as one.
 
@@ -151,8 +151,8 @@ whoever can write it can admit hardware. Under `--privsep` the analyzer runs as
 stronger than it looks: it allows unlinking and replacing any file in that
 directory regardless of the file's own owner. So while the ledger and the trust
 store shared one directory, handing it to `nobody` handed over trust as well.
-The ledger now lives in `/var/lib/cerberus/state/`, which is the only directory
-given to the analyzer; `/var/lib/cerberus/` itself stays root-owned and holds
+The ledger now lives in `/var/lib/probolos/state/`, which is the only directory
+given to the analyzer; `/var/lib/probolos/` itself stays root-owned and holds
 `trusted.json`. The analyzer reads trust and can neither rewrite nor replace it.
 
 **Writes never follow a symlink.** State files are written with
@@ -166,7 +166,7 @@ store's JSON through it. Stores are created mode `0600`.
 account at mode `0700`, taking sudo, ssh and PAM with it on a running system.
 That needs no attacker; a typo is enough. Paths are resolved with `realpath`
 first, so `../` cannot smuggle a path back out, and a sibling such as
-`/var/lib/cerberus-evil` does not match on prefix alone.
+`/var/lib/probolos-evil` does not match on prefix alone.
 
 **Trust entries are validated on load,** with the same discipline the ledger
 already used — the security-critical store was previously the unvalidated one.
@@ -179,7 +179,7 @@ trusted.
 A device chooses its own manufacturer, product and serial strings, and those
 strings reach the terminal, the approval dialog, the JSON log, the trust store
 and the ledger. They are sanitised at the single point where sysfs bytes become
-Python strings, not at each display site — a `cat cerberus.jsonl` three days
+Python strings, not at each display site — a `cat probolos.jsonl` three days
 later would otherwise replay an escape-sequence attack in a terminal nobody was
 guarding.
 
@@ -214,7 +214,7 @@ result.
 Stage 4 must briefly authorize the device for its block node to appear, and
 udisks2 may automount the medium in that window. The window is kept as short as
 the kernel allows and the device is re-blocked the instant the read returns, but
-the race is real; ship `systemd/60-cerberus-inhibit-automount.rules` to close
+the race is real; ship `systemd/60-probolos-inhibit-automount.rules` to close
 it. The structural fix is interface-level authorization — authorize the device
 while holding the mass-storage interface at 0, so no block node is ever created
 — and that work is not finished.
@@ -229,7 +229,7 @@ independent layers:
 | Protected devices | internal (`removable=fixed`) ports are never gated |
 | Port allowlist | `--allow-port` keeps a rescue port always open |
 | Watchdog | daemon alive but stuck; reopens the gate |
-| Panic file | `sudo touch /run/cerberus.panic` from another TTY or over SSH |
+| Panic file | `sudo touch /run/probolos.panic` from another TTY or over SSH |
 | Privilege separation | analyzer compromise cannot escalate to root |
 
 Plus the gate's own restore paths (context manager, signal handlers, `atexit`)

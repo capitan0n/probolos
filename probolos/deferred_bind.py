@@ -31,7 +31,7 @@ binds before we are ready to grab.
 WHY INTERFACE-LEVEL AND NOT drivers_autoprobe=0
 -----------------------------------------------
 The global switch /sys/bus/usb/drivers_autoprobe is system-wide state. If
-Cerberus dies with the switch at 0, NO new device on the WHOLE system gets a
+Probolos dies with the switch at 0, NO new device on the WHOLE system gets a
 driver — the same lockout gate.py fights to prevent, in worse form. Interface
 authorization is per-device: what we touch affects only that device, and if
 something goes wrong the damage is limited to it.

@@ -25,8 +25,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from cerberus import daemon as daemon_mod
-from cerberus import session, sysfs, usbclass
+from probolos import daemon as daemon_mod
+from probolos import session, sysfs, usbclass
 
 
 def make_device(name="3-9", kinds=None):
@@ -52,7 +52,7 @@ class StageOrdering(unittest.TestCase):
         # path itself does not need a real device. observe=0 means stage 3 is
         # skipped, which is fine: what we are pinning is that stage 4 does not
         # authorize a device that can type.
-        self.engine = daemon_mod.Cerberus(
+        self.engine = daemon_mod.Probolos(
             monitor=session.AlwaysUnlocked(),
             observe=0,
             inspect_storage=True)

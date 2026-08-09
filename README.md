@@ -1,9 +1,21 @@
-# Cerberus
+# Probolos
+
+> ⚠️ **Alpha — under active development.** This is an early, research-stage
+> project. The core mechanism works in software emulation and the full test
+> suite passes, but **validation on real, physical hardware is still pending** —
+> the tool has not yet been proven to behave correctly against a broad range of
+> genuine USB devices and attack fixtures (e.g. BadUSB via ATmega32u4 / Raspberry
+> Pi Zero). Interfaces, flags and on-disk formats may change without notice.
+> **Do not rely on it as a security control on a machine you care about.** Treat
+> everything here as experimental and report anything that surprises you.
 
 **A deny-by-default USB admission gate for Linux.**
 
+*Probolos* (πρόβολος) — Greek for a jutting barrier: the thing set in front that
+must be got past first.
+
 New USB devices do not work until a human approves them. While a device waits,
-Cerberus inspects it — and the device is dead the whole time.
+Probolos inspects it — and the device is dead the whole time.
 
 ```
 identity · consistency · behaviour
@@ -17,7 +29,7 @@ Every USB defence has the same problem: the kernel binds a driver the moment a
 device is enumerated. By the time anything notices a keyboard is a BadUSB, it
 has already typed.
 
-Cerberus sets `authorized_default=0` on every root hub, so a new device arrives
+Probolos sets `authorized_default=0` on every root hub, so a new device arrives
 *inert*. It is then examined across four stages, and only a human decision
 authorizes it.
 
@@ -41,9 +53,9 @@ decide from descriptors alone, or watch a device that is already live.
 ## Quick start
 
 ```bash
-git clone https://github.com/capitan0n/cerberus
-cd cerberus
-sudo python3 -m cerberus --observe 3
+git clone https://github.com/capitan0n/probolos
+cd probolos
+sudo python3 -m probolos --observe 3
 ```
 
 Plug in a device. You will get a report and a prompt.
@@ -57,8 +69,8 @@ Stop with `Ctrl-C`; the gate reopens on every exit path.
 ### Recommended: privilege separation
 
 ```bash
-sudo python3 -m cerberus --privsep --agent --agent-user "$USER"
-python3 -m cerberus.agent          # in your graphical session
+sudo python3 -m probolos --privsep --agent --agent-user "$USER"
+python3 -m probolos.agent          # in your graphical session
 ```
 
 `--privsep` keeps root to a ~150-line gate; everything else runs as `nobody`.
@@ -71,12 +83,12 @@ may automount the medium in that window — the exact kernel-filesystem exposure
 stage 4 exists to avoid. Install the inhibitor:
 
 ```bash
-sudo cp systemd/60-cerberus-inhibit-automount.rules /etc/udev/rules.d/
+sudo cp systemd/60-probolos-inhibit-automount.rules /etc/udev/rules.d/
 sudo udevadm control --reload
 sudo udevadm trigger --subsystem-match=block
 ```
 
-USB storage will no longer auto-mount. Cerberus reads the raw node itself, so
+USB storage will no longer auto-mount. Probolos reads the raw node itself, so
 it loses nothing; you mount approved devices deliberately afterwards.
 
 ---
@@ -104,14 +116,14 @@ The gate restores on exit, on signals, and via `atexit`. If a device is still
 blocked:
 
 ```bash
-sudo python3 -m cerberus --release
+sudo python3 -m probolos --release
 ```
 
-If Cerberus itself is wedged, the panic file forces the gate open from another
+If Probolos itself is wedged, the panic file forces the gate open from another
 TTY or over SSH:
 
 ```bash
-sudo touch /run/cerberus.panic
+sudo touch /run/probolos.panic
 ```
 
 It must be **root-owned** — a panic file anyone could create would be a way for
@@ -159,10 +171,23 @@ CRITICAL paths can be exercised with no hardware.
 ## Scope
 
 Read [`SECURITY.md`](SECURITY.md) before trusting this with anything. It is
-explicit about what Cerberus does **not** stop: USB stack vulnerabilities, a
+explicit about what Probolos does **not** stop: USB stack vulnerabilities, a
 patient attacker, descriptor forgery, Thunderbolt/DMA, and wireless gateways.
 
-Status: **beta.** All four critical findings from the security audit are fixed
-and covered by regression tests, but the tool has been exercised on a limited
-range of hardware. Treat real-world results as data, and report anything that
-surprises you.
+Status: **alpha — under active development.** All four critical findings from
+the security audit are fixed and covered by regression tests, and the full
+suite passes, but the tool has so far been exercised almost entirely in
+software emulation. **Real-hardware validation is the main open work item**:
+until Probolos has been tested against a range of genuine devices and BadUSB
+fixtures, treat every real-world result as data rather than a guarantee, and
+report anything that surprises you. Known open items are tracked in
+[`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
+
+Note the warranty disclaimer in particular: this is alpha, security-relevant
+software provided as-is. You are responsible for what you run it on.

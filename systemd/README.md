@@ -1,4 +1,4 @@
-# Running Cerberus as a service
+# Running Probolos as a service
 
 Two units, because the two halves live in different places: the gate is a
 **system** service (it needs root and udev), and the agent is a **user** service
@@ -8,38 +8,38 @@ Two units, because the two halves live in different places: the gate is a
 
 ```bash
 # the gate, as root
-sudo cp systemd/cerberus.service /etc/systemd/system/
+sudo cp systemd/probolos.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 # the agent, as you
 mkdir -p ~/.config/systemd/user
-cp systemd/cerberus-agent.service ~/.config/systemd/user/
+cp systemd/probolos-agent.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-Cerberus must be importable by the system Python, either installed as a package
+Probolos must be importable by the system Python, either installed as a package
 or with the source directory on `PYTHONPATH`. For a source checkout, add to the
 system unit:
 
 ```ini
-Environment=PYTHONPATH=/opt/cerberus
+Environment=PYTHONPATH=/opt/probolos
 ```
 
-and put the source at `/opt/cerberus`.
+and put the source at `/opt/probolos`.
 
 ## Start
 
 ```bash
-sudo systemctl enable --now cerberus.service
-systemctl --user enable --now cerberus-agent.service
+sudo systemctl enable --now probolos.service
+systemctl --user enable --now probolos-agent.service
 ```
 
 Check both:
 
 ```bash
-systemctl status cerberus.service
-systemctl --user status cerberus-agent.service
-sudo journalctl -u cerberus -f
+systemctl status probolos.service
+systemctl --user status probolos-agent.service
+sudo journalctl -u probolos -f
 ```
 
 ## Before enabling it at boot
@@ -49,8 +49,8 @@ and then fails to start its agent will leave you approving devices from a
 terminal you have to find. Run it by hand until you are satisfied:
 
 ```bash
-sudo python -m cerberus --privsep --agent
-python -m cerberus.agent
+sudo python -m probolos --privsep --agent
+python -m probolos.agent
 ```
 
 Note the gate is started with `--timeout 0`, meaning a question waits
@@ -80,13 +80,13 @@ privileged half is kept to about 150 auditable lines.
 ## Removing it
 
 ```bash
-sudo systemctl disable --now cerberus.service
-systemctl --user disable --now cerberus-agent.service
+sudo systemctl disable --now probolos.service
+systemctl --user disable --now probolos-agent.service
 ```
 
 Stopping the service reopens the gate, as every exit path does. If something has
 gone wrong and devices are left blocked:
 
 ```bash
-sudo python -m cerberus --release
+sudo python -m probolos --release
 ```

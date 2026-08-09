@@ -23,8 +23,8 @@ not tested is a wish.
 WHY THE PANIC FILE MUST BE PLACED BY ROOT
 -----------------------------------------
 Creating the panic file disables the tool. That is its whole purpose, and it
-is why it has to cost exactly what `systemctl stop cerberus` costs. At
-/tmp/cerberus-panic it cost nothing: any local account could open the gate for
+is why it has to cost exactly what `systemctl stop probolos` costs. At
+/tmp/probolos-panic it cost nothing: any local account could open the gate for
 every device on the machine, or -- worse, because it looks like a malfunction
 rather than an attack -- leave one behind so the daemon refuses to start at
 all. A world-writable off switch on a security tool is not an escape hatch.
@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 # /run rather than /tmp, and BESIDE the runtime directory rather than inside
-# it. /run/cerberus looks like the obvious home, but agentlink.prepare_socket_dir
+# it. /run/probolos looks like the obvious home, but agentlink.prepare_socket_dir
 # chowns it to the analyzer's uid and chmods it 2770 so the desktop agent can
 # reach the socket -- which would put the panic file back within reach of both
 # `nobody` and the desktop user's group. /run itself is root:root 0755.
@@ -55,7 +55,7 @@ from typing import Callable, List, Optional
 # A second benefit falls out of tmpfs: a forgotten panic file no longer
 # survives a reboot, so the "it would fire the watchdog instantly" startup
 # refusal in daemon.py can only ever be triggered within one boot.
-DEFAULT_PANIC_FILE = Path("/run/cerberus.panic")
+DEFAULT_PANIC_FILE = Path("/run/probolos.panic")
 
 
 def panic_file_is_valid(path: Path, required_uid: int = 0,
@@ -77,7 +77,7 @@ def panic_file_is_valid(path: Path, required_uid: int = 0,
       * The DIRECTORY must be root-owned and not writable by anyone else. This
         is the check that is easy to leave out and expensive to omit: the path
         is operator-supplied via --panic-file, and in a directory an attacker
-        can write to, `ln /etc/hostname /run/cerberus.panic` produces a file
+        can write to, `ln /etc/hostname /run/probolos.panic` produces a file
         that is regular, root-owned, and entirely under their control as to
         WHEN it appears. Ownership of the file says nothing about who put it
         there if anyone can hardlink one in.

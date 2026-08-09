@@ -50,7 +50,7 @@ except ImportError:
     sys.exit("pyusb is required: sudo pacman -S python-pyusb")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cerberus import interrogate  # noqa: E402
+from probolos import interrogate  # noqa: E402
 
 
 def describe(dev) -> str:

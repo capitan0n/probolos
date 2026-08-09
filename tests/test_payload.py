@@ -8,7 +8,7 @@ typed, even in memory.
 
 import unittest
 
-from cerberus import analyzers, payload, quarantine, rules
+from probolos import analyzers, payload, quarantine, rules
 
 # Codes used below, from linux/input-event-codes.h
 K = {"h": 35, "e": 18, "l": 38, "o": 24, "space": 57, "enter": 28,

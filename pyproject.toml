@@ -1,0 +1,57 @@
+[build-system]
+# setuptools is the least surprising choice for a plain src-less layout and is
+# already present on almost every distro. The build backend is what turns this
+# tree into something `pip install .` understands.
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "probolos"
+# Kept in one place; probolos/__init__.py reads this at runtime via importlib
+# metadata is NOT wired here, so bump both together until that is unified.
+version = "0.9.0"
+description = "A deny-by-default USB admission gate for Linux"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["usb", "security", "badusb", "linux", "sysfs", "hardening"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Hardware",
+]
+
+# Runtime dependencies. pyudev drives the event loop; the desktop-dialog
+# backends (kdialog/zenity/tkinter) are optional and discovered at runtime,
+# so they are deliberately NOT hard requirements here.
+dependencies = [
+    "pyudev>=0.24",
+]
+
+[project.optional-dependencies]
+# `pip install .[agent]` pulls the Tk fallback for the desktop prompt. kdialog
+# and zenity are system packages, not pip ones, so they stay out of here.
+agent = []
+dev = []
+
+[project.urls]
+Homepage = "https://github.com/capitan0n/probolos"
+Source = "https://github.com/capitan0n/probolos"
+Changelog = "https://github.com/capitan0n/probolos/blob/main/CHANGELOG.md"
+
+[project.scripts]
+# This is the payoff: `probolos` becomes a real command on PATH after install,
+# which removes the "must cd to repo root" dependency and lets the systemd unit
+# call an absolute ExecStart instead of `python -m probolos` with a WorkingDirectory.
+probolos = "probolos.__main__:main"
+
+[tool.setuptools]
+# Explicit package list so the testbed/ and tests/ trees are not shipped as
+# importable packages of the installed distribution.
+packages = ["probolos"]

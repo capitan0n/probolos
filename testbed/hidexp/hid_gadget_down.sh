@@ -11,7 +11,7 @@
 #
 set -uo pipefail
 
-G=/sys/kernel/config/usb_gadget/cerberus_test
+G=/sys/kernel/config/usb_gadget/probolos_test
 
 if [ ! -d "$G" ]; then
     echo "[i] Δεν υπάρχει gadget να καθαρίσω."

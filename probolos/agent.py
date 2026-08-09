@@ -2,9 +2,9 @@
 """
 The desktop agent. Runs as you, in your graphical session.
 
-    python -m cerberus.agent
+    python -m probolos.agent
 
-It connects to the running Cerberus analyzer, shows a notification when a device
+It connects to the running Probolos analyzer, shows a notification when a device
 is waiting for a decision, and sends back what you chose. It knows nothing about
 USB, sysfs, or rules -- it displays text and reports a click. That narrowness is
 deliberate: it runs in your session with your privileges, so it is the component
@@ -58,7 +58,7 @@ from .agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_UNAVAILABLE,
                         ANSWER_YES, DEFAULT_SOCKET,
                         MAX_MESSAGE, MSG_ANSWER, MSG_CRITICAL, MSG_DECIDE)
 
-APP_NAME = "Cerberus"
+APP_NAME = "Probolos"
 ICON = "drive-removable-media-usb"
 
 # urgency: 0 low, 1 normal, 2 critical (critical notifications do not expire)
@@ -207,7 +207,7 @@ class Agent:
             self.sock.settimeout(1.0)
             return True
         except OSError as exc:
-            self.log(f"[agent] cannot reach Cerberus at {self.socket_path}: "
+            self.log(f"[agent] cannot reach Probolos at {self.socket_path}: "
                      f"{exc}")
             return False
 
@@ -224,7 +224,7 @@ class Agent:
         if self.notifier.available():
             self.notifier.start()
 
-        self.log(f"[agent] connected to Cerberus. Decisions will be asked "
+        self.log(f"[agent] connected to Probolos. Decisions will be asked "
                  f"through {self.dialog.name}.")
         buffer = b""
         try:
@@ -236,7 +236,7 @@ class Agent:
                 except OSError:
                     break
                 if not chunk:
-                    self.log("[agent] Cerberus closed the connection")
+                    self.log("[agent] Probolos closed the connection")
                     break
                 buffer += chunk
                 while b"\n" in buffer:
@@ -260,7 +260,7 @@ class Agent:
         if kind == MSG_CRITICAL:
             # Display only. Deliberately offers no way to allow anything.
             self.notifier.notify(
-                message.get("title", "Cerberus"),
+                message.get("title", "Probolos"),
                 message.get("body", "") +
                 "\n\nThis device matches an attack pattern and cannot be "
                 "approved from here. Use the terminal.",
@@ -294,7 +294,7 @@ class Agent:
         try:
             # ---- first question -------------------------------------------
             allowed = self.dialog.confirm(
-                title="Cerberus — new USB device",
+                title="Probolos — new USB device",
                 text=(f"{title}\n\n{body}\n\n"
                       f"This device is currently BLOCKED and cannot do "
                       f"anything.\n\nAllow it?"),
@@ -325,7 +325,7 @@ class Agent:
 
             if not allow_always:
                 confirmed = self.dialog.confirm(
-                    title="Cerberus — confirm",
+                    title="Probolos — confirm",
                     text=confirm_text,
                     yes_label="Yes, switch it on", no_label="Cancel",
                     timeout=30.0)
@@ -338,7 +338,7 @@ class Agent:
             # entry. The convenient path must never grant more than the
             # inconvenient one.
             choice = self.dialog.choose(
-                title="Cerberus — confirm",
+                title="Probolos — confirm",
                 text=confirm_text + "\n\nAllow it once, or remember it for "
                                     "next time as well?",
                 once_label="Just this once",
@@ -369,10 +369,10 @@ def main(argv=None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Cerberus desktop agent: approve USB devices from a "
+        description="Probolos desktop agent: approve USB devices from a "
                     "notification instead of a terminal.")
     parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET,
-                        help="where the Cerberus analyzer is listening")
+                        help="where the Probolos analyzer is listening")
     parser.add_argument("--test", action="store_true",
                         help="show a sample notification and exit, to check "
                              "that notifications work at all")
@@ -384,7 +384,7 @@ def main(argv=None) -> int:
 
         if notifier.available():
             ident = notifier.notify(
-                "Cerberus test",
+                "Probolos test",
                 "Notifications work. A dialog should now appear.",
                 actionable=False)
             print("Notification sent."
@@ -397,7 +397,7 @@ def main(argv=None) -> int:
             return 1
         print(f"Dialog backend: {backend.name}. A dialog should be open now...")
         answer = backend.confirm(
-            title="Cerberus test",
+            title="Probolos test",
             text=("This is what a device prompt will look like.\n\n"
                   "Press \"Allow\" to continue to the second dialog."),
             yes_label="Allow", no_label="Cancel", timeout=60.0)
@@ -410,7 +410,7 @@ def main(argv=None) -> int:
             return 0
 
         choice = backend.choose(
-            title="Cerberus test — three choices",
+            title="Probolos test — three choices",
             text=("The real second dialog offers three outcomes, the same as "
                   "the terminal.\n\nPick any of them."),
             once_label="Just this once", always_label="Always allow",

@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import unittest
 
-from cerberus import textsafe
-from cerberus.textsafe import (NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE,
+from probolos import textsafe
+from probolos.textsafe import (NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE,
                                NOTE_TRUNCATED, sanitize)
 
 

@@ -1,5 +1,5 @@
 """
-descriptors_safe.py — Defensive layer for USB descriptor parsing in Cerberus.
+descriptors_safe.py — Defensive layer for USB descriptor parsing in Probolos.
 
 Design principle: every parsing error is a *finding*, not a crash.
 A device that produces an error stays at authorized=0.

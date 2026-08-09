@@ -3,7 +3,7 @@ Symlink-safe atomic writes for the trust store and the ledger.
 
 Why this exists (audit finding C3)
 ----------------------------------
-Under --privsep the state directory /var/lib/cerberus is chowned to `nobody`
+Under --privsep the state directory /var/lib/probolos is chowned to `nobody`
 so the unprivileged analyzer can update the ledger. `nobody` is a shared
 account: any other `nobody` process on the machine can write into that
 directory too. The old save() did `tmp.write_text(...)`, and write_text() ends
@@ -11,9 +11,9 @@ up calling open(path, "w") -- which FOLLOWS SYMLINKS.
 
 So an attacker who is `nobody` could pre-plant
 
-    /var/lib/cerberus/trusted.tmp  ->  /etc/cron.d/root_job
+    /var/lib/probolos/trusted.tmp  ->  /etc/cron.d/root_job
 
-and the next save() -- especially `sudo python -m cerberus --forget N`, which
+and the next save() -- especially `sudo python -m probolos --forget N`, which
 runs as ROOT -- would write the JSON through the symlink and clobber the
 target with root privileges. A trust store meant to be edited by root becomes
 an arbitrary-file-write primitive.

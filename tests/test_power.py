@@ -10,7 +10,7 @@ been quietly wrong, so the multiplier is pinned here before anything judges it.
 import struct
 import unittest
 
-from cerberus import descriptors, rules
+from probolos import descriptors, rules
 from tests.test_descriptors import endpoint_desc, iface_desc
 
 

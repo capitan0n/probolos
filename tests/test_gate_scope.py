@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from cerberus import gate_server
+from probolos import gate_server
 
 
 class GateScope(unittest.TestCase):

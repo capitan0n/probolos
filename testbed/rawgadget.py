@@ -9,7 +9,7 @@ machine), it means an arbitrary USB device -- including a malicious one -- can
 be conjured entirely in software, with descriptors chosen byte by byte, and
 plugged into the local kernel with no hardware at all.
 
-For Cerberus this is the testbed. It turns "you need a Rubber Ducky to test the
+For Probolos this is the testbed. It turns "you need a Rubber Ducky to test the
 CRITICAL path" into "run this script". Every synthetic device the parser is
 tested against in CI can also be made to physically enumerate here, which is
 the difference between testing the parser and testing the whole pipeline.

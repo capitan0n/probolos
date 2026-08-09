@@ -12,7 +12,7 @@ understands they are field data and not invented examples.
 
 import unittest
 
-from cerberus import descriptors, rules, usbclass
+from probolos import descriptors, rules, usbclass
 from tests.test_descriptors import (config_desc, device_desc, endpoint_desc,
                                     iface_desc)
 

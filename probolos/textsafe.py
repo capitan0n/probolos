@@ -14,7 +14,7 @@ Python string, and everything downstream inherits it.
 WHY NOT ONLY AT DISPLAY TIME
 ----------------------------
 Because the log is a display surface too, just a delayed one. If the analyzer
-writes the raw string to cerberus.jsonl, a `cat` three days later re-runs the
+writes the raw string to probolos.jsonl, a `cat` three days later re-runs the
 attack -- in a different terminal, in a different context, possibly on a
 different machine after the file was mailed to someone. A payload that waits
 in a file for someone to read it is not a smaller problem than one that fires

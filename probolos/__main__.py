@@ -1,10 +1,10 @@
 """
 Command line entry point.
 
-    sudo python -m cerberus                 # run the gate
-    sudo python -m cerberus --dry-run       # observe only, gate stays open
-    python -m cerberus --list               # what is attached right now
-    sudo python -m cerberus --release       # free devices stranded by a crash
+    sudo python -m probolos                 # run the gate
+    sudo python -m probolos --dry-run       # observe only, gate stays open
+    python -m probolos --list               # what is attached right now
+    sudo python -m probolos --release       # free devices stranded by a crash
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ BANNER = r"""
 def require_root() -> None:
     if os.geteuid() != 0:
         sys.exit("This needs root: writing to /sys/bus/usb/.../authorized "
-                 "is a privileged operation.\nTry: sudo python -m cerberus")
+                 "is a privileged operation.\nTry: sudo python -m probolos")
 
 
 def require_usb() -> None:
@@ -84,7 +84,7 @@ def cmd_list(verbose: bool = False) -> None:
 
 def cmd_release() -> None:
     """
-    Recovery path. If Cerberus was SIGKILLed while the gate was closed, devices
+    Recovery path. If Probolos was SIGKILLed while the gate was closed, devices
     plugged in afterwards are sitting dead. This authorizes them in one go.
 
     It exists because a security tool that can brick your peripherals owes you
@@ -194,7 +194,7 @@ def cmd_trusted(path) -> None:
               f"{entry.times_admitted} time(s)")
         print(f"      ports       : {', '.join(entry.ports) or '-'}")
         print()
-    print("Remove one with:  sudo python -m cerberus --forget N   "
+    print("Remove one with:  sudo python -m probolos --forget N   "
           "(N is the number in brackets)")
 
 
@@ -225,7 +225,7 @@ def cmd_forget(path, pattern: str) -> None:
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
-        prog="cerberus",
+        prog="probolos",
         description="Hold new USB devices unauthorized until a human decides.")
     parser.add_argument("--list", action="store_true",
                         help="show attached devices and exit")
@@ -251,7 +251,7 @@ def main(argv=None) -> None:
     parser.add_argument("--ledger", type=Path, metavar="FILE",
                         default=None,
                         help="device history file for drift detection "
-                             "(default: XDG state dir, or /var/lib/cerberus "
+                             "(default: XDG state dir, or /var/lib/probolos "
                              "as root)")
     parser.add_argument("--no-ledger", action="store_true",
                         help="keep no history between runs")
@@ -296,7 +296,7 @@ def main(argv=None) -> None:
                         help="pretend the screen is unlocked")
     parser.add_argument("--agent", action="store_true",
                         help="accept decisions from a desktop notification "
-                             "agent (start it with: python -m cerberus.agent)")
+                             "agent (start it with: python -m probolos.agent)")
     parser.add_argument("--agent-socket", type=Path,
                         default=agentlink.DEFAULT_SOCKET, metavar="PATH",
                         help="where the desktop agent connects")

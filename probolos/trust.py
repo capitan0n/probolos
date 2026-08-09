@@ -3,7 +3,7 @@ Remembering decisions, so the tool can be used every day.
 
 THE PROBLEM THIS SOLVES
 -----------------------
-Until now Cerberus asked about every device, every time. That makes it a
+Until now Probolos asked about every device, every time. That makes it a
 demonstration, not a tool: a person who is asked the same question about their
 own mouse twice a day will stop reading the question, and shortly afterwards
 will stop running the program. A security tool nobody runs protects nothing.
@@ -52,9 +52,9 @@ def default_path() -> Path:
     """Beside the ledger, and with the same root/user split."""
     import os
     if os.geteuid() == 0:
-        return Path("/var/lib/cerberus/trusted.json")
+        return Path("/var/lib/probolos/trusted.json")
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    return Path(base) / "cerberus" / "trusted.json"
+    return Path(base) / "probolos" / "trusted.json"
 
 
 @dataclass

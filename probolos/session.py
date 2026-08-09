@@ -9,7 +9,7 @@ and letting it act when you come back -- or letting you approve it yourself,
 distractedly, along with everything else you clicked on returning.
 
 A locked screen is the clearest signal available that the owner is not present.
-Cerberus admits nothing while it is locked, including remembered devices: the
+Probolos admits nothing while it is locked, including remembered devices: the
 whole point of the trust store is to avoid asking about your own hardware, and
 a device attached while you were absent is precisely the case where asking is
 the correct behaviour.

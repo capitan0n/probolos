@@ -7,7 +7,7 @@
 #   attributes, κάνεις symlink τη function στη configuration, δένεις το
 #   gadget σε έναν UDC, και ο kernel κάνει ΟΛΗ τη δουλειά enumeration/
 #   endpoint. Κανένα ioctl, κανένα struct layout, τίποτα να μαντέψουμε.
-#   Το αποτέλεσμα είναι ΠΡΑΓΜΑΤΙΚΟ HID keyboard: ο Cerberus το βλέπει
+#   Το αποτέλεσμα είναι ΠΡΑΓΜΑΤΙΚΟ HID keyboard: ο Probolos το βλέπει
 #   ακριβώς όπως ένα φυσικό Rubber Ducky.
 #
 # ΓΙΑΤΙ dummy_udc:
@@ -20,7 +20,7 @@
 #
 set -euo pipefail
 
-G=/sys/kernel/config/usb_gadget/cerberus_test
+G=/sys/kernel/config/usb_gadget/probolos_test
 UDC_NAME=dummy_udc.0
 
 # --- 1. Φόρτωσε τα modules και mount το configfs ---------------------------
@@ -40,16 +40,16 @@ echo 0x0104 > "$G/idProduct"         # Multifunction Composite Gadget
 echo 0x0100 > "$G/bcdDevice"
 echo 0x0200 > "$G/bcdUSB"            # USB 2.0
 
-# Strings — αγγλικά. Ο marker "CERBERUS-TEST" κάνει τη συσκευή αναγνωρίσιμη
+# Strings — αγγλικά. Ο marker "PROBOLOS-TEST" κάνει τη συσκευή αναγνωρίσιμη
 # στο report, ώστε να μην μπερδευτεί με πραγματικό hardware.
 mkdir -p "$G/strings/0x409"
-echo "0000CERBERUSTEST" > "$G/strings/0x409/serialnumber"
-echo "Cerberus Testbed"  > "$G/strings/0x409/manufacturer"
+echo "0000PROBOLOSTEST" > "$G/strings/0x409/serialnumber"
+echo "Probolos Testbed"  > "$G/strings/0x409/manufacturer"
 echo "HID Attack Dummy"  > "$G/strings/0x409/product"
 
 # --- 3. Η HID function: boot keyboard -------------------------------------
 # protocol=1, subclass=1 => boot keyboard. Αυτό ΑΚΡΙΒΩΣ δηλώνει ένα
-# Rubber Ducky, και αυτό ελέγχει το is_keyboard() του Cerberus.
+# Rubber Ducky, και αυτό ελέγχει το is_keyboard() του Probolos.
 mkdir -p "$G/functions/hid.usb0"
 echo 1 > "$G/functions/hid.usb0/protocol"        # 1 = keyboard
 echo 1 > "$G/functions/hid.usb0/subclass"        # 1 = boot interface
@@ -63,14 +63,14 @@ printf '\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01
 
 # --- 4. Configuration + σύνδεση της function ------------------------------
 mkdir -p "$G/configs/c.1/strings/0x409"
-echo "Cerberus HID test config" > "$G/configs/c.1/strings/0x409/configuration"
+echo "Probolos HID test config" > "$G/configs/c.1/strings/0x409/configuration"
 echo 250 > "$G/configs/c.1/MaxPower"             # 250 mA, εύλογο για keyboard
 
 ln -sf "$G/functions/hid.usb0" "$G/configs/c.1/"
 
 # --- 5. Δέσε το gadget στον εικονικό controller ---------------------------
 # Μόλις γραφτεί το UDC name, ο kernel κάνει το gadget "live": enumeration
-# ξεκινά, evdev node δημιουργείται. ΑΥΤΗ είναι η στιγμή που ο Cerberus
+# ξεκινά, evdev node δημιουργείται. ΑΥΤΗ είναι η στιγμή που ο Probolos
 # (αν τρέχει) βλέπει νέα συσκευή.
 echo "$UDC_NAME" > "$G/UDC"
 

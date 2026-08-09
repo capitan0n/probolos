@@ -8,7 +8,7 @@ defeated by patience: a payload throttled to human typing speed beats timing
 analysis, and a cloned descriptor set beats identity analysis. Both are
 software problems, and the attacker controls the software.
 
-But Cerberus holds the device in a state nobody else has -- enumerated,
+But Probolos holds the device in a state nobody else has -- enumerated,
 unauthorized, no driver bound, and under no time pressure at all. In that state
 it can issue arbitrary control transfers and measure the answers. And the
 answers are a property of the FIRMWARE AND THE SILICON, which the attacker does

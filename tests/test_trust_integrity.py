@@ -25,7 +25,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from cerberus import privsep, trust
+from probolos import privsep, trust
 
 
 def good_entry(key="v:p:s#abc"):
@@ -82,21 +82,21 @@ class DirectorySeparation(unittest.TestCase):
         with it on a running system.
         """
         logged = []
-        privsep.prepare_state_dir("/etc/cerberus-typo.json", uid=65534,
+        privsep.prepare_state_dir("/etc/probolos-typo.json", uid=65534,
                                   gid=65534, log=logged.append)
         self.assertTrue(any("REFUSING" in line for line in logged))
 
     def test_traversal_out_of_a_state_root_is_refused(self):
         """realpath runs first, so ../ cannot smuggle a path back out."""
         logged = []
-        privsep.prepare_state_dir("/var/lib/cerberus/../../../etc/x.json",
+        privsep.prepare_state_dir("/var/lib/probolos/../../../etc/x.json",
                                   uid=65534, gid=65534, log=logged.append)
         self.assertTrue(any("REFUSING" in line for line in logged))
 
     def test_a_sibling_sharing_the_prefix_is_refused(self):
-        """/var/lib/cerberus-evil must not match /var/lib/cerberus."""
+        """/var/lib/probolos-evil must not match /var/lib/probolos."""
         logged = []
-        privsep.prepare_state_dir("/var/lib/cerberus-evil/x.json", uid=65534,
+        privsep.prepare_state_dir("/var/lib/probolos-evil/x.json", uid=65534,
                                   gid=65534, log=logged.append)
         self.assertTrue(any("REFUSING" in line for line in logged))
 

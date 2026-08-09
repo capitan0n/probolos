@@ -2,7 +2,7 @@
 Tests for the descriptor parser.
 
 These matter more than they look. The parser is the only thing standing
-between Cerberus and a device that lies about its own structure, and it is the
+between Probolos and a device that lies about its own structure, and it is the
 one component that can be tested without any hardware at all -- which is
 exactly why it is the part that gets tested properly.
 """
@@ -10,7 +10,7 @@ exactly why it is the part that gets tested properly.
 import struct
 import unittest
 
-from cerberus import descriptors, usbclass
+from probolos import descriptors, usbclass
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 [Unit]
-Description=Cerberus desktop agent (asks you about new USB devices)
-Documentation=https://github.com/capitan0n/cerberus
+Description=Probolos desktop agent (asks you about new USB devices)
+Documentation=https://github.com/capitan0n/probolos
 # A USER unit: it belongs to the graphical session, because that is the only
 # place a dialog can appear. The analyzer deliberately runs outside the session
 # and cannot do this itself.
@@ -9,9 +9,9 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m cerberus.agent
+ExecStart=/usr/bin/python3 -m probolos.agent
 # The socket may not exist yet if the system service is still starting, and the
-# session may outlive a Cerberus restart. Retrying quietly is correct here.
+# session may outlive a Probolos restart. Retrying quietly is correct here.
 Restart=always
 RestartSec=5
 

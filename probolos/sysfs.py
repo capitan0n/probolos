@@ -1,5 +1,5 @@
 """
-The sysfs layer: everything Cerberus knows and everything it can do.
+The sysfs layer: everything Probolos knows and everything it can do.
 
 Two responsibilities, kept apart on purpose:
 
@@ -157,7 +157,7 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
     # become Python strings. Cleaning at each display site instead would mean
     # remembering eight destinations -- terminal, kdialog, zenity, tkinter,
     # notification, JSON log, trust store, ledger -- and one of them is not a
-    # screen until it is: a `cat cerberus.jsonl` three days later would replay
+    # screen until it is: a `cat probolos.jsonl` three days later would replay
     # an escape-sequence attack in a terminal nobody was guarding.
     #
     # Nothing is lost: raw_descriptors keeps the original bytes, so the ledger
@@ -188,7 +188,7 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
         parse_error=parse_error,
         raw_descriptors=raw,
         # "fixed" means the port is not user-accessible: a soldered-in webcam,
-        # or the built-in keyboard. Cerberus must never gate those.
+        # or the built-in keyboard. Probolos must never gate those.
         removable=read_attr(syspath, "removable"),
         string_notes=sorted({n for notes in _fields.values() for n in notes}),
         string_note_fields={k: v for k, v in _fields.items() if v},
@@ -320,7 +320,7 @@ def set_authorized_default(hub: Path, value: int) -> None:
     """
     Set the default authorization state for devices newly attached to this hub.
 
-    0 = every new device arrives blocked. This is the window Cerberus lives in:
+    0 = every new device arrives blocked. This is the window Probolos lives in:
     descriptors are read and cached by the kernel, but no configuration is set
     and no driver is bound.
 
