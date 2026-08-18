@@ -77,6 +77,14 @@ DEFAULT_PATH = default_path()
 
 SCHEMA_VERSION = 1
 
+# Per-entry list bounds. The ledger is read AND rewritten on every device
+# attachment, so anything that grows once per attachment grows a file that is
+# on the hot path -- and every one of these lists is fed by values the device
+# chooses. Generous enough that no honest device ever reaches them.
+MAX_DECISIONS = 20
+MAX_KNOWN_HASHES = 32     # 32 distinct descriptor sets is already an alarm
+MAX_PORTS = 32            # more ports than any machine has
+
 
 @dataclass
 class Entry:
@@ -303,4 +311,23 @@ class Ledger:
         # Keep the tail only. An audit trail belongs in the JSONL log; this
         # file exists to answer "has this changed?", and unbounded growth in a
         # file read at every device attachment is a real operational problem.
-        entry.decisions = entry.decisions[-20:]
+        entry.decisions = entry.decisions[-MAX_DECISIONS:]
+        # The same bound, for the same reason, on the two lists that had none.
+        #
+        # `decisions` was capped and these were not, which left the cap doing
+        # nothing against the case that actually produces growth: a device
+        # whose descriptors differ on every attachment appends a NEW hash every
+        # time, under one identity, in a file that is parsed and rewritten on
+        # every single device event. Sixty-four characters per plug-in, from a
+        # device whose entire purpose may be to be plugged in repeatedly.
+        #
+        # Truncation is from the FRONT, keeping the newest -- except for the
+        # first hash, which is deliberately preserved: it is the one the drift
+        # rule compares against, and losing it would let a device wash its own
+        # history out of the ledger simply by changing shape often enough.
+        # That would turn a memory-growth annoyance into an erasure attack on
+        # exactly the evidence this file exists to hold.
+        if len(entry.known_hashes) > MAX_KNOWN_HASHES:
+            entry.known_hashes = (entry.known_hashes[:1]
+                                  + entry.known_hashes[-(MAX_KNOWN_HASHES - 1):])
+        entry.ports = entry.ports[-MAX_PORTS:]

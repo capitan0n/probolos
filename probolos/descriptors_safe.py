@@ -36,7 +36,28 @@ class DescriptorParsingError(ValueError):
 
     Inherits from ValueError so existing `except ValueError` catches it, but is
     semantically distinct: "the device lied", not "a bug in our code".
+
+    `recoverable` separates two kinds of lie, and the distinction is load
+    bearing now that descriptors.parse() walks through here:
+
+      recoverable=True   the chain simply STOPS early -- a descriptor overruns
+                         the buffer, or a lone header byte is left at the end.
+                         Everything already parsed is still valid, so the caller
+                         may keep it and record the truncation as a finding.
+
+      recoverable=False  the chain cannot be walked at all -- bLength < 2 (the
+                         offset would never advance) or an item flood. There is
+                         no safe way to continue, so the caller must refuse the
+                         device outright.
+
+    Without this split, wiring the safe walker into the real parser would have
+    turned "truncated tail, keep what we have" into "reject the device", which
+    is a false positive on genuinely buggy but harmless hardware.
     """
+
+    def __init__(self, message: str, recoverable: bool = False):
+        super().__init__(message)
+        self.recoverable = recoverable
 
 
 # --------------------------------------------------------------------------
@@ -92,9 +113,11 @@ def walk_descriptors(buf: bytes,
                 f"more than {max_items} descriptors — possible exhaustion attempt"
             )
         if off + 2 > total:
-            # One byte left: truncated chain.
+            # One byte left: truncated chain. Recoverable -- the descriptors
+            # before it parsed fine and the stray byte carries no meaning.
             raise DescriptorParsingError(
-                f"truncated descriptor header at offset {off}"
+                f"truncated descriptor header at offset {off}",
+                recoverable=True,
             )
 
         b_length = buf[off]
@@ -102,14 +125,19 @@ def walk_descriptors(buf: bytes,
 
         if b_length < 2:
             # THE CRITICAL POINT. Every legitimate descriptor has at least
-            # bLength + bDescriptorType = 2 bytes.
+            # bLength + bDescriptorType = 2 bytes. NOT recoverable: the walk
+            # cannot advance past this point by any amount, so "keep going" is
+            # not an option that exists.
             raise DescriptorParsingError(
                 f"bLength={b_length} at offset {off} — invalid (minimum 2)"
             )
         if off + b_length > total:
+            # A descriptor that claims more bytes than were delivered. The tail
+            # is unusable but the head is not, so this is recoverable.
             raise DescriptorParsingError(
                 f"descriptor type 0x{b_type:02x} at offset {off} declares "
-                f"{b_length}B but the buffer ends at {total}B"
+                f"{b_length}B but the buffer ends at {total}B",
+                recoverable=True,
             )
 
         yield b_type, buf[off:off + b_length]

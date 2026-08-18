@@ -260,6 +260,7 @@ def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
                 continue
             seen.add(node)
             obs.nodes.append(node)
+            fd = None
             try:
                 # Opening goes through the backend: direct when running as a
                 # single root process, or a request to the gate under privsep,
@@ -278,6 +279,19 @@ def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
                         obs.exposure_window = _now - obs.first_node_at
             except OSError as exc:
                 obs.grab_failures.append(f"{node}: {exc}")
+                # The open can succeed and the EVIOCGRAB still fail -- another
+                # process already holds the grab, most commonly. The descriptor
+                # was then never added to `devices`, so the cleanup loop at the
+                # bottom never saw it and it leaked for the life of the daemon,
+                # once per ungrabbable node per attachment. Worse than a leak:
+                # an open input fd this process is not reading from and cannot
+                # release is precisely the thing quarantine promises it never
+                # holds.
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
         # Once we hold something, stop waiting for stragglers: extra dwell here
         # is pure exposure. Late-appearing nodes are noted as ungrabbed below.

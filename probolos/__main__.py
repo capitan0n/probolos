@@ -19,11 +19,13 @@ from . import (agentlink, daemon, gate, ledger as ledger_mod, report, rules,
                safety, session as session_mod, sysfs, trust as trust_mod,
                usbclass)
 
+# The rename from Cerberus reached ~60 files and missed this one, which is the
+# first thing every user sees. Same figlet font ("small"), without smushing.
 BANNER = r"""
-   ___         _
-  / __|___ _ _| |__  ___ _ _ _  _ ___
- | (__/ -_) '_| '_ \/ -_) '_| || (_-<
-  \___\___|_| |_.__/\___|_|  \_,_/__/   identity · consistency · behaviour
+   ___              _           _
+  | _ \  _ _  ___  | |__  ___  | | ___   ___
+  |  _/ | '_|/ _ \ | '_ \/ _ \ | |/ _ \ (_-<
+  |_|   |_|  \___/ |_.__/\___/ |_|\___/ /__/  identity · consistency · behaviour
 """
 
 
@@ -303,6 +305,16 @@ def main(argv=None) -> None:
     parser.add_argument("--agent-user", metavar="USER",
                         help="the desktop user allowed to answer through the "
                              "agent (default: the owner of the active session)")
+    parser.add_argument("--close-race-window", action="store_true",
+                        help="eliminate the exposure window between authorizing "
+                             "an input device and grabbing it, by holding the "
+                             "bus-wide driver autoprobe switch at 0 for the "
+                             "two sysfs writes it takes to authorize the device "
+                             "with no driver bound. OFF BY DEFAULT: if the "
+                             "process is killed mid-window, no USB device on "
+                             "the machine binds a driver until it is restored "
+                             "by hand. Not available with --privsep. "
+                             "See SECURITY.md before enabling.")
     parser.add_argument("--privsep", action="store_true",
                         help="run with privilege separation: a small root gate "
                              "and an unprivileged analyzer. Recommended")
@@ -389,9 +401,24 @@ def main(argv=None) -> None:
                      force_locked=forced_lock,
                      agent_socket=args.agent_socket if args.agent else None,
                      agent_uid=agent_uid,
-                     agent_gid=agent_gid)
+                     agent_gid=agent_gid,
+                     close_race_window=args.close_race_window)
 
     if args.privsep:
+        if args.close_race_window:
+            # Fail here rather than at the first input device. The two flags
+            # are not merely unhelpful together: the user asked for a specific
+            # security property and would otherwise be told, mid-session, that
+            # they are not getting it. Better to make them choose knowingly.
+            sys.exit(
+                "--close-race-window cannot be combined with --privsep.\n"
+                "drivers_autoprobe is bus-wide, so the privileged gate has no "
+                "device to scope\nthe request to and does not offer it. "
+                "Choose one:\n"
+                "  --privsep              bound the blast radius of an "
+                "analyzer bug (recommended)\n"
+                "  --close-race-window    remove the 41-85 ms exposure window "
+                "on input devices")
         from . import privsep
         from .gate_client import GateBackend
 

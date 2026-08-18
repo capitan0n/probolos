@@ -37,3 +37,6 @@ htmlcov/
 *.swo
 *~
 .DS_Store
+
+
+fuzzing/

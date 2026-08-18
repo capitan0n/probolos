@@ -179,6 +179,32 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
     has_keyboard = any(
         usbclass.is_keyboard(i.interface_class, i.interface_subclass,
                              i.interface_protocol) for i in ifaces)
+    # A HID interface that declares no boot protocol has not said whether it is
+    # a keyboard, and the descriptors cannot tell us -- the report descriptor,
+    # which holds the answer, is not in the sysfs blob (see
+    # usbclass.is_undeclared_hid). Every rule below that asked has_keyboard was
+    # therefore evadable by declaring subclass 0x00 / protocol 0x00: legal,
+    # ordinary, and a fully working keyboard under Linux.
+    #
+    # The response is NOT to widen has_keyboard, which would fire on the many
+    # honest peripherals that use subclass 0. It is to keep the two apart and
+    # let each rule state which question it is asking -- "this device says it
+    # can type" or "this device might be able to type and will not say".
+    has_undeclared_hid = any(
+        usbclass.is_undeclared_hid(i.interface_class, i.interface_subclass,
+                                   i.interface_protocol) for i in ifaces)
+    # A declared boot mouse also "might type": the sysfs blob does not contain
+    # the report descriptor, so a device that says `subclass=1, protocol=2`
+    # (mouse) can still map its HID reports to Usage Page 0x01 / Usage 0x06
+    # (keyboard). Alone, this is a completely normal mouse and must not raise
+    # anything -- see test_ordinary_mouse_alone_never_alerts. In combination
+    # with mass storage, it is the same BadUSB layout as the undeclared case,
+    # and the property test found the gap in the pair rules below.
+    has_declared_mouse = any(
+        usbclass.is_mouse(i.interface_class, i.interface_subclass,
+                          i.interface_protocol) for i in ifaces)
+    input_of_unknown_shape = has_undeclared_hid or has_declared_mouse
+    may_type = has_keyboard or has_undeclared_hid
 
     def add(rule_id: str, default_sev: Severity, title: str, explanation: str):
         if not cfg.enabled(rule_id):
@@ -203,6 +229,43 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
             "interface can run commands and carry the results out over a link "
             "you do not control. Very few legitimate products do this.")
 
+    # -- 2b. The same two shapes, with the HID half saying nothing ---------
+    # Combination rules only. An undeclared HID interface ON ITS OWN is
+    # unremarkable -- countless mice, headset buttons and vendor config
+    # channels look exactly like this -- so flagging it alone would be the
+    # false-positive machine this whole module was written to avoid. Paired
+    # with mass storage or a network interface it is a different statement:
+    # there is no mainstream product that is a flash drive plus an input
+    # device of undisclosed kind, and that is precisely the BadUSB layout.
+    if input_of_unknown_shape and not has_keyboard:
+        if CLS_MASS_STORAGE in classes:
+            add("storage-with-undeclared-hid", Severity.CRITICAL,
+                "Storage device with an input interface that may be able "
+                "to type",
+                "This device presents itself as a disk AND as a human "
+                "interface device whose actual behaviour is not visible from "
+                "the descriptors -- either it declined to say (subclass 0) "
+                "or it declared itself a mouse, but the answer lives in the "
+                "HID report descriptor, which is not readable without "
+                "talking to the device. Either way, the report descriptor "
+                "can map keys. Treat it as the BadUSB layout: the storage "
+                "half is the alibi, and the input half may be able to type. "
+                "Legitimate flash drives do not carry an input interface at "
+                "all.")
+        if classes & {CLS_CDC, CLS_CDC_DATA, CLS_WIRELESS}:
+            add("network-with-undeclared-hid", Severity.WARNING,
+                "Network device with an input interface of unclear shape",
+                "Alongside its own network path this device declares a human "
+                "interface device whose actual behaviour is not visible from "
+                "the descriptors (either subclass 0, or a declared mouse "
+                "whose report descriptor was not read). If that interface "
+                "can type, the pair can run commands and carry the results "
+                "out over a link you do not control. This is a WARNING "
+                "rather than a CRITICAL because the combination has "
+                "legitimate instances -- some radios expose a vendor HID "
+                "channel -- and because what the interface actually does "
+                "cannot be read from the descriptors.")
+
     # -- 3. A keyboard hiding beside some other function -------------------
     unrelated = classes - {CLS_HID, CLS_HUB, CLS_VENDOR}
     if has_keyboard and unrelated and CLS_MASS_STORAGE not in classes:
@@ -215,13 +278,18 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
 
     # -- 4. The device contradicts its own description ---------------------
     label = f"{dev.manufacturer or ''} {dev.product or ''}".lower()
-    if has_keyboard and any(word in label for word in STORAGE_WORDS):
+    if may_type and any(word in label for word in STORAGE_WORDS):
+        what = ("a keyboard interface" if has_keyboard
+                else "a human interface device that will not say what kind "
+                     "it is")
         add("self-contradictory-identity", Severity.WARNING,
-            "Calls itself storage, behaves as a keyboard",
+            "Calls itself storage, presents an input interface",
             f"The device names itself '{dev.label()}', which describes a "
-            "storage product, yet it declares a keyboard interface. Note this "
+            f"storage product, yet it declares {what}. Note this "
             "compares the device against ITSELF -- no external vendor database "
-            "is involved, because cross-branded hardware is normal.")
+            "is involved, because cross-branded hardware is normal. A disguised "
+            "keystroke injector that omits the boot protocol used to slip past "
+            "this rule; it no longer does.")
 
     # -- 5. Several unrelated functions in one device ----------------------
     if len(classes) > 1 and not _is_benign_group(classes, cfg):
@@ -256,6 +324,25 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
             "Device declares no interfaces",
             "Nothing can be said about what this device does, because it "
             "describes no functions at all.")
+
+    # These two only became observable once descriptors.parse() was routed
+    # through descriptors_safe; the loop it replaced discarded a truncated tail
+    # without recording that it had done so.
+    truncated = getattr(descriptor_set, "truncated", None)
+    if truncated:
+        add("descriptor-chain-truncated", Severity.WARNING,
+            "The descriptor chain stops before it should",
+            f"{truncated}. What was parsed is still shown, but the device did "
+            "not deliver everything it promised, so any function described in "
+            "the missing part is invisible to every check below.")
+
+    overstated = getattr(descriptor_set, "length_overstated", 0)
+    if overstated > 0:
+        add("descriptor-length-overstated", Severity.NOTICE,
+            "Device claims more descriptor data than it sent",
+            f"wTotalLength overstates the delivered configuration data by "
+            f"{overstated} bytes. Vendor toolchains compute this field; a "
+            "mismatch is the fingerprint of a descriptor set edited by hand.")
 
     # -- 7. Weak signal, stated as weak ------------------------------------
     if has_keyboard and _speed_mbps(dev) and _speed_mbps(dev) >= 480:
@@ -292,10 +379,10 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
         # Escalation: a device that can TYPE and also lies about its own name
         # is expressing intent, not manufacturing sloppiness. Treated like the
         # other BadUSB signatures.
-        if has_keyboard:
+        if may_type:
             add("crafted-strings-hid", Severity.CRITICAL,
                 "A device that can type also disguised its own name",
-                "This device declares a keyboard interface AND hides deceptive "
+                "This device declares an input interface AND hides deceptive "
                 "characters in its identity strings." + detail + " A real "
                 "keyboard has no reason to obfuscate its name; combined with "
                 "the ability to inject keystrokes this matches a BadUSB that is "
@@ -654,6 +741,22 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
         return out
 
     from . import storage as storage_mod
+
+    # -- 0. Structures the hardening layer refused to read -------------------
+    # MediumReport.suspicious was being written by the inspection code and read
+    # by nothing at all: the checks ran, rejected impossible geometry, and then
+    # the reasons went nowhere. A refusal that never reaches the operator is
+    # indistinguishable from a check that was never performed.
+    if report.suspicious:
+        detail = "; ".join(report.suspicious[:4])
+        if len(report.suspicious) > 4:
+            detail += f"; and {len(report.suspicious) - 4} more"
+        add("impossible-partition-geometry", Severity.WARNING,
+            "The medium describes structures that cannot exist",
+            f"{detail}. These were not read, deliberately: seeking to an "
+            "offset a device invented is how a partition table becomes an "
+            "instruction rather than a description. Honest media do not "
+            "produce this.")
 
     partitions = [p for p in report.partitions
                   if p.type_byte != storage_mod.PROTECTIVE_MBR_TYPE]

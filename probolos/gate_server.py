@@ -28,6 +28,37 @@ acts only on a USB device the kernel currently reports as blocked
 This is derived from the kernel, not from the analyzer's claims, so a
 compromised analyzer cannot open the built-in keyboard, read the system disk,
 or disturb a device you are actively using -- even with otherwise valid paths.
+
+TWO HOLES IN THAT SCOPE, NOW CLOSED
+-----------------------------------
+The paragraph above was the claim; the code did not fully implement it.
+
+  1. DEAUTHORIZATION WAS UNSCOPED. `value=0` was accepted for any valid USB
+     path, on the reasoning that "tightening is never the risk". It is: the
+     device you are actively using is exactly the one an attacker wants
+     switched off. A compromised analyzer could send authorize(<your USB
+     keyboard>, 0) -- or, worse, unbind one interface of it -- and kill
+     hardware the gate had never been asked about. That contradicts the
+     sentence above, which promises the opposite.
+
+     The gate therefore remembers which devices IT authorized out of
+     quarantine, and will switch off only those, or something already off
+     (a no-op). Everything else is refused.
+
+  2. authorized_default WAS COMPLETELY UNSCOPED. It is the global switch the
+     whole tool rests on: setting it back to 1 means every device attached
+     afterwards is admitted with no question asked. Any path was accepted and
+     any value was written, so the cheapest possible attack on Probolos was to
+     ask its own root half to turn it off -- no exploit needed beyond a
+     compromised analyzer, which is precisely the threat the split exists for.
+
+     Now: only a root hub (usbN) is accepted; 0 is always allowed (closing is
+     never the risk); and the gate will re-open a hub ONLY to the value it
+     itself read there before closing it. A hub the gate never closed cannot
+     be opened by the analyzer at all.
+
+Both records live in this process and are never taken from the wire, so a
+compromised analyzer cannot widen its scope by asserting anything.
 """
 
 from __future__ import annotations
@@ -66,6 +97,10 @@ SYS_CLASS_PREFIX = "/sys/class/"
 BLOCK_PREFIX = "/dev/"
 import re as _re
 _BLOCK_NAME = _re.compile(r"^sd[a-z]+$")
+# Root hubs -- usb1, usb2, ... -- are the only devices that own
+# authorized_default. Anything else asking for it is either confused or
+# probing, and neither deserves a write.
+_ROOT_HUB_NAME = _re.compile(r"^usb\d+$")
 
 
 class GateServer:
@@ -73,11 +108,24 @@ class GateServer:
     Runs in the root process. Serves one connected analyzer over a SEQPACKET
     socketpair, one request at a time -- there is exactly one client, so there
     is no session state, no concurrency, and nothing to get wrong there.
+
+    There IS a little state now, and it is worth being explicit about why:
+    the two records below are what let the gate distinguish "put back what you
+    changed" from "change something you were never given". Both are written
+    only by this process, from values read out of sysfs; nothing on the wire
+    can add to either. They are per-connection, so a restarted analyzer starts
+    with no accumulated permission.
     """
 
     def __init__(self, sock: socket.socket, log=print):
         self.sock = sock
         self.log = log
+        # Resolved paths of USB devices/interfaces this gate switched ON out of
+        # quarantine. Only these may be switched off again.
+        self._authorized_here: set = set()
+        # Root hub path -> the authorized_default value found there before the
+        # gate closed it. Only this value may be written back.
+        self._closed_defaults: dict = {}
 
     # ---- path validation: the heart of the security boundary ----
 
@@ -249,21 +297,44 @@ class GateServer:
             return protocol.Response(
                 protocol.DENIED,
                 f"not a USB device path: {req.path!r} -> {resolved!r}")
-        # Scope: authorizing (value=1) is only ever legitimate for a device that
-        # is currently blocked. Refusing to switch ON a device that is already
-        # authorized stops a compromised analyzer from re-authorizing -- or
-        # churning -- a device you are actively using. Setting value=0
-        # (re-blocking) is always allowed: tightening is never the risk.
+        # Scope, switching ON: only a device that is currently blocked. This
+        # stops a compromised analyzer re-authorizing -- or churning -- a
+        # device you are actively using.
         if req.value == 1 and not self._usb_device_is_blocked(devpath):
             return protocol.Response(
                 protocol.DENIED,
                 "refusing to authorize a device that is not under quarantine "
                 f"(authorized != 0): {devpath.name}")
+
+        # Scope, switching OFF. This used to be unconditional, on the reasoning
+        # that tightening cannot hurt. It can: the device an attacker most
+        # wants switched off is the one you are using, and "deauthorize the
+        # user's USB keyboard" is a one-message denial of service that every
+        # other check here was written to prevent.
+        #
+        # The legitimate need is narrow and can be stated exactly: the daemon
+        # authorizes a device for quarantine or a storage read and must be able
+        # to put it straight back. So the gate allows switching off only what
+        # it switched on, plus anything already off (where the write is a
+        # no-op that keeps the daemon's "make the state explicit" calls
+        # working).
+        if req.value == 0 and str(devpath) not in self._authorized_here:
+            if not self._usb_device_is_blocked(devpath):
+                return protocol.Response(
+                    protocol.DENIED,
+                    "refusing to deauthorize a device this gate did not "
+                    f"authorize: {devpath.name}")
         try:
             (devpath / "authorized").write_text(str(req.value))
-            return protocol.Response(protocol.OK)
         except OSError as exc:
             return protocol.Response(protocol.ERROR, str(exc))
+        # Recorded only after the write succeeded, so a failed authorization
+        # never grants the right to deauthorize something.
+        if req.value == 1:
+            self._authorized_here.add(str(devpath))
+        else:
+            self._authorized_here.discard(str(devpath))
+        return protocol.Response(protocol.OK)
 
     def _do_authorize_interface(self, req: protocol.Request) -> protocol.Response:
         """
@@ -289,11 +360,24 @@ class GateServer:
                 protocol.DENIED,
                 f"not an interface (no configuration:interface suffix): {intf.name}")
         parent = intf.parent
+        in_scope = (self._usb_device_is_blocked(parent)
+                    or str(parent) in self._authorized_here)
         if req.value == 1 and not self._usb_device_is_blocked(parent):
             return protocol.Response(
                 protocol.DENIED,
                 "refusing to bind an interface on a device that is not under "
                 f"quarantine: {parent.name}")
+        # Unbinding one interface of a device is the same denial of service as
+        # deauthorizing the whole device, just quieter -- it takes the keyboard
+        # half of a working device away and leaves the rest looking healthy. So
+        # it is held to the same rule: the parent must be under quarantine, or
+        # be a device this gate authorized itself (which is the deferred-bind
+        # case, where the device is deliberately on but held driverless).
+        if req.value == 0 and not in_scope:
+            return protocol.Response(
+                protocol.DENIED,
+                "refusing to unbind an interface of a device that is neither "
+                f"under quarantine nor authorized by this gate: {parent.name}")
         try:
             (intf / "authorized").write_text(str(req.value))
             return protocol.Response(protocol.OK)
@@ -301,17 +385,80 @@ class GateServer:
             return protocol.Response(protocol.ERROR, str(exc))
 
     def _do_set_default(self, req: protocol.Request) -> protocol.Response:
+        """
+        Close or re-open a root hub's default authorization.
+
+        This is the single most powerful message the protocol carries, and it
+        was the least guarded: any USB path, any of three values, no questions.
+        Writing 1 here admits every device attached from that moment on without
+        a prompt, so a compromised analyzer did not need to defeat Probolos --
+        it could ask Probolos's own root half to stand down.
+
+        Three restrictions now, in increasing order of importance:
+
+          * only a ROOT HUB (usbN). authorized_default belongs to nothing else,
+            so accepting other paths only ever widened the target list.
+          * CLOSING (0) is always allowed and the previous value is remembered.
+            Closing is the direction that cannot hurt.
+          * OPENING is allowed only back to what this gate found there before
+            it closed the hub, and only once. A hub the gate never closed
+            cannot be opened at all -- which is the case that matters, because
+            it is the one an attacker is in.
+        """
         if req.value not in (0, 1, 2):
             return protocol.Response(protocol.ERROR, "value must be 0, 1 or 2")
         hubpath = self._safe_usb_path(req.path)
         if hubpath is None:
             return protocol.Response(protocol.DENIED,
                                      f"path not under {USB_LINK_PREFIX}")
+        if not _ROOT_HUB_NAME.match(hubpath.name):
+            return protocol.Response(
+                protocol.DENIED,
+                f"authorized_default belongs to a root hub, not to "
+                f"{hubpath.name}")
+
+        attr = hubpath / "authorized_default"
+
+        if req.value != 0:
+            expected = self._closed_defaults.get(str(hubpath))
+            if expected is None:
+                return protocol.Response(
+                    protocol.DENIED,
+                    f"refusing to open {hubpath.name}: this gate never closed "
+                    f"it, so there is nothing to restore")
+            # gate.py deliberately restores 1 when it found 0, so that the
+            # residue of a run that died does not become permanent. Mirror
+            # exactly that, and nothing wider.
+            allowed = expected if expected != 0 else 1
+            if req.value != allowed:
+                return protocol.Response(
+                    protocol.DENIED,
+                    f"refusing to set authorized_default={req.value} on "
+                    f"{hubpath.name}: only the previous value ({allowed}) may "
+                    f"be restored")
+
+        previous = None
+        if req.value == 0:
+            try:
+                previous = int(attr.read_text().strip())
+            except (OSError, ValueError):
+                previous = None
+
         try:
-            (hubpath / "authorized_default").write_text(str(req.value))
-            return protocol.Response(protocol.OK)
+            attr.write_text(str(req.value))
         except OSError as exc:
             return protocol.Response(protocol.ERROR, str(exc))
+
+        if req.value == 0:
+            # setdefault: the value worth remembering is the one from BEFORE
+            # the first close, not whatever a second close would read back (0).
+            if previous is not None:
+                self._closed_defaults.setdefault(str(hubpath), previous)
+        else:
+            # Restored. The permission is spent, so a second open is refused
+            # exactly like the first would have been on a hub we never closed.
+            self._closed_defaults.pop(str(hubpath), None)
+        return protocol.Response(protocol.OK)
 
     def _do_open_input(self, req: protocol.Request):
         """
@@ -399,11 +546,19 @@ class GateServer:
             else:
                 resp = protocol.Response(protocol.ERROR, "unhandled kind")
 
-            self._reply(resp, fd_to_send)
-            if fd_to_send is not None:
+            try:
+                self._reply(resp, fd_to_send)
+            finally:
                 # The kernel duplicated the fd into the analyzer on send; our
-                # copy is no longer needed and must not leak.
-                os.close(fd_to_send)
+                # copy is no longer needed and must not leak. In a `finally`
+                # because sendmsg can fail -- an analyzer that dies at exactly
+                # the wrong moment used to leave the root process holding an
+                # open descriptor to a device node for every attempt.
+                if fd_to_send is not None:
+                    try:
+                        os.close(fd_to_send)
+                    except OSError:
+                        pass
 
     def _reply(self, resp: protocol.Response, fd: Optional[int] = None) -> None:
         payload = resp.encode()

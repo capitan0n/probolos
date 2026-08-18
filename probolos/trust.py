@@ -169,6 +169,25 @@ class TrustStore:
     def load(self) -> None:
         if not self.path.exists():
             return
+
+        # C3: the trust store is an admission list. Anything in it skips the
+        # human question entirely, so whoever can WRITE this file can admit any
+        # device they like without ever touching the machine physically.
+        #
+        # It was already being written at 0600 by atomicio -- but writing it
+        # safely says nothing about the file we are about to read. A store that
+        # was created before a hardening change, restored from a backup, copied
+        # with `cp` (which does not preserve mode by default), or dropped in by
+        # another user is exactly the case that matters, and none of those go
+        # through our writer. The permissions have to be checked on the way IN.
+        #
+        # Fail CLOSED, and loudly: an untrustworthy trust store is treated as
+        # an empty one, so every device is asked about rather than admitted.
+        integrity = self._integrity_error()
+        if integrity:
+            self.load_error = integrity
+            return
+
         try:
             data = json.loads(self.path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
@@ -194,6 +213,89 @@ class TrustStore:
         if skipped:
             self.load_error = (f"{skipped} malformed trust entr"
                                f"{'y' if skipped == 1 else 'ies'} ignored")
+
+    def _integrity_error(self) -> Optional[str]:
+        """
+        Why this trust store must not be believed, or None if it is sound.
+
+        Four separate questions, because they fail in different ways:
+
+          1. Is it a regular file? A symlink pointing somewhere else, or a
+             FIFO, means the path we validate is not the data we read. lstat
+             is deliberate here -- stat would follow the link and check the
+             wrong inode.
+          2. Who owns it? A file owned by anyone other than the user running
+             Probolos (or root, who can write it regardless) is a file someone
+             else controls.
+          3. Who else can write it? Group- or world-writable means the
+             admission list is editable by accounts that were never granted
+             that power.
+          4. Who can write its DIRECTORY? This was missing, and it is the same
+             omission safety.panic_file_is_valid was written to avoid -- there
+             the reasoning is spelled out and here it was simply not applied.
+             Directory write permission allows unlinking and replacing any file
+             inside, whatever that file's own owner and mode say, so checks 1-3
+             describe an inode that anyone with the directory can swap out from
+             under them. ledger.default_path() already restructured the state
+             tree specifically so this directory could stay root-owned; that
+             precaution is only worth anything if somebody verifies it held.
+
+        Read permission is not checked: a world-READABLE trust store leaks
+        which devices you own, which is a privacy matter rather than an
+        admission-control one, and refusing to start over it would break
+        existing installations for no security gain.
+
+        Only the immediate parent is examined, as with the panic file. Walking
+        every ancestor to / would be more thorough and would also refuse on
+        systems with an unusual but harmless /var layout; the directory that
+        actually holds the file is where the replacement happens.
+        """
+        import os
+        import stat as _stat
+
+        try:
+            st = os.lstat(self.path)
+        except OSError as exc:
+            return f"cannot stat trust store: {exc}"
+
+        if _stat.S_ISLNK(st.st_mode):
+            return ("trust store is a symlink; refusing to follow it, because "
+                    "the file whose ownership we can check is not the file we "
+                    "would read")
+        if not _stat.S_ISREG(st.st_mode):
+            return "trust store is not a regular file"
+
+        if st.st_uid not in (0, os.geteuid()):
+            return (f"trust store is owned by uid {st.st_uid}, not by root or "
+                    f"uid {os.geteuid()}; nothing in it is trusted")
+
+        writable_by_others = st.st_mode & (_stat.S_IWGRP | _stat.S_IWOTH)
+        if writable_by_others:
+            return (f"trust store mode is {_stat.S_IMODE(st.st_mode):04o}; it "
+                    "is writable by group or others, so its contents cannot "
+                    "establish that you approved anything. Fix with: "
+                    f"chmod 600 {self.path}")
+
+        directory = self.path.parent
+        try:
+            parent = os.lstat(directory)
+        except OSError as exc:
+            return f"cannot stat the trust store's directory: {exc}"
+
+        if parent.st_uid not in (0, os.geteuid()):
+            return (f"the trust store's directory {directory} is owned by uid "
+                    f"{parent.st_uid}, not by root or uid {os.geteuid()}; "
+                    "whoever owns it can replace the file regardless of the "
+                    "file's own permissions, so nothing in it is trusted")
+
+        if parent.st_mode & (_stat.S_IWGRP | _stat.S_IWOTH):
+            return (f"the trust store's directory {directory} has mode "
+                    f"{_stat.S_IMODE(parent.st_mode):04o}; it is writable by "
+                    "group or others, who can therefore unlink this file and "
+                    "put their own in its place. Fix with: "
+                    f"chmod 755 {directory}")
+
+        return None
 
     def save(self) -> Optional[str]:
         try:

@@ -77,8 +77,16 @@ class GateClient:
             raise GateError(f"authorize failed: {resp.status}: {resp.detail}")
 
     def authorize_interface(self, intf_dir, value: int) -> None:
-        self._round_trip(protocol.Request(protocol.REQ_AUTHORIZE_INTERFACE,
-                                          path=str(intf_dir), value=value))
+        # The response used to be discarded, which is the project's recurring
+        # bug in miniature: a refusal from the gate looked exactly like
+        # success, so deferred_bind would report "interface held unbound" for
+        # an interface that was never touched -- a security property claimed
+        # but not delivered. Callers already handle OSError (GateError is one).
+        resp, _ = self._round_trip(protocol.Request(
+            protocol.REQ_AUTHORIZE_INTERFACE, path=str(intf_dir), value=value))
+        if not resp.ok:
+            raise GateError(
+                f"authorize_interface failed: {resp.status}: {resp.detail}")
 
     def set_default(self, hubpath, value: int) -> None:
         resp, _ = self._round_trip(protocol.Request(
@@ -119,6 +127,12 @@ class GateBackend:
     daemon does not know or care that it is no longer privileged.
     """
 
+    # See the note below the fd helpers: the gate cannot scope a bus-wide
+    # operation, so it does not carry one. deferred_bind reads this flag and
+    # declines to start, rather than discovering the problem halfway through
+    # with autoprobe already switched off.
+    supports_bus_wide = False
+
     def __init__(self, client: "GateClient"):
         self.client = client
 
@@ -139,3 +153,26 @@ class GateBackend:
 
     def open_block(self, device_path) -> int:
         return self.client.open_block(device_path)
+
+    # ---- deliberately NOT available under privilege separation ----
+    #
+    # The gate's entire scoping rule is "act only on a USB device the kernel
+    # reports as authorized=0". drivers_autoprobe and drivers_probe are bus-wide:
+    # there is no device to scope them to, so the gate has no way to tell a
+    # legitimate request from a compromised analyzer switching driver binding
+    # off for the whole machine. Rather than invent a weaker rule for the most
+    # dangerous operation, the split simply does not carry it.
+    #
+    # These raise instead of returning quietly, because deferred_bind's
+    # supported() check must FAIL when this backend is installed. A no-op would
+    # reproduce the exact bug being fixed here: a race-closing mechanism that
+    # reports success while doing nothing.
+
+    def set_drivers_autoprobe(self, value: int) -> None:
+        raise NotImplementedError(
+            "drivers_autoprobe is bus-wide and cannot be scoped to a "
+            "quarantined device, so the privileged gate does not offer it")
+
+    def trigger_driver_probe(self, name: str) -> None:
+        raise NotImplementedError(
+            "drivers_probe is bus-wide and is not offered by the gate")

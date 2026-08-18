@@ -191,9 +191,29 @@ CRITICAL paths can be exercised with no hardware.
 
 ## Scope
 
-Read [`SECURITY.md`](SECURITY.md) before trusting this with anything. It is
-explicit about what Probolos does **not** stop: USB stack vulnerabilities, a
-patient attacker, descriptor forgery, Thunderbolt/DMA, and wireless gateways.
+[`CAPABILITIES.md`](CAPABILITIES.md) is the authoritative list of what Probolos
+does, what it does not do, and what may be built later. Read it first — it
+distinguishes between code that runs and code that merely exists in the tree.
+
+[`SECURITY.md`](SECURITY.md) covers the threat model and is explicit about what
+Probolos does **not** stop: USB stack vulnerabilities, a patient attacker,
+descriptor forgery, Thunderbolt/DMA, and wireless gateways.
+
+Short version:
+
+- **Does** — deny-by-default admission, descriptor consistency rules,
+  pre-authorization quarantine with `EVIOCGRAB` and timing analysis, unmounted
+  storage-metadata inspection, cross-session ledger and trust store, privilege
+  separation with kernel-derived scope, lockout safety.
+- **Does not** — anything before the kernel finishes enumerating, anything after
+  you approve the device, Thunderbolt/DMA, USB-PD, wireless, or file contents.
+- **Off by default** — `--close-race-window` removes the 41–85 ms exposure
+  window on input devices, at the cost of holding a bus-wide kernel switch for
+  the length of two sysfs writes. Read `SECURITY.md` before enabling it, and
+  note it is not yet validated on real hardware.
+- **Not yet** — no HID report descriptor analysis: the parser for it is written
+  and hardened, but the report descriptor is not in the sysfs blob and has no
+  source wired to it. `CAPABILITIES.md` §2.2 and §3.2.
 
 Status: **alpha — under active development.** All four critical findings from
 the security audit are fixed and covered by regression tests, and the full

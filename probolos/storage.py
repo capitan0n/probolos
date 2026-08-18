@@ -192,9 +192,20 @@ def sniff_filesystem(data: bytes) -> Optional[str]:
         magic = struct.unpack_from("<H", data, 0x438)[0]
         if magic == 0xEF53:
             return "ext2/3/4"
-    if data[:4] == b"\x28\xb5\x2f\xfd" or data[:9] == b"\x1c\x00\x00\x00":
-        return None
-    if data[0x10040:0x10044] == b"_BHRfS_M" if len(data) > 0x10044 else False:
+    # btrfs: the magic is 8 bytes at 0x10040 (superblock offset 0x10000 + 0x40).
+    #
+    # Two dead comparisons used to sit here. One sliced FOUR bytes and compared
+    # them to an EIGHT-byte literal, so it could never be true; the other
+    # compared a nine-byte slice to a four-byte literal, same result, and would
+    # have returned None mid-chain even if it had matched. Both looked like
+    # checks and were not -- the kind of thing that makes a signature list read
+    # as more thorough than it is.
+    #
+    # Note this only fires if the caller hands over a buffer large enough to
+    # contain the btrfs superblock; the 512-byte and 17 KiB reads above never
+    # are. Correct now rather than silently wrong, so it works the day a larger
+    # read is passed in.
+    if len(data) >= 0x10048 and data[0x10040:0x10048] == b"_BHRfS_M":
         return "btrfs"
     return None
 
@@ -295,18 +306,116 @@ def inspect(device: str, open_fn=None) -> MediumReport:
 
     `open_fn` allows the privileged gate to supply an already-open read-only
     descriptor under privilege separation, exactly as with input nodes.
+
+    ONE DESCRIPTOR, OPENED ONCE (bug fix)
+    -------------------------------------
+    This function used to open, read the header, and CLOSE -- then call
+    _read_at() per partition, which opened again through the same open_fn. That
+    is wrong in two separate ways, and both were silent:
+
+      * Under --privsep (and inside inspect_safely's fork worker) open_fn is
+        `lambda _dev: fd`, a closure over ONE already-open descriptor. The
+        second call handed back the same integer, which had just been closed,
+        so every per-partition read failed with EBADF and returned b"". The
+        filesystem-signature check -- the whole point of stage 4's second half,
+        and the input to the "partition contains something other than it
+        declares" rule -- therefore never ran on the privileged path. It failed
+        by returning nothing, which reads exactly like a clean medium.
+
+      * A closed descriptor number is immediately reusable. If anything else in
+        the process opened a file between the close and the next _read_at, that
+        file's bytes would be lseek'd into and fed to sniff_filesystem as if
+        they came from the device. Wrong answers from the wrong file is a worse
+        failure than no answer.
+
+    So: acquire the descriptor once, read everything from it with os.pread
+    (which takes an offset and does not disturb the file position, removing the
+    lseek entirely), and close it once at the end.
     """
     import os
 
     report = MediumReport(device=device)
     report.size_sectors = read_size_sectors(device)
 
+    # HARDENING (1/3): the declared size is itself device-controlled, and every
+    # per-partition bounds check below is measured against it. An absurd size
+    # therefore does not just produce a wrong number -- it silently disables the
+    # checks that depend on it. So it is validated first, and a size that fails
+    # is discarded rather than trusted, which falls back to the absolute limits
+    # in validate_partition() instead of a device-supplied one.
+    size_ok, size_reason = storage_hardening.device_size_sane(report.size_sectors)
+    if not size_ok:
+        report.suspicious.append(f"declared device size rejected: {size_reason}")
+        report.size_sectors = None
+
     fd = None
     try:
-        fd = open_fn(device) if open_fn else os.open(device, os.O_RDONLY)
-        data = os.read(fd, HEADER_READ)
-    except OSError as exc:
-        report.error = str(exc)
+        try:
+            fd = open_fn(device) if open_fn else os.open(device, os.O_RDONLY)
+            data = os.pread(fd, HEADER_READ, 0)
+        except OSError as exc:
+            report.error = str(exc)
+            return report
+
+        if len(data) < SECTOR:
+            report.error = f"only {len(data)} bytes readable"
+            return report
+
+        partitions = parse_mbr(data)
+        gpt = parse_gpt_header(data)
+
+        if gpt is not None:
+            report.scheme = "gpt"
+            report.partitions = partitions      # the protective MBR entries
+        elif partitions:
+            report.scheme = "mbr"
+            report.partitions = partitions
+        else:
+            # No partition table. Common and legitimate: many USB sticks are
+            # formatted as a "superfloppy", with a filesystem written directly
+            # to the medium. Sniff it so this is reported as a fact, not an
+            # anomaly.
+            report.scheme = "none"
+            fs = sniff_filesystem(data)
+            if fs:
+                report.signatures[-1] = fs
+            return report
+
+        # HARDENING (2/3): split the table into partitions that can be read and
+        # partitions that cannot, BEFORE touching the medium again. Doing it up
+        # front means the whole geometry is judged as a unit and every
+        # rejection is reported with its reason -- previously the per-partition
+        # guard below rejected on offset alone, so a partition with a sane
+        # start and an absurd LENGTH was read anyway and its impossibility
+        # never surfaced.
+        readable, impossible = storage_hardening.filter_safe_partitions(
+            report.partitions, report.size_sectors)
+        report.suspicious.extend(impossible)
+
+        # Read the first sector of each partition to see what is actually
+        # there.
+        for part in readable:
+            if part.type_byte == PROTECTIVE_MBR_TYPE:
+                continue
+            # HARDENING (3/3): never read at a device-controlled offset without
+            # checking it fits inside the real device first. A partition
+            # claiming start_lba=0xFFFFFFFF would otherwise reach for ~2 TB.
+            # Kept even though filter_safe_partitions has already vetted this
+            # one: it is the guard immediately above the read, and a guard that
+            # lives anywhere else is one refactor away from not running.
+            offset = storage_hardening.safe_read_offset(
+                part.start_lba, report.size_sectors)
+            if offset is None:
+                report.suspicious.append(
+                    f'partition {part.index}: start_lba {part.start_lba} '
+                    f'does not fit the device; not read')
+                continue
+            chunk = _read_at(fd, offset, SECTOR)
+            if chunk:
+                fs = sniff_filesystem(chunk)
+                if fs:
+                    report.signatures[part.index] = fs
+
         return report
     finally:
         if fd is not None:
@@ -315,69 +424,23 @@ def inspect(device: str, open_fn=None) -> MediumReport:
             except OSError:
                 pass
 
-    if len(data) < SECTOR:
-        report.error = f"only {len(data)} bytes readable"
-        return report
 
-    partitions = parse_mbr(data)
-    gpt = parse_gpt_header(data)
+def _read_at(fd: int, offset: int, length: int) -> bytes:
+    """
+    One bounded read at an offset on an ALREADY-OPEN descriptor.
 
-    if gpt is not None:
-        report.scheme = "gpt"
-        report.partitions = partitions          # the protective MBR entries
-    elif partitions:
-        report.scheme = "mbr"
-        report.partitions = partitions
-    else:
-        # No partition table. Common and legitimate: many USB sticks are
-        # formatted as a "superfloppy", with a filesystem written directly to
-        # the medium. Sniff it so this is reported as a fact, not an anomaly.
-        report.scheme = "none"
-        fs = sniff_filesystem(data)
-        if fs:
-            report.signatures[-1] = fs
-        return report
-
-    # Read the first sector of each partition to see what is actually there.
-    for part in report.partitions:
-        if part.type_byte == PROTECTIVE_MBR_TYPE:
-            continue
-        # HARDENING: never seek to a device-controlled offset without
-        # checking it fits inside the real device first. A partition
-        # claiming start_lba=0xFFFFFFFF would otherwise seek to ~2 TB.
-        offset = storage_hardening.safe_read_offset(
-            part.start_lba, report.size_sectors)
-        if offset is None:
-            report.suspicious.append(
-                f'partition {part.index}: start_lba {part.start_lba} '
-                f'does not fit the device; not read')
-            continue
-        chunk = _read_at(device, offset, SECTOR, open_fn)
-        if chunk:
-            fs = sniff_filesystem(chunk)
-            if fs:
-                report.signatures[part.index] = fs
-
-    return report
-
-
-def _read_at(device: str, offset: int, length: int, open_fn=None) -> bytes:
-    """One bounded read at an offset. Failures are silent and non-fatal."""
+    pread rather than lseek+read: it carries the offset with the call, so there
+    is no file position to leave behind and no window in which a concurrent
+    reader could move it. Failures are silent and non-fatal -- a partition that
+    will not read is reported by its absence from `signatures`, not by killing
+    the whole inspection.
+    """
     import os
 
-    fd = None
     try:
-        fd = open_fn(device) if open_fn else os.open(device, os.O_RDONLY)
-        os.lseek(fd, offset, os.SEEK_SET)
-        return os.read(fd, length)
+        return os.pread(fd, length, offset)
     except OSError:
         return b""
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
 
 
 def type_name(type_byte: int) -> str:

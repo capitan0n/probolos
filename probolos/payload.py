@@ -133,10 +133,21 @@ def reconstruct(raw_events: Sequence[Tuple[float, int, int]],
     payload = Payload()
     active: set = set()
     buffer: List[str] = []
+    # Everything emitted so far, across every flushed line AND the line being
+    # built. The old bound compared max_chars against len(payload.text) --
+    # which is empty until the very last statement of this function -- plus the
+    # CURRENT buffer, so flush() reset it to zero. A device that types a
+    # newline every few characters therefore never hit the limit at all: 20 000
+    # keystrokes produced 4 000 lines with truncated=False. The cap existed to
+    # bound what a hostile HID can make the daemon hold in memory, and a cap a
+    # payload can reset by pressing ENTER is not a cap.
+    emitted = 0
 
     def flush():
+        nonlocal emitted
         if buffer:
             payload.lines.append("STRING " + "".join(buffer))
+            emitted += len(buffer)
             buffer.clear()
 
     for _offset, code, value in raw_events:
@@ -151,7 +162,9 @@ def reconstruct(raw_events: Sequence[Tuple[float, int, int]],
             continue
 
         payload.keystrokes += 1
-        if len(payload.text) + len(buffer) >= max_chars:
+        # keystrokes is still counted past the limit: how MUCH the device typed
+        # is a finding in its own right, and it costs one integer to keep.
+        if emitted + len(buffer) >= max_chars:
             payload.truncated = True
             continue
 
@@ -161,18 +174,22 @@ def reconstruct(raw_events: Sequence[Tuple[float, int, int]],
         if mods and not (mods == ["SHIFT"]):
             flush()
             key = NAMED_KEYS.get(code) or (KEYMAP.get(code, ("?", "?"))[0]).upper()
-            payload.lines.append(" ".join(mods + [key]))
+            line = " ".join(mods + [key])
+            payload.lines.append(line)
+            emitted += len(line)
             continue
 
         if code in NAMED_KEYS:
             flush()
             payload.lines.append(NAMED_KEYS[code])
+            emitted += len(NAMED_KEYS[code])
             continue
 
         mapping = KEYMAP.get(code)
         if mapping is None:
             flush()
             payload.lines.append(f"KEY_{code}")
+            emitted += len(f"KEY_{code}")
             continue
 
         buffer.append(mapping[1] if (active & SHIFT) else mapping[0])

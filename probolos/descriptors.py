@@ -34,6 +34,8 @@ import struct
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from . import descriptors_safe as _safe
+
 # Standard descriptor type codes (bDescriptorType)
 DESC_DEVICE = 0x01
 DESC_CONFIG = 0x02
@@ -125,6 +127,13 @@ class DescriptorSet:
     device: DeviceDescriptor
     configs: List[ConfigDescriptor] = field(default_factory=list)
 
+    # Anomalies observed while walking the chain. These exist because the walk
+    # now goes through descriptors_safe, which notices things the old inline
+    # loop silently swallowed. They are recorded rather than raised so that a
+    # merely buggy device still produces a usable report.
+    truncated: Optional[str] = None       # chain stopped early; reason
+    length_overstated: int = 0            # max (wTotalLength - bytes delivered)
+
     def primary_interfaces(self) -> List[InterfaceDescriptor]:
         """
         Interfaces of the first configuration, alternate setting 0 only.
@@ -179,12 +188,14 @@ def parse(blob: bytes) -> DescriptorSet:
     blocks, vendor junk) are skipped harmlessly by the same mechanism -- which
     is important, because a hostile device can put anything in there.
     """
-    if len(blob) < 18:
-        raise DescriptorParseError(f"blob too short: {len(blob)} bytes")
+    try:
+        head = _safe.take(blob, 0, 18, "device descriptor")
+    except _safe.DescriptorParsingError as exc:
+        raise DescriptorParseError(str(exc)) from exc
 
     (b_length, b_type, bcd_usb, dev_class, dev_subclass, dev_protocol,
      _max_packet0, vid, pid, bcd_device, _i_manu, _i_prod, _i_serial,
-     num_configs) = struct.unpack(_DEVICE_FMT, blob[:18])
+     num_configs) = struct.unpack(_DEVICE_FMT, head)
 
     if b_type != DESC_DEVICE:
         raise DescriptorParseError(
@@ -205,59 +216,95 @@ def parse(blob: bytes) -> DescriptorSet:
         )
     )
 
-    offset = 18
     current: ConfigDescriptor | None = None
     unit = power_unit_ma(bcd_usb)
 
-    while offset + 2 <= len(blob):
-        d_len = blob[offset]
-        d_type = blob[offset + 1]
+    # The walk itself lives in descriptors_safe. That module was written for
+    # exactly this job, carries its own regression suite, and was -- until this
+    # change -- imported by nothing at all, so none of its protections were in
+    # force on the real path. What it adds over the loop that used to be here:
+    #
+    #   * a bound on the NUMBER of descriptors, not just their sizes, so a
+    #     device cannot exhaust us with a flood of minimal two-byte items
+    #   * one audited implementation of the bLength >= 2 rule instead of two
+    #     copies that could drift apart
+    #   * take()-based field access, so a short chunk fails loudly rather than
+    #     returning fewer bytes than asked for, which is what Python slicing
+    #     does and is the quiet root of this whole class of bug
+    #
+    # Recoverable errors (a truncated tail) stop the walk and are recorded;
+    # non-recoverable ones (bLength < 2, item flood) are refusals, because the
+    # walk cannot continue past them at all.
+    # Byte offset of the current descriptor within blob[18:]. walk_descriptors
+    # yields contiguous chunks, so accumulating their lengths tracks the
+    # position exactly -- and the position is what the wTotalLength check needs.
+    consumed = 0
+    tail = blob[18:]
 
-        # A zero length would spin us forever; a hostile device is entitled to
-        # send exactly that, so this guard is a security control, not paranoia.
-        if d_len < 2:
-            raise DescriptorParseError(
-                f"invalid bLength={d_len} at offset {offset}")
-        if offset + d_len > len(blob):
-            # Truncated tail: keep what we parsed rather than throwing it away.
-            break
-
-        chunk = blob[offset:offset + d_len]
-
-        if d_type == DESC_CONFIG and d_len >= 9:
-            (_l, _t, _total, n_ifaces, cfg_value, _i_cfg,
-             attrs, max_power) = struct.unpack(_CONFIG_FMT, chunk[:9])
-            current = ConfigDescriptor(
-                value=cfg_value,
-                num_interfaces=n_ifaces,
-                attributes=attrs,
-                max_power_ma=max_power * unit,
-                max_power_raw=max_power,
-                power_unit_ma=unit,
-            )
-            result.configs.append(current)
-
-        elif d_type == DESC_INTERFACE and d_len >= 9:
-            (_l, _t, i_num, i_alt, i_neps, i_cls,
-             i_sub, i_proto, _i_str) = struct.unpack(_IFACE_FMT, chunk[:9])
-            iface = InterfaceDescriptor(
-                number=i_num,
-                alternate=i_alt,
-                num_endpoints=i_neps,
-                interface_class=i_cls,
-                interface_subclass=i_sub,
-                interface_protocol=i_proto,
-            )
-            if current is None:
-                # Interface before any configuration: malformed, but we keep it
-                # in a synthetic config so the anomaly is visible downstream.
-                current = ConfigDescriptor(value=0, num_interfaces=0,
-                                           attributes=0, max_power_ma=0,
-                                           power_unit_ma=unit)
+    try:
+        for d_type, chunk in _safe.walk_descriptors(tail):
+            offset, consumed = consumed, consumed + len(chunk)
+            if d_type == DESC_CONFIG and len(chunk) >= 9:
+                (_l, _t, w_total, n_ifaces, cfg_value, _i_cfg,
+                 attrs, max_power) = struct.unpack(
+                     _CONFIG_FMT, _safe.take(chunk, 0, 9, "config descriptor"))
+                # wTotalLength counts THIS configuration descriptor and
+                # everything belonging to it, starting at this descriptor --
+                # not at the start of the blob. It was being compared against
+                # the length of the entire remaining blob, which is wrong in
+                # both directions and silently:
+                #
+                #   * with several configurations the comparison used the sum
+                #     of all of them, so an overstatement in any one config was
+                #     masked and the rule could effectively never fire;
+                #   * with one configuration it happened to be right, which is
+                #     why the mistake survived -- the single-config case is the
+                #     one anybody tests by hand.
+                #
+                # Measuring from this descriptor's own offset makes the number
+                # mean what the field means. A device that overstates it is
+                # describing data it did not send: harmless in itself, but the
+                # fingerprint of a descriptor set edited by hand rather than
+                # emitted by a vendor toolchain.
+                available = len(tail) - offset
+                overstated = w_total - available
+                if overstated > 0:
+                    result.length_overstated = max(result.length_overstated,
+                                                   overstated)
+                current = ConfigDescriptor(
+                    value=cfg_value,
+                    num_interfaces=n_ifaces,
+                    attributes=attrs,
+                    max_power_ma=max_power * unit,
+                    max_power_raw=max_power,
+                    power_unit_ma=unit,
+                )
                 result.configs.append(current)
-            current.interfaces.append(iface)
 
-        offset += d_len
+            elif d_type == DESC_INTERFACE and len(chunk) >= 9:
+                (_l, _t, i_num, i_alt, i_neps, i_cls,
+                 i_sub, i_proto, _i_str) = struct.unpack(
+                     _IFACE_FMT, _safe.take(chunk, 0, 9, "interface descriptor"))
+                iface = InterfaceDescriptor(
+                    number=i_num,
+                    alternate=i_alt,
+                    num_endpoints=i_neps,
+                    interface_class=i_cls,
+                    interface_subclass=i_sub,
+                    interface_protocol=i_proto,
+                )
+                if current is None:
+                    # Interface before any configuration: malformed, but we keep
+                    # it in a synthetic config so the anomaly stays visible.
+                    current = ConfigDescriptor(value=0, num_interfaces=0,
+                                               attributes=0, max_power_ma=0,
+                                               power_unit_ma=unit)
+                    result.configs.append(current)
+                current.interfaces.append(iface)
+    except _safe.DescriptorParsingError as exc:
+        if not exc.recoverable:
+            raise DescriptorParseError(str(exc)) from exc
+        result.truncated = str(exc)
 
     return result
 

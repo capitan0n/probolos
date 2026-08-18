@@ -193,11 +193,28 @@ def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
         if _os.path.exists(target):
             _os.chown(target, uid, gid)
             _os.chmod(target, 0o600)
-        # Stale temp files from an interrupted save would be root-owned and
-        # would block the atomic rename the ledger relies on.
-        tmp = _os.path.splitext(target)[0] + ".tmp"
-        if _os.path.exists(tmp):
-            _os.chown(tmp, uid, gid)
+        # Stale staging files from an interrupted save are root-owned and serve
+        # no purpose once their writer is gone. They are REMOVED rather than
+        # chowned: atomicio now stages under a unique, unguessable name, so a
+        # leftover can never collide with a future save and handing it to the
+        # analyzer would only leave clutter accumulating in a directory that is
+        # rewritten on every device attachment.
+        import fnmatch as _fnmatch
+        from .atomicio import temp_glob_for
+        pattern = temp_glob_for(target)
+        for name in _os.listdir(directory):
+            if not _fnmatch.fnmatch(name, pattern):
+                continue
+            stale = _os.path.join(directory, name)
+            try:
+                # lstat, and regular files only: a symlink left at a staging
+                # path is not ours to follow, and unlinking it is still the
+                # right move -- but stat'ing through it is not.
+                import stat as _stat
+                if _stat.S_ISREG(_os.lstat(stale).st_mode):
+                    _os.unlink(stale)
+            except OSError:
+                pass
         log(f"[privsep] state dir {directory} handed to uid {uid}")
     except OSError as exc:
         log(f"[privsep] could not prepare {directory}: {exc}\n"

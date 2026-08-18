@@ -7,8 +7,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "probolos"
-# Kept in one place; probolos/__init__.py reads this at runtime via importlib
-# metadata is NOT wired here, so bump both together until that is unified.
+# THE single source of truth for the version. probolos/__init__.py reads it
+# back through importlib.metadata rather than repeating it; the literal in that
+# file is a source-checkout fallback only and carries a "+source" suffix so the
+# two can never silently disagree again (they did: 0.5.1 vs 0.9.0).
 version = "0.9.0"
 description = "A deny-by-default USB admission gate for Linux"
 readme = "README.md"

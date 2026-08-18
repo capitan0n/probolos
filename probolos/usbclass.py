@@ -76,6 +76,9 @@ KIND_OTHER = "other"
 
 KIND_WIRELESS = "wireless"
 
+# The HID base class, named rather than repeated as 0x03 in six places.
+HID_CLASS = 0x03
+
 _KIND_BY_CLASS = {
     0x03: KIND_INPUT,
     0x08: KIND_STORAGE,
@@ -100,11 +103,14 @@ def describe_interface(cls: int, subcls: int, proto: int) -> str:
     We special-case HID because "keyboard" versus "mouse" is exactly the
     distinction a user needs in order to answer the confirmation prompt.
     """
-    if cls == 0x03:
+    if cls == HID_CLASS:
         # subclass 1 == boot interface subclass; only then is proto meaningful
         if subcls == 0x01 and proto in HID_BOOT_PROTOCOLS:
             return HID_BOOT_PROTOCOLS[proto]
-        return "HID (generic input device)"
+        # Worded as a question rather than a reassurance. "generic input
+        # device" reads like a verdict; this interface has not told us what it
+        # does, and it may well be a keyboard.
+        return "HID (kind undeclared — could be a keyboard)"
     detail = SUBCLASS_DETAIL.get((cls, subcls))
     if detail:
         return detail
@@ -113,15 +119,60 @@ def describe_interface(cls: int, subcls: int, proto: int) -> str:
 
 def is_keyboard(cls: int, subcls: int, proto: int) -> bool:
     """
-    True only for an interface that can actually type.
+    True only for an interface that DECLARES itself a boot keyboard.
 
-    This is deliberately narrow. The BadUSB threat is keystroke injection, so
-    the rule that matters keys on the boot-keyboard protocol rather than on HID
-    in general -- HID also covers mice, headset buttons, UPS units, and vendor
-    configuration channels, all of which are innocuous company for other
-    functions.
+    Deliberately narrow, and narrow in a way that must be understood before it
+    is relied on. It is a statement about what the device SAYS, and the answer
+    is only available for the boot-interface subclass.
     """
-    return cls == 0x03 and subcls == 0x01 and proto == 0x01
+    return cls == HID_CLASS and subcls == 0x01 and proto == 0x01
+
+
+def is_mouse(cls: int, subcls: int, proto: int) -> bool:
+    """True for an interface that declares itself a boot mouse."""
+    return cls == HID_CLASS and subcls == 0x01 and proto == 0x02
+
+
+def is_undeclared_hid(cls: int, subcls: int, proto: int) -> bool:
+    """
+    True for a HID interface that says nothing about what kind of input it is.
+
+    WHY THIS MATTERS MORE THAN IT LOOKS
+    -----------------------------------
+    is_keyboard() only ever fires on subclass 0x01, protocol 0x01. A device
+    that declares HID with subclass 0x00 and protocol 0x00 -- entirely legal,
+    and what a great many real peripherals do -- can still be a fully working
+    keyboard: Linux binds usbhid, reads the REPORT descriptor, finds Usage Page
+    0x01 / Usage 0x06 (Keyboard), and creates an evdev node that types.
+
+    Probolos cannot read that report descriptor. The sysfs `descriptors`
+    attribute carries the device and configuration descriptors, including the
+    HID class descriptor (0x21) -- which states the report descriptor's LENGTH
+    and not its contents. Fetching the contents needs a GET_DESCRIPTOR(REPORT)
+    control transfer to the interface, and issuing one means talking to a
+    device we are holding precisely because we have not decided to trust it.
+
+    So for these interfaces the honest answer is NOT "it is not a keyboard".
+    It is "we cannot tell". Treating that silence as innocence is what let two
+    zero bytes walk a composite storage+HID device past the CRITICAL rule the
+    whole tool is built around.
+
+    A declared mouse is excluded: it has answered the question, and a rule that
+    fires on every mouse is a rule that trains people to ignore the alarm.
+    """
+    if cls != HID_CLASS:
+        return False
+    return not (is_keyboard(cls, subcls, proto) or is_mouse(cls, subcls, proto))
+
+
+def may_type(cls: int, subcls: int, proto: int) -> bool:
+    """
+    True when this interface can inject keystrokes as far as anyone can tell
+    from the descriptors alone: a declared keyboard, or a HID interface that
+    declined to say.
+    """
+    return (is_keyboard(cls, subcls, proto)
+            or is_undeclared_hid(cls, subcls, proto))
 
 
 def kind_of(cls: int) -> str:

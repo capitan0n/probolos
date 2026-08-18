@@ -70,7 +70,8 @@ class Probolos:
                  inspect_storage: bool = True,
                  monitor=None,
                  lock_policy: str = session_mod.POLICY_QUEUE,
-                 agent=None):
+                 agent=None,
+                 close_race_window: bool = False):
         self.dry_run = dry_run
         self.timeout = timeout          # 0 == wait forever
         self.json_log = json_log
@@ -86,6 +87,14 @@ class Probolos:
         self.monitor = monitor or session_mod.AlwaysUnlocked()
         self.lock_policy = lock_policy
         self.agent = agent
+        # Opt-in, and off by default on purpose. Closing the grab race means
+        # switching driver binding off for the whole USB bus for the length of
+        # two sysfs writes (see deferred_bind.py). That is a real lockout risk
+        # on a machine whose keyboard is USB, and it is not a risk to take on
+        # the operator's behalf while the mechanism is still alpha. When it is
+        # off, _quarantine() says so rather than letting the user assume the
+        # window is closed.
+        self.close_race_window = close_race_window
         # Devices attached while the screen was locked. They are held blocked
         # and asked about when someone returns, so nobody has to unplug and
         # replug hardware just because they stepped away.
@@ -555,20 +564,37 @@ class Probolos:
         print(f"  >>> DO NOT TOUCH IT for the next {self.observe:.0f} seconds. <<<")
         print()
 
-        if deferred_bind.supported(dev.syspath):
-            # No race window: driver does not bind until we are ready
-            # to grab. Interfaces are held unbound, device powered on,
-            # then interfaces released after the monitor is listening.
-            db = deferred_bind.DeferredBind(dev.syspath, log=print)
-            return quarantine.quarantine(
-                dev.syspath,
-                authorize_fn=db.authorize_device,
-                release_fn=db.release_interfaces,
-                bind_context=db,
-                duration=self.observe,
-                capture=self.capture_payload,
-            )
-        # Fallback: kernel/device without interface authorization.
+        # The driverless-authorization path is opt-in. It is the only thing
+        # that actually removes the grab race, but it switches driver binding
+        # off for the whole USB bus for the length of two sysfs writes, and
+        # that is not a risk to take on someone's behalf by default.
+        #
+        # The fallback is announced. It used to be silent -- supported()
+        # returned False on every device for structural reasons and the daemon
+        # quietly took the racy path while the documentation claimed the window
+        # was closed. A security property that degrades without saying so is
+        # worse than one that was never claimed.
+        if self.close_race_window:
+            if deferred_bind.supported(dev.syspath):
+                db = deferred_bind.DeferredBind(dev.syspath, log=print)
+                return quarantine.quarantine(
+                    dev.syspath,
+                    authorize_fn=db.authorize_device,
+                    release_fn=db.release_interfaces,
+                    bind_context=db,
+                    duration=self.observe,
+                    capture=self.capture_payload,
+                )
+            print("  ! --close-race-window requested but unavailable: "
+                  f"{deferred_bind.unsupported_reason()}")
+            print("  ! falling back to authorize-then-grab; the exposure "
+                  "window below is real.")
+        else:
+            print("  Note: the driver binds before the grab, so a short "
+                  "exposure window applies.")
+            print("  It is measured and printed below. --close-race-window "
+                  "removes it (see SECURITY.md).")
+
         return quarantine.quarantine(
             dev.syspath,
             authorize_fn=lambda: sysfs.set_authorized(dev.syspath, 1),
@@ -701,6 +727,14 @@ class Probolos:
         return answer in ("y", "yes")
 
     def _record(self, decision: Decision, findings=()) -> None:
+        """
+        Persist one decision: to the ledger, then to the JSON audit log.
+
+        (The docstring used to sit BELOW the ledger block, where Python treats
+        it as a discarded string expression rather than documentation -- so the
+        method had none, and `help()` showed nothing for the one function that
+        writes both persistent stores.)
+        """
         # In dry-run we change nothing that persists, and the ledger is
         # persistent state. Recording a decision that was never actually made
         # would also poison the history with dry-run noise.
@@ -709,7 +743,8 @@ class Probolos:
             error = self.ledger.save()
             if error:
                 print(f"[!] could not write ledger: {error}")
-        """Append one JSON line. Audit trail first, pretty output second."""
+
+        # Audit trail first, pretty output second.
         if not self.json_log:
             return
         dev = decision.device
@@ -753,7 +788,8 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
           force_locked: Optional[bool] = None,
           agent_socket: Optional[Path] = None,
           agent_uid: Optional[int] = None,
-          agent_gid: Optional[int] = None) -> None:
+          agent_gid: Optional[int] = None,
+          close_race_window: bool = False) -> None:
     """Wire the gate, the safety net and the loop together."""
     policy = policy or safety.SafetyPolicy()
     link = None
@@ -800,11 +836,29 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
     # A panic file left behind by a previous run would fire the watchdog the
     # instant it starts, which looks like a malfunction rather than the
     # deliberate signal it is. Refuse clearly instead.
-    if policy.panic_file.exists() and not dry_run:
+    #
+    # lexists, not exists: exists() follows symlinks, so a DANGLING symlink at
+    # the panic path read as absent here while the watchdog -- which uses
+    # lstat -- saw it, refused it, and complained about it twice a second for
+    # the whole run. The two checks look at the same path and must agree about
+    # what is there; anything left at the path is the operator's to clear.
+    import os as _os
+    if _os.path.lexists(policy.panic_file) and not dry_run:
         raise SystemExit(
             f"A panic file already exists at {policy.panic_file}.\n"
             f"It would force the gate open immediately. Remove it first:\n"
             f"    rm {policy.panic_file}")
+
+    if close_race_window and not dry_run:
+        from . import deferred_bind
+        if deferred_bind.supported():
+            print("  - grab race: will be closed per device "
+                  "(drivers_autoprobe held at 0 for two writes)")
+        else:
+            print(f"[!] --close-race-window is not available here: "
+                  f"{deferred_bind.unsupported_reason()}")
+            print("    Devices will be observed with the exposure window open; "
+                  "it is measured and printed per device.")
 
     print("[*] Closing the USB authorization gate:")
     with gate.AuthorizationGate(dry_run=dry_run) as opened:
@@ -826,7 +880,8 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
                           capture_payload=capture_payload, watchdog=dog,
                           stop_event=stop_event, trust_store=trust_store,
                           inspect_storage=inspect_storage, monitor=monitor,
-                          lock_policy=lock_policy, agent=link)
+                          lock_policy=lock_policy, agent=link,
+                          close_race_window=close_race_window)
         engine.snapshot()
         try:
             engine.run()

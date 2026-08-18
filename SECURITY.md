@@ -5,6 +5,15 @@
 Open a GitHub issue for anything that is already public. For anything else,
 contact the maintainer directly before disclosing.
 
+## Scope of this document
+
+This file describes the **threat model**: what is being defended against and
+under what assumptions. For the feature-by-feature boundary — which capabilities
+are implemented and reachable, which exist in the tree but are not on any
+execution path, and which are merely under consideration — see
+[`CAPABILITIES.md`](CAPABILITIES.md). Where the two disagree, `CAPABILITIES.md`
+is the one kept current against the code.
+
 ## What Probolos is trying to stop
 
 An attacker with brief physical access who leaves behind, or persuades someone
@@ -89,10 +98,37 @@ configurable (`--observe`, `0` disables it).
 completing, keystrokes can reach the session. The window is measured and
 printed in every report. Measured on real hardware it is 41–85 ms, not the
 10–20 ms this document previously estimated; the figure is printed per device
-precisely because it is not a constant. It is eliminated, not merely
-narrowed, by moving to `drivers_autoprobe=0` plus interface-level
-authorization plus `libusb`, so that no `/dev/input` node is ever created. That
-is the intended architecture; the current one is a stopgap.
+precisely because it is not a constant.
+
+**Closing it is possible, and opt-in.** `--close-race-window` authorizes the
+device with no driver bound, by holding the bus-wide `drivers_autoprobe` switch
+at `0` across the two sysfs writes it takes to configure the device and mark its
+interfaces unbindable. The monitor is listening before any driver attaches, so
+there is no interval in which a keyboard can type — the window does not shrink,
+it ceases to exist.
+
+It is off by default for a reason worth stating plainly. Between those two
+writes, no USB device on the machine will auto-bind a driver. If the process is
+killed with `SIGKILL` in that span, that state persists until someone writes `1`
+back by hand — the lockout this document's gate section exists to prevent, in a
+worse form. An `atexit` restore is registered before the first write, the span
+contains no I/O to the device and no waiting on a human, and devices arriving
+during it are unaffected in practice (`authorized_default` is already `0`, so
+they are never configured and have no interfaces to bind). It is still a real
+risk on a machine whose keyboard is USB.
+
+The flag is refused under `--privsep`: `drivers_autoprobe` is bus-wide, so the
+gate has no device to scope the request to, and inventing a weaker scoping rule
+for the most dangerous operation in the codebase was not an acceptable trade.
+Pick one — bounded blast radius, or no exposure window.
+
+An earlier implementation of this claimed to close the window and did not: its
+capability check counted interface directories on a device held at
+`authorized=0`, where none exist, so it returned `False` on every device and the
+daemon fell back silently. The fallback is now announced, and the check has a
+regression test. If you are reading this to decide whether to trust the
+property: it has not yet been validated on real hardware. See
+`CAPABILITIES.md` §3.1.
 
 **Active interrogation can be a trigger.** The probes in `interrogate.py`
 deliberately send requests outside ordinary enumeration. A sophisticated

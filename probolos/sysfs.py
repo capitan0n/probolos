@@ -20,6 +20,13 @@ from . import descriptors, textsafe, usbclass
 
 USB_DEVICES = Path("/sys/bus/usb/devices")
 
+# Bus-wide driver binding controls. Unlike everything else in this module these
+# are NOT per-device: they belong to the whole usb bus_type, which is precisely
+# why touching them is dangerous and why deferred_bind holds them for the
+# shortest span it can. Module-level so tests can point them at a temp tree.
+DRIVERS_AUTOPROBE = Path("/sys/bus/usb/drivers_autoprobe")
+DRIVERS_PROBE = Path("/sys/bus/usb/drivers_probe")
+
 # Root hubs are named usb1, usb2, ... They are the controllers themselves, not
 # pluggable devices, and they are where authorized_default lives.
 _ROOT_HUB_RE = re.compile(r"^usb\d+$")
@@ -239,6 +246,12 @@ class _DirectBackend:
     """Writes sysfs directly. The original behaviour, used when running as root
     without privilege separation."""
 
+    # Bus-wide operations (drivers_autoprobe, drivers_probe) are available only
+    # when we hold real privilege. A backend that cannot offer them declares so
+    # here rather than failing at the point of use, because deferred_bind has to
+    # know BEFORE it starts whether the mechanism can complete.
+    supports_bus_wide = True
+
     def authorize(self, syspath: Path, value: int) -> None:
         (syspath / "authorized").write_text(str(value))
 
@@ -257,6 +270,12 @@ class _DirectBackend:
     def open_block(self, device_path) -> int:
         import os
         return os.open(str(device_path), os.O_RDONLY)
+
+    def set_drivers_autoprobe(self, value: int) -> None:
+        DRIVERS_AUTOPROBE.write_text(str(value))
+
+    def trigger_driver_probe(self, name: str) -> None:
+        DRIVERS_PROBE.write_text(name)
 
 
 _backend = _DirectBackend()
@@ -296,6 +315,47 @@ def set_authorized(syspath: Path, value: int) -> None:
 
 def get_authorized_default(hub: Path) -> Optional[int]:
     return read_int_attr(hub, "authorized_default")
+
+
+def backend_supports_bus_wide() -> bool:
+    """Whether the active backend will perform bus-wide driver operations."""
+    return bool(getattr(_backend, "supports_bus_wide", False))
+
+
+def get_drivers_autoprobe() -> Optional[int]:
+    """Current bus-wide autoprobe setting, or None if unreadable."""
+    try:
+        return int(DRIVERS_AUTOPROBE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def set_drivers_autoprobe(value: int) -> None:
+    """
+    Turn automatic driver binding for the WHOLE usb bus on (1) or off (0).
+
+    This is the only genuinely global switch Probolos ever writes, and it is
+    the mechanism that makes a driverless authorization possible: with it at 0,
+    the kernel creates a device's interfaces without probing a driver for them,
+    so no usbhid, no evdev node, and nothing for a keyboard to type into.
+
+    It is also the most dangerous thing in the codebase. Left at 0, no device
+    on the machine binds a driver -- the lockout gate.py exists to prevent, in a
+    worse form. Every caller must restore it, and deferred_bind registers an
+    atexit restore before it ever writes 0.
+    """
+    _backend.set_drivers_autoprobe(value)
+
+
+def trigger_driver_probe(name: str) -> None:
+    """
+    Ask the usb bus to probe drivers for one device or interface by name.
+
+    Needed because authorizing an interface does not, by itself, cause a rebind:
+    the kernel's interface_authorized_store() sets the flag and stops there.
+    Writing the name here is what actually makes usbhid attach.
+    """
+    _backend.trigger_driver_probe(name)
 
 
 def open_input_node(node_path) -> int:

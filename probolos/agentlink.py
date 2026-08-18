@@ -56,6 +56,17 @@ notification can be treated as a human decision:
        means anything that can open the socket can evict the running agent and
        become the thing that answers questions about hardware.
 
+       The liveness check that enforces this had a race of its own. It runs on
+       the accept thread and briefly puts the LIVE connection into non-blocking
+       mode; ask() runs on the main thread and is sitting in recv() on that
+       same socket. A connection attempt timed to land inside a question would
+       make ask()'s recv raise BlockingIOError -- an OSError, not a timeout --
+       which ask() reads as "the agent went away" and answers by dropping the
+       real agent and returning None. So merely CONNECTING repeatedly was
+       enough to cancel every question and evict the agent, which is the thing
+       this check exists to prevent. A question in flight is now itself proof
+       of life: the probe is skipped entirely while one is open.
+
     3. An answer cannot precede its question. Request ids counting from 1 let
        a client put replies into the buffer before anything is asked, so the
        first real device question resolves instantly from a value chosen by
@@ -214,6 +225,10 @@ class AgentLink:
         self._peer: Optional[tuple] = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        # How many questions are open on the current connection right now.
+        # Non-zero means the main thread is inside recv() on that socket, and
+        # the accept thread must not touch its blocking mode. See the header.
+        self._asking = 0
 
     # ---- lifecycle ----
 
@@ -221,7 +236,12 @@ class AgentLink:
         try:
             created_dir = not self.path.parent.exists()
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.exists():
+            # lexists, not exists: exists() follows symlinks, so a DANGLING
+            # symlink left at the socket path -- which anyone in the
+            # directory's group can plant -- reads as absent, is never
+            # unlinked, and makes bind() fail. The agent path would then be
+            # silently unavailable for the whole run.
+            if os.path.lexists(self.path):
                 self.path.unlink()
             self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._listener.bind(str(self.path))
@@ -328,6 +348,15 @@ class AgentLink:
             return
 
         with self._lock:
+            # A question in flight is proof of life that costs nothing to
+            # check, and checking it this way avoids poking at a socket the
+            # other thread is blocked on. Probing anyway is what let a
+            # connection attempt cancel a question and evict the agent.
+            if self._conn is not None and self._asking > 0:
+                self.log(f"[agent] REFUSED second agent from uid={uid} "
+                         f"pid={pid}: one is already connected and answering")
+                self._close(conn)
+                return
             if self._conn is not None and _still_connected(self._conn):
                 self.log(f"[agent] REFUSED second agent from uid={uid} "
                          f"pid={pid}: one is already connected")
@@ -404,6 +433,8 @@ class AgentLink:
 
         deadline = time.monotonic() + timeout
         buffer = b""
+        with self._lock:
+            self._asking += 1
         try:
             while True:
                 remaining = deadline - time.monotonic()
@@ -443,6 +474,8 @@ class AgentLink:
                     if answer is not None:
                         return answer
         finally:
+            with self._lock:
+                self._asking = max(0, self._asking - 1)
             # Leave the socket as the accept path set it up, whatever exit was
             # taken, so the next question does not inherit a shrunken timeout.
             try:
