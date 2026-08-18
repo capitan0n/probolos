@@ -228,7 +228,7 @@ report anything that surprises you. Known open items are tracked in
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+GPLv3 — see [`LICENSE`](LICENSE).
 
 Note the warranty disclaimer in particular: this is alpha, security-relevant
 software provided as-is. You are responsible for what you run it on.
