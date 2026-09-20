@@ -181,15 +181,28 @@ class Notifier:
         return False
 
     def close(self, notification_id: int) -> None:
+        """
+        Best-effort. Tidying up a notification must never cost an answer.
+
+        This is called from the `finally` of _decide(), after the user has
+        already chosen. An unhandled TimeoutExpired or OSError from gdbus there
+        replaced the return value with an exception, so a hung or missing
+        notification daemon discarded a decision the human had just made -- and
+        the device stayed blocked with no explanation. A stale notification
+        left on screen is the strictly smaller problem.
+        """
         if not self._gdbus:
             return
-        subprocess.run(
-            [self._gdbus, "call", "--session",
-             "--dest", "org.freedesktop.Notifications",
-             "--object-path", "/org/freedesktop/Notifications",
-             "--method", "org.freedesktop.Notifications.CloseNotification",
-             str(notification_id)],
-            capture_output=True, timeout=5)
+        try:
+            subprocess.run(
+                [self._gdbus, "call", "--session",
+                 "--dest", "org.freedesktop.Notifications",
+                 "--object-path", "/org/freedesktop/Notifications",
+                 "--method", "org.freedesktop.Notifications.CloseNotification",
+                 str(notification_id)],
+                capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 class Agent:

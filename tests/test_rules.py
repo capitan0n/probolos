@@ -153,9 +153,9 @@ class TestDetection(unittest.TestCase):
 
     def test_mouse_with_storage_is_not_the_keyboard_rule(self):
         """
-        A mouse cannot type. The critical rule keys on keyboard protocol, so a
-        storage + mouse device must not raise the BadUSB alarm -- though it is
-        still an odd combination and should say so more quietly.
+        A claimed mouse is not a declared keyboard, but its unread report
+        descriptor may contain keyboard usages. The existing conservative
+        storage/HID rule must still apply to this combination.
         """
         dev = FakeDevice("1234", "5678", "Generic", "Combo", "480",
                          build((0x08, 0x06, 0x50), (0x03, 0x01, 0x02)))
@@ -163,8 +163,9 @@ class TestDetection(unittest.TestCase):
         ids = [f.rule_id for f in findings]
 
         self.assertNotIn("storage-with-keyboard", ids)
+        self.assertIn("storage-with-undeclared-hid", ids)
         self.assertIn("multiple-distinct-functions", ids)
-        self.assertEqual(rules.worst(findings), rules.Severity.NOTICE)
+        self.assertEqual(rules.worst(findings), rules.Severity.CRITICAL)
 
     def test_unreadable_descriptors_is_a_finding(self):
         dev = FakeDevice("1234", "5678", None, None, "480", None,

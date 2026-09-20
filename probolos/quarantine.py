@@ -94,6 +94,7 @@ INPUT_EVENT_SIZE = struct.calcsize(INPUT_EVENT_FORMAT)
 EV_KEY = 0x01
 EV_REL = 0x02
 EV_ABS = 0x03
+MAX_EVENTS = 65536
 
 
 def _grab(fd: int) -> None:
@@ -151,6 +152,11 @@ class Observation:
     button_presses: int = 0         # mouse clicks: normal, never suspicious
     motion_events: int = 0
     error: Optional[str] = None
+    limit_reached: bool = False
+    # Set when the device could NOT be put back to authorized=0 after the
+    # observation. This is the one failure mode where the report must not read
+    # as a normal quarantine: the device is still live and unwatched.
+    reblock_error: Optional[str] = None
 
     @property
     def observed(self) -> bool:
@@ -204,157 +210,146 @@ def find_input_nodes(usb_syspath: Path, context=None) -> List[str]:
 
 
 def quarantine(usb_syspath: Path, authorize_fn, duration: float = 3.0,
-               settle_timeout: float = 2.0,
-               capture: bool = False,
-               release_fn=None, bind_context=None) -> Observation:
-    """
-    Authorize the device, immediately isolate its input nodes, and watch.
+               settle_timeout: float = 2.0, capture: bool = False,
+               release_fn=None, bind_context=None, deauthorize_fn=None) -> Observation:
+    """Observe temporarily, then block BEFORE releasing any input grab.
 
-    `authorize_fn` is injected rather than called directly so that the caller
-    keeps ownership of the authorization decision, and so this function can be
-    exercised in tests without touching /sys.
+    Monitoring a udev event is asynchronous: neither this function nor deferred
+    binding eliminates the interval between driver binding and EVIOCGRAB.
     """
     obs = Observation(duration=duration, capture=capture)
-
     if not available():
-        obs.error = ("python-pyudev is required "
-                     "(Manjaro: sudo pacman -S python-pyudev)")
+        obs.error = "python-pyudev is required"
         return obs
-
     ctx = pyudev.Context()
-
-    # Start listening BEFORE authorizing. Every millisecond spent setting up
-    # the monitor after authorization would be a millisecond of exposure.
     monitor = pyudev.Monitor.from_netlink(ctx)
     monitor.filter_by(subsystem="input")
     monitor.start()
-
-    cm = bind_context if bind_context is not None else _null_context()
-    with cm:
-        authorized_at = time.monotonic()
-        authorize_fn()                 # device on; interfaces still 0
-        if release_fn is not None:
-            release_fn()               # now drivers bind, nodes appear
-
     devices = []
-    deadline = authorized_at + settle_timeout
-    seen: set = set()
+    seen = set()
+    deauthorize = deauthorize_fn or (lambda: sysfs.set_authorized(usb_syspath, 0))
+    cm = bind_context if bind_context is not None else _null_context()
+    authorized_at = time.monotonic()
+    wall_start = time.time()
 
-    # Grab each node the instant it appears, rather than waiting for the whole
-    # device to settle and then grabbing them all.
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        udev_dev = monitor.poll(timeout=max(0.01, min(0.2, remaining)))
-        if udev_dev is not None and udev_dev.action != "add":
-            continue
-
-        _nodes_now = find_input_nodes(usb_syspath, ctx)
-        if _nodes_now and obs.first_node_at == 0.0:
-            # The instant a live node first exists: the exposure window
-            # opens here, not at authorization. With deferred bind this
-            # is ~50 ms after authorize (enumeration), but the grab
-            # follows within a poll tick, so exposure stays near zero.
-            obs.first_node_at = time.monotonic()
-        for node in _nodes_now:
+    def discover():
+        # Keep discovering throughout collection. A second HID node can appear
+        # after the first has already been grabbed.
+        for node in find_input_nodes(usb_syspath, ctx):
             if node in seen:
                 continue
             seen.add(node)
             obs.nodes.append(node)
+            if not obs.first_node_at:
+                obs.first_node_at = time.monotonic()
             fd = None
             try:
-                # Opening goes through the backend: direct when running as a
-                # single root process, or a request to the gate under privsep,
-                # which returns an already-open read-only descriptor.
                 fd = sysfs.open_input_node(node)
                 _grab(fd)
                 devices.append(fd)
                 obs.grabbed.append(node)
-                if obs.race_window == 0.0:
-                    _now = time.monotonic()
-                    obs.race_window = _now - authorized_at
-                    # Exposure = how long a live node existed before we
-                    # grabbed it. This is the number that actually matters:
-                    # near zero means keystrokes had no window to land.
-                    if obs.first_node_at > 0.0:
-                        obs.exposure_window = _now - obs.first_node_at
+                if not obs.race_window:
+                    now = time.monotonic()
+                    obs.race_window = now - authorized_at
+                    obs.exposure_window = now - obs.first_node_at
             except OSError as exc:
                 obs.grab_failures.append(f"{node}: {exc}")
-                # The open can succeed and the EVIOCGRAB still fail -- another
-                # process already holds the grab, most commonly. The descriptor
-                # was then never added to `devices`, so the cleanup loop at the
-                # bottom never saw it and it leaked for the life of the daemon,
-                # once per ungrabbable node per attachment. Worse than a leak:
-                # an open input fd this process is not reading from and cannot
-                # release is precisely the thing quarantine promises it never
-                # holds.
+                obs.error = "input isolation failed; observation stopped"
                 if fd is not None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-
-        # Once we hold something, stop waiting for stragglers: extra dwell here
-        # is pure exposure. Late-appearing nodes are noted as ungrabbed below.
-        if devices and udev_dev is None:
-            break
-
-    if not devices:
-        obs.error = obs.error or "no input nodes appeared; nothing to observe"
-        return obs
+                    os.close(fd)
+                return False
+        return True
 
     try:
-        _collect(devices, obs, duration)
+        with cm:
+            authorize_fn()
+            if release_fn is not None:
+                release_fn()
+        deadline = time.monotonic() + settle_timeout
+        while time.monotonic() < deadline:
+            if not discover():
+                return obs
+            if devices:
+                break
+            monitor.poll(timeout=min(0.05, max(0, deadline - time.monotonic())))
+        if not devices:
+            obs.error = "no input nodes appeared; nothing to observe"
+            return obs
+        _collect(devices, obs, duration, discover=discover, wall_start=wall_start)
+        return obs
     finally:
-        # Releasing is best-effort: closing the fd releases the grab anyway,
-        # which is also why a crash can never leave a keyboard captured.
-        for fd in devices:
-            _ungrab(fd)
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        # Covers failed authorization, driver probing, discovery, collection,
+        # signals and ordinary completion. Never wait for human input here.
+        #
+        # The re-block is REPORTED, never raised. Letting the OSError out was a
+        # fail-open: `quarantine()` is called from `Daemon._on_add`, which the
+        # udev poll loop invokes with no handler, so the single most ordinary
+        # event on a machine -- someone pulling the device out during the three
+        # observation seconds -- produced ENODEV here and killed the daemon.
+        # From that moment nothing is gated at all, which is precisely the
+        # state deny-by-default exists to prevent. The failure still has to be
+        # loud, because a device left authorized is the dangerous case, so it
+        # is recorded on the Observation and the rules turn it into a finding.
+        try:
+            deauthorize()
+        except OSError as exc:
+            obs.reblock_error = str(exc)
+        finally:
+            for fd in devices:
+                _ungrab(fd)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
-    return obs
 
-
-def _collect(fds, obs: Observation, duration: float) -> None:
-    """Read events from the grabbed descriptors for `duration` seconds."""
+def _collect(fds, obs: Observation, duration: float, discover=None,
+             wall_start=None) -> None:
+    """Drain grabbed nodes while discovering late nodes under the same deadline."""
     import select
-
-    live = set(fds)
     start = time.monotonic()
+    wall_start = time.time() if wall_start is None else wall_start
     end = start + duration
-
-    while live:
-        remaining = end - time.monotonic()
-        if remaining <= 0:
-            break
-        ready, _, _ = select.select(list(live), [], [], remaining)
+    gone = set()
+    while time.monotonic() < end:
+        if discover is not None and not discover():
+            return
+        live = set(fds) - gone
+        if not live:
+            return
+        ready, _, _ = select.select(list(live), [], [],
+                                     min(0.05, max(0, end - time.monotonic())))
         for fd in ready:
             try:
                 data = os.read(fd, INPUT_EVENT_SIZE * 64)
             except BlockingIOError:
                 continue
             except OSError:
-                # Device yanked out mid-observation. Not an error: unplugging
-                # is a perfectly normal thing for a person to do.
-                live.discard(fd)
+                gone.add(fd)
                 continue
             if not data:
-                live.discard(fd)
+                gone.add(fd)
                 continue
-            # A read can return several events; they are fixed-size records.
             for offset in range(0, len(data) - INPUT_EVENT_SIZE + 1,
                                 INPUT_EVENT_SIZE):
-                _sec, _usec, etype, code, value = struct.unpack(
-                    INPUT_EVENT_FORMAT,
-                    data[offset:offset + INPUT_EVENT_SIZE])
-                _record_event(etype, code, value, obs, start)
+                sec, usec, etype, code, value = struct.unpack(
+                    INPUT_EVENT_FORMAT, data[offset:offset + INPUT_EVENT_SIZE])
+                # evdev defaults to CLOCK_REALTIME. Use the kernel event time,
+                # not the time Python drains a batch of queued events.
+                event_offset = max(0.0, sec + usec / 1_000_000 - wall_start)
+                _record_event(etype, code, value, obs, start,
+                              event_offset=event_offset)
+                if obs.limit_reached:
+                    return
 
 
 def _record_event(etype: int, code: int, value: int,
-                  obs: Observation, start: float) -> None:
-    offset = time.monotonic() - start
+                  obs: Observation, start: float, event_offset=None) -> None:
+    if len(obs.key_presses) >= MAX_EVENTS or len(obs.raw_events) >= MAX_EVENTS:
+        obs.limit_reached = True
+        obs.error = "event limit reached; observation stopped"
+        return
+    offset = (time.monotonic() - start if event_offset is None else event_offset)
     if etype == EV_KEY and value == 1:
         # value 1 == key down. Releases and auto-repeats are excluded so the
         # timing statistics measure intent, not key-hold duration.

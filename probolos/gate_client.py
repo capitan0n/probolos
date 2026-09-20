@@ -14,6 +14,7 @@ from __future__ import annotations
 import array
 import os
 import socket
+import threading
 from typing import Optional
 
 from . import protocol
@@ -37,8 +38,20 @@ class GateError(OSError):
 class GateClient:
     def __init__(self, sock: socket.socket):
         self.sock = sock
+        self._lock = threading.RLock()
 
     def _round_trip(self, req: protocol.Request, expect_fd: bool = False):
+        # Watchdog and daemon share this socket; replies must not cross threads.
+        with self._lock:
+            try:
+                return self._exchange(req, expect_fd)
+            except BaseException:
+                # A signal can interrupt after send but before recv. Never
+                # consume that stale response as the next operation's reply.
+                self.sock.close()
+                raise
+
+    def _exchange(self, req, expect_fd=False):
         self.sock.sendmsg([req.encode()])
         if expect_fd:
             return self._recv_with_fd()
@@ -69,6 +82,12 @@ class GateClient:
     def ping(self) -> bool:
         resp, _ = self._round_trip(protocol.Request(protocol.REQ_PING))
         return resp.ok
+
+    def admit(self, syspath, instance) -> None:
+        resp, _ = self._round_trip(protocol.Request(
+            protocol.REQ_ADMIT, path=str(syspath), value=1, instance=instance))
+        if not resp.ok:
+            raise GateError(f"admit failed: {resp.status}: {resp.detail}")
 
     def authorize(self, syspath, value: int) -> None:
         resp, _ = self._round_trip(protocol.Request(
@@ -135,6 +154,9 @@ class GateBackend:
 
     def __init__(self, client: "GateClient"):
         self.client = client
+
+    def admit(self, syspath, instance) -> None:
+        self.client.admit(syspath, instance)
 
     def authorize(self, syspath, value: int) -> None:
         self.client.authorize(syspath, value)

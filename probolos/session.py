@@ -121,8 +121,26 @@ class LogindMonitor(SessionMonitor):
     # ---- internals ----
 
     def _run(self, *args) -> str:
-        result = subprocess.run([self._binary, *args],
-                                capture_output=True, text=True, timeout=3)
+        """
+        One loginctl call. Never raises.
+
+        The handling used to sit around `_graphical_sessions()` only, which
+        left `_locked_hint()` -- called from the loop BELOW that try -- able to
+        raise TimeoutExpired straight out of `is_locked()`. That call happens
+        once a second from the daemon's main poll loop and once per device in
+        `_on_add`, so a loginctl that wedged for more than three seconds (a
+        stuck system bus, a hung session manager) did not degrade the lock
+        policy: it killed the daemon and opened the gate.
+
+        An empty string means "could not tell", which is exactly what the
+        callers already treat as unknown, so the policy degrades to its
+        documented fail-visible default instead.
+        """
+        try:
+            result = subprocess.run([self._binary, *args],
+                                    capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return ""
         return result.stdout if result.returncode == 0 else ""
 
     def _graphical_sessions(self):

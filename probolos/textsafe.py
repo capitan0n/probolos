@@ -76,6 +76,26 @@ NOTE_BIDI = "bidi-overrides"
 NOTE_INVISIBLE = "invisible-characters"
 NOTE_TRUNCATED = "over-length"
 NOTE_UNDECODABLE = "undecodable-bytes"
+NOTE_STACKED_MARKS = "stacked-combining-marks"
+
+# How many combining marks may follow one base character.
+#
+# Combining marks (Unicode category Mn/Mc/Me) occupy ZERO terminal columns, so
+# display_width() and fit() -- which exist to stop a device from pushing the
+# border of the report box off the line -- count a string of two hundred of
+# them as costing nothing and let all of them through. The terminal does not
+# agree: they stack on the preceding glyph and spill into the lines ABOVE and
+# BELOW, which is the same "the report no longer looks like a report" outcome
+# the width handling was written to prevent, reached by the one route it does
+# not measure.
+#
+# Three is past anything a real script needs (Vietnamese and Thai peak at two
+# per base; the ceiling here is deliberately generous). Legitimate names are
+# unaffected, and a name that is not is both escaped AND reported -- no device
+# fills its product string with combining marks by accident, so this is one of
+# the stronger single indications that a descriptor was written rather than
+# generated.
+MAX_COMBINING_RUN = 3
 
 
 @dataclass
@@ -132,13 +152,31 @@ def sanitize(value, limit: int = MAX_LENGTH) -> Sanitized:
     out: List[str] = []
     used = 0
     truncated = False
+    combining_run = 0
     for char in text:
         category = unicodedata.category(char)
+
+        # Track how many marks have stacked on the current base character. A
+        # mark is escaped only once the run is past what any real script uses,
+        # so accented text stays readable and a Zalgo string becomes visible
+        # as what it is.
+        if category in ("Mn", "Mc", "Me"):
+            combining_run += 1
+        else:
+            combining_run = 0
+
+        # Checked BEFORE the category rules below so the shared length budget
+        # at the bottom of the loop applies to these escapes too. Falling
+        # through with a token, rather than appending here, is what keeps the
+        # "never cut through the middle of an escape" guarantee intact.
+        if combining_run > MAX_COMBINING_RUN:
+            notes.append(NOTE_STACKED_MARKS)
+            token = _escape(char)
 
         # Cc is C0 and C1 control characters: ESC, CR, BS, NUL and the 0x80-9f
         # range that some terminals still interpret. This is the class that
         # lets a device redraw the screen above the prompt.
-        if category == "Cc":
+        elif category == "Cc":
             notes.append(NOTE_CONTROL)
             token = _escape(char)
         elif char in _BIDI:

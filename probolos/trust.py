@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -102,7 +103,11 @@ class TrustedDevice:
             # is not a timestamp.
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return None
-            return float(value)
+            try:
+                converted = float(value)
+            except (ValueError, OverflowError):
+                return None
+            return converted if math.isfinite(converted) else None
 
         entry_key = as_str(raw.get("key"))
         identity = as_str(raw.get("identity"))
@@ -167,6 +172,8 @@ class TrustStore:
     # ---------- persistence ----------
 
     def load(self) -> None:
+        self.devices.clear()
+        self.load_error = None
         if not self.path.exists():
             return
 
@@ -189,19 +196,27 @@ class TrustStore:
             return
 
         try:
-            data = json.loads(self.path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
+            from .securefs import read_json_file
+            data = read_json_file(self.path, trusted=True)
+        except (OSError, ValueError, UnicodeError, RecursionError) as exc:
             # Fail CLOSED: an unreadable trust store means nothing is trusted,
             # so every device is asked about. The opposite default -- trusting
             # everything when the file is corrupt -- would turn a damaged file
             # into an open door.
             self.load_error = str(exc)
             return
+        if not isinstance(data, dict):
+            self.load_error = "state file is not a JSON object"
+            return
         if data.get("schema") != SCHEMA_VERSION:
             self.load_error = f"unsupported trust schema {data.get('schema')}"
             return
+        devices = data.get("devices", {})
+        if not isinstance(devices, dict):
+            self.load_error = "trust devices is not a JSON object"
+            return
         skipped = 0
-        for key, raw in (data.get("devices") or {}).items():
+        for key, raw in devices.items():
             entry = TrustedDevice.from_raw(key, raw)
             if entry is None:
                 # Skipped, never trusted. Counted rather than silently dropped:

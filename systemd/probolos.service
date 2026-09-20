@@ -31,7 +31,7 @@ RestartSec=5
 ProtectSystem=strict
 ProtectHome=yes
 StateDirectory=probolos
-StateDirectoryMode=0700
+StateDirectoryMode=0755
 RuntimeDirectory=probolos
 RuntimeDirectoryMode=0750
 # /sys must be writable: the entire mechanism is writing `authorized` and
@@ -61,10 +61,10 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_SETUID CAP_SETGID CAP_FOWNER
 AmbientCapabilities=
 
-# Network: Probolos has no reason to speak to anything. Removing this entirely
-# means an analyzer compromise cannot exfiltrate what it observed.
-PrivateNetwork=yes
-RestrictAddressFamilies=AF_UNIX
+# pyudev needs AF_NETLINK in the host network namespace to receive uevents.
+# INET sockets are still excluded and IP traffic is denied below.
+PrivateNetwork=no
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 IPAddressDeny=any
 
 # Namespaces and execution

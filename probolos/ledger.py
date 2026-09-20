@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -132,7 +133,11 @@ class Entry:
             # needed: a JSON `true` is not a timestamp.
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return None
-            return float(value)
+            try:
+                converted = float(value)
+            except (ValueError, OverflowError):
+                return None
+            return converted if math.isfinite(converted) else None
 
         def as_str_list(value) -> List[str]:
             # Individual bad elements are dropped, not the whole list: a
@@ -208,15 +213,21 @@ class Ledger:
     # ---------- persistence ----------
 
     def load(self) -> None:
+        self.entries.clear()
+        self.load_error = None
         if not self.path.exists():
             return
         try:
-            data = json.loads(self.path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
+            from .securefs import read_json_file
+            data = read_json_file(self.path)
+        except (OSError, ValueError, UnicodeError, RecursionError) as exc:
             # A corrupt ledger must not stop the gate from working. Losing
             # history is an inconvenience; refusing to admit a keyboard because
             # a JSON file is malformed is a lockout.
             self.load_error = f"{exc}"
+            return
+        if not isinstance(data, dict):
+            self.load_error = "state file is not a JSON object"
             return
         if data.get("schema") != SCHEMA_VERSION:
             self.load_error = f"unsupported ledger schema {data.get('schema')}"

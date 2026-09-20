@@ -97,129 +97,78 @@ def drop_privileges(uid: int, gid: int) -> None:
 #
 # So the launcher refuses instead of chowning. The cost of refusing is that the
 # analyzer keeps no history; the cost of not refusing is the machine.
-STATE_ROOTS = ("/var/lib/probolos", "/run/probolos")
+STATE_ROOTS = ("/var/lib/probolos/state", "/run/probolos/state")
 
 
 def _within_allowed_root(directory: str) -> bool:
-    """
-    True if `directory` is one of STATE_ROOTS or lies beneath one.
-
-    realpath first, so that --ledger /var/lib/probolos/../../etc/x.json is
-    judged as /etc rather than as something under /var/lib/probolos. The
-    separator is appended before the prefix comparison so that a sibling named
-    /var/lib/probolos-evil does not match a root it merely starts with.
-    """
-    resolved = os.path.realpath(directory)
-    for root in STATE_ROOTS:
-        root = os.path.realpath(root)
-        if resolved == root or resolved.startswith(root + os.sep):
-            return True
-    return False
+    # Lexical scope plus open_directory's component-by-component O_NOFOLLOW.
+    # Resolving the allowlisted root itself would let a symlink redefine it.
+    directory = os.path.abspath(directory)
+    return any(directory == os.path.abspath(root)
+               or directory.startswith(os.path.abspath(root) + os.sep)
+               for root in STATE_ROOTS)
 
 
 def prepare_trust_readable(path, log=print) -> None:
-    """
-    Let the analyzer READ the trust store without being able to write it.
-
-    The trust store stays root-owned in a root-owned directory (see
-    ledger.default_path for why that separation exists). But the analyzer still
-    has to consult it to know whether a device was remembered, and it runs as
-    an unprivileged account -- so the file itself is made world-readable while
-    its directory stays root-only-writable.
-
-    That trade is deliberate and worth stating: the contents are device
-    identities and labels, not secrets, and anyone who can read /var/lib can
-    already see which devices exist. What must not leak is WRITE access, and
-    that is what the directory ownership protects.
-    """
-    import os as _os
-    target = str(path)
-    if not _os.path.exists(target):
-        return
+    """Make only the pinned, regular trust file readable; never follow links."""
+    from pathlib import Path
+    from .securefs import open_directory, open_regular_at
+    path = Path(path)
+    directory_fd = fd = None
     try:
-        _os.chmod(target, 0o644)
+        directory_fd = open_directory(path.parent)
+        fd = open_regular_at(directory_fd, path.name)
+        if os.fstat(fd).st_uid != os.geteuid():
+            raise OSError("trust file is not owned by the preparing account")
+        os.fchmod(fd, 0o644)
+    except FileNotFoundError:
+        return
     except OSError as exc:
-        log(f"[privsep] could not make {target} readable by the analyzer: "
-            f"{exc}\n[privsep] remembered devices will be asked about again.")
+        log(f"[privsep] REFUSING to change trust permissions: {exc}")
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
-    """
-    Make a state directory writable by the analyzer, before privilege drops.
-
-    The analyzer runs as an unprivileged user and cannot create or write
-    /var/lib/probolos, which is root-owned. Rather than routing ledger writes
-    through the privileged gate -- which would mean putting file I/O and a
-    serialisation format inside the trusted process, exactly what the split
-    exists to avoid -- the launcher hands ownership of one directory to the
-    analyzer while it still can.
-
-    REFUSES in two cases, both before any side effect:
-
-      * a directory outside STATE_ROOTS. Chowning an arbitrary parent to an
-        unprivileged account is a one-typo way to destroy a running system.
-      * a directory that holds a trust store. Whoever can write a directory
-        can unlink and replace any file in it regardless of that file's own
-        owner, so handing over a directory containing trusted.json would
-        silently hand over trust itself -- the exact escalation this split
-        exists to prevent.
-    """
-    import os as _os
-    directory = _os.path.dirname(_os.path.abspath(str(path)))
-
-    # Checked BEFORE anything is created or chowned. Both guards must run
-    # before the first side effect: refusing after makedirs would already have
-    # left a directory behind in a place that was never allowed.
-    if not _within_allowed_root(directory):
-        log(f"[privsep] REFUSING to hand {directory} to uid {uid}: state "
-            f"files must live under one of {', '.join(STATE_ROOTS)}.\n"
-            f"[privsep] chowning it would give an unprivileged account "
-            f"ownership of a directory the system depends on. Continuing "
-            f"without device history.")
+    """Hand over a dedicated state directory using pinned descriptors only."""
+    from pathlib import Path
+    from .securefs import open_directory, open_regular_at
+    path = Path(os.path.abspath(path))
+    if not _within_allowed_root(str(path.parent)):
+        log(f"[privsep] REFUSING to hand {path.parent} to uid {uid}: "
+            f"state must be under {', '.join(STATE_ROOTS)}")
         return
-
-    if _os.path.exists(_os.path.join(directory, "trusted.json")):
-        log(f"[privsep] REFUSING to hand {directory} to uid {uid}: it holds a "
-            f"trust store, and directory write access would allow replacing "
-            f"it. The ledger belongs in its own subdirectory.")
-        return
+    directory_fd = fd = None
     try:
-        _os.makedirs(directory, exist_ok=True)
-        _os.chown(directory, uid, gid)
-        # The directory must also be traversable and writable by the owner;
-        # a previous root-only run may have left tighter bits.
-        _os.chmod(directory, 0o700)
-        target = str(path)
-        if _os.path.exists(target):
-            _os.chown(target, uid, gid)
-            _os.chmod(target, 0o600)
-        # Stale staging files from an interrupted save are root-owned and serve
-        # no purpose once their writer is gone. They are REMOVED rather than
-        # chowned: atomicio now stages under a unique, unguessable name, so a
-        # leftover can never collide with a future save and handing it to the
-        # analyzer would only leave clutter accumulating in a directory that is
-        # rewritten on every device attachment.
-        import fnmatch as _fnmatch
-        from .atomicio import temp_glob_for
-        pattern = temp_glob_for(target)
-        for name in _os.listdir(directory):
-            if not _fnmatch.fnmatch(name, pattern):
-                continue
-            stale = _os.path.join(directory, name)
-            try:
-                # lstat, and regular files only: a symlink left at a staging
-                # path is not ours to follow, and unlinking it is still the
-                # right move -- but stat'ing through it is not.
-                import stat as _stat
-                if _stat.S_ISREG(_os.lstat(stale).st_mode):
-                    _os.unlink(stale)
-            except OSError:
-                pass
-        log(f"[privsep] state dir {directory} handed to uid {uid}")
+        directory_fd = open_directory(path.parent, create=True)
+        try:
+            os.stat("trusted.json", dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError("directory holds a trust store")
+        try:
+            fd = open_regular_at(directory_fd, path.name)
+        except FileNotFoundError:
+            pass
+        # Validate the file before making ANY ownership changes. fchown and
+        # fchmod act on what was opened, even if its name is swapped meanwhile.
+        if fd is not None:
+            os.fchown(fd, uid, gid)
+            os.fchmod(fd, 0o600)
+        os.fchown(directory_fd, uid, gid)
+        os.fchmod(directory_fd, 0o700)
+        log(f"[privsep] state dir {path.parent} handed to uid {uid}")
     except OSError as exc:
-        log(f"[privsep] could not prepare {directory}: {exc}\n"
-            f"[privsep] the analyzer will not be able to keep device history. "
-            f"Fix with: sudo chown -R {uid}:{gid} {directory}")
+        log(f"[privsep] REFUSING unsafe state preparation for {path}: {exc}")
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def start(analyzer_main, drop_to: str = "nobody", log=print,
@@ -294,10 +243,29 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
 
     log(f"[privsep] gate running as root (pid {os.getpid()}), "
         f"analyzer as {drop_to} (pid {pid})")
+    # The gate is not allowed to take the reap with it. os.waitpid() used to
+    # sit AFTER this block with nothing catching an exception from the gate,
+    # so anything that escaped run_gate() -- EPIPE from a reply to an analyzer
+    # that had just exited was the realistic one -- skipped the wait entirely:
+    # the root process died with a traceback, the analyzer child was orphaned,
+    # and the exit status nobody collected was reported to the operator as a
+    # crash rather than as the ordinary shutdown it was.
+    gate_error = None
     try:
         gate_server.run_gate(parent_sock, log=log)
+    except Exception as exc:   # noqa: BLE001 -- reap first, re-raise never
+        gate_error = exc
     finally:
         parent_sock.close()
 
-    _pid, status = os.waitpid(pid, 0)
-    return os.waitstatus_to_exitcode(status)
+    if gate_error is not None:
+        log(f"[privsep] the gate stopped with an error: {gate_error!r}")
+
+    try:
+        _pid, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        # Already reaped (a SIGCHLD handler installed elsewhere, or the child
+        # was inherited away). Nothing left to wait for.
+        return 1 if gate_error is not None else 0
+    code = os.waitstatus_to_exitcode(status)
+    return code if code else (1 if gate_error is not None else 0)

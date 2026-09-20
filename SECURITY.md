@@ -56,79 +56,46 @@ and then admits a keyboard over the air, with no USB event at all.
 
 These are real and are not hidden:
 
-**Privilege separation exists (`--privsep`), but is not yet the default.**
-With `--privsep`, a small root gate (`gate_server.py`, the only privileged
-code) does nothing but write `authorized`/`authorized_default` and open input
-nodes read-only, passing the file descriptors to an unprivileged analyzer over
-`SCM_RIGHTS`. The analyzer — all rules, timing, ledger, payload work — runs as
-`nobody` and can regain no privilege; the drop is verified, including that
-`setuid(0)` fails afterwards. A bug in any analyzer is then a bug in an
-unprivileged process, not a root compromise.
+**Privilege separation is optional.** With `--privsep`, the analyzer runs as
+`nobody`; the root gate handles sysfs writes and read-only device descriptors.
+Startup preparation and protocol/cleanup code also belong to the privileged
+boundary. A dedicated service account is preferable to shared `nobody`.
 
-What this does and does not buy: it bounds the blast radius of a compromised
-analyzer to the analyzer's own (minimal) privileges. It does NOT stop the
-analyzer from reading keystrokes it is entitled to read during quarantine —
-that is bounded instead by the "never on an authorized device" invariant.
+**Temporary activation and admission are different operations.** The gate can
+open input/block nodes belonging to a blocked peripheral or to the same device
+instance it temporarily activated. Temporary open permission expires after
+30 seconds. Re-blocking clears it. Final `admit` activates the inspected instance
+without retaining read/deauthorization permission. An already-open descriptor
+is not revoked by a lease timer; the normal workflow revokes the device by
+re-blocking it before final admission. Baseline devices, non-USB disks and PS/2
+keyboards remain outside scope. An interface cannot be passed to the whole-device
+operation to bypass its parent-device checks.
 
-**That invariant is now enforced by the gate, not asserted by the analyzer.**
-It used to live on the untrusted side, which meant a compromised analyzer could
-simply ignore it: the gate would open any `/dev/input/event*` (including the
-built-in keyboard), read any `/dev/sd*` (including the system disk), and
-authorize any USB device. The gate now derives scope from the kernel — it acts
-only on a device whose `authorized` flag reads 0, and on input or block nodes
-whose USB parent is such a device. A PS/2 keyboard has no USB parent and can
-never be in scope; a disk that is not USB-attached is refused; a device you are
-using reads authorized=1 and cannot be disturbed. Because the check reads the
-kernel rather than the request, a compromised analyzer cannot widen its own
-scope by lying.
+The analyzer still decides whether unknown hardware is admitted; this is not
+independent verification of a human decision by the gate. An analyzer compromise
+can also cause a denial of service or trigger the deliberate exit-time reopening
+policy. Privilege separation is not a guarantee that protection survives a
+compromised policy process.
 
-Without `--privsep` the daemon still runs entirely as root, which is why the
-flag is recommended in the README and will become the default once it has more
-real-world testing.
+**Observation temporarily activates the whole device.** Grabs protect only input
+channels successfully captured by Probolos. Storage/network functions of a
+composite device are live too. The cleanup path now re-blocks before releasing
+any grab and runs on exceptions as well. A grab failure aborts observation;
+late nodes continue to be discovered, but discovery is asynchronous.
 
-**Observation requires briefly authorizing the device.** During the observation
-window the device is live, with its input captured. It is returned to
-`authorized=0` the instant observation ends, before the human is asked, so
-there is no window in which it is both live and unwatched. A composite device's
-non-input functions (storage, network) are nonetheless live for the duration of
-the window, which is a real exposure and the reason the window is short and
-configurable (`--observe`, `0` disables it).
+**The input race remains, including with `--close-race-window`.** Deferred
+binding delays driver attachment; it does not stop a driver from delivering
+input between attachment and the eventual `EVIOCGRAB`. Starting a udev monitor
+first cannot make the following operations atomic. The reported duration is
+authorization-to-first-grab latency. Time between Python discovering a node and
+grabbing it is not the true exposure interval, and a small displayed number
+cannot demonstrate that no keys escaped.
 
-**The quarantine has a race.** Between `authorized=1` and the `EVIOCGRAB`
-completing, keystrokes can reach the session. The window is measured and
-printed in every report. Measured on real hardware it is 41–85 ms, not the
-10–20 ms this document previously estimated; the figure is printed per device
-precisely because it is not a constant.
-
-**Closing it is possible, and opt-in.** `--close-race-window` authorizes the
-device with no driver bound, by holding the bus-wide `drivers_autoprobe` switch
-at `0` across the two sysfs writes it takes to configure the device and mark its
-interfaces unbindable. The monitor is listening before any driver attaches, so
-there is no interval in which a keyboard can type — the window does not shrink,
-it ceases to exist.
-
-It is off by default for a reason worth stating plainly. Between those two
-writes, no USB device on the machine will auto-bind a driver. If the process is
-killed with `SIGKILL` in that span, that state persists until someone writes `1`
-back by hand — the lockout this document's gate section exists to prevent, in a
-worse form. An `atexit` restore is registered before the first write, the span
-contains no I/O to the device and no waiting on a human, and devices arriving
-during it are unaffected in practice (`authorized_default` is already `0`, so
-they are never configured and have no interfaces to bind). It is still a real
-risk on a machine whose keyboard is USB.
-
-The flag is refused under `--privsep`: `drivers_autoprobe` is bus-wide, so the
-gate has no device to scope the request to, and inventing a weaker scoping rule
-for the most dangerous operation in the codebase was not an acceptable trade.
-Pick one — bounded blast radius, or no exposure window.
-
-An earlier implementation of this claimed to close the window and did not: its
-capability check counted interface directories on a device held at
-`authorized=0`, where none exist, so it returned `False` on every device and the
-daemon fell back silently. The fallback is now announced, and the check has a
-regression test. If you are reading this to decide whether to trust the
-property: it has not yet been validated on real hardware. See
-`CAPABILITIES.md` §3.1.
+The legacy flag remains experimental and incompatible with `--privsep`. It
+changes the bus-wide `drivers_autoprobe` switch and can leave it disabled after
+`SIGKILL` or a kernel failure. Use `--observe 0 --no-storage-scan` to avoid these
+pre-decision activation windows. That intentionally forgoes behavioural and
+storage evidence; it does not protect the earlier kernel enumeration phase.
 
 **Active interrogation can be a trigger.** The probes in `interrogate.py`
 deliberately send requests outside ordinary enumeration. A sophisticated
@@ -200,15 +167,23 @@ store's JSON through it. Stores are created mode `0600`.
 **The launcher refuses to chown anything outside a fixed allowlist.**
 `--ledger /etc/x.json` would otherwise make `/etc` owned by an unprivileged
 account at mode `0700`, taking sudo, ssh and PAM with it on a running system.
-That needs no attacker; a typo is enough. Paths are resolved with `realpath`
-first, so `../` cannot smuggle a path back out, and a sibling such as
-`/var/lib/probolos-evil` does not match on prefix alone.
+That needs no attacker; a typo is enough. Allowed ledger directories are
+`/var/lib/probolos/state` and `/run/probolos/state`, including descendants.
+The allowlist is lexical and every directory component is opened with
+`O_NOFOLLOW`; resolving an allowlisted symlink must not redefine the allowlist.
+Files must be regular and have one link. Ownership and mode changes use pinned
+file descriptors. Agent directory preparation is limited to `/run/probolos`.
+A root-run agent listener requires trusted ancestor directories and keeps its
+directory root-owned, so a desktop user cannot replace a socket with a symlink
+before a privileged chmod/chown on restart.
 
 **Trust entries are validated on load,** with the same discipline the ledger
 already used — the security-critical store was previously the unvalidated one.
 An entry whose fields are the wrong type, whose fingerprint is empty, or whose
 key disagrees with the name it is filed under is ignored and counted, not
-trusted.
+trusted. State readers reject non-object JSON, invalid encodings, non-finite
+timestamps, special files and inputs over 8 MiB. Reload clears previous entries
+before parsing. Trust checks apply to the opened inode and its directory chain.
 
 ## Device strings are treated as hostile input
 
@@ -233,7 +208,7 @@ verdict this tool never wrote, next to the Allow button. The terminal and
 tkinter backends deliberately do **not** escape: `<` and `&` are ordinary
 characters there, and a legitimate name like `A<B & C>D` must display as typed.
 
-## Storage inspection cannot wedge the daemon
+## Storage read deadlines and remaining limits
 
 Stage 4 reads the raw medium, and a device can stall a read indefinitely —
 ordinary for failing USB, deliberate for a hostile one. Unbounded, that freeze
@@ -245,15 +220,19 @@ killed if it overruns, while the watchdog is paused for the duration. Both are
 required. A timeout alone leaves the watchdog counting legitimate work as a
 stall; pausing alone converts the fail-open into a permanent freeze. A device
 that will not let itself be inspected produces a finding — the silence is the
-result.
+result. This deadline covers the worker read/parse phase. Device authorization,
+opening a gate-provided block descriptor, and deauthorization occur outside that
+worker; a kernel operation stuck in uninterruptible sleep cannot be bounded or
+reliably killed by Python. The watchdog is not proof against every USB stall.
 
 Stage 4 must briefly authorize the device for its block node to appear, and
 udisks2 may automount the medium in that window. The window is kept as short as
 the kernel allows and the device is re-blocked the instant the read returns, but
-the race is real; ship `systemd/60-probolos-inhibit-automount.rules` to close
-it. The structural fix is interface-level authorization — authorize the device
-while holding the mass-storage interface at 0, so no block node is ever created
-— and that work is not finished.
+the race is real. A udisks-specific inhibitor can suppress udisks automounting,
+but not every other program capable of mounting a device. Holding the storage
+interface at 0 also prevents the block node needed by the current scanner; it
+is not a drop-in fix. The inhibitor file referenced in the original README was
+not present in the supplied ZIP; it was not reconstructed as part of this audit.
 
 ## Lockout safety
 
@@ -271,8 +250,9 @@ independent layers:
 Plus the gate's own restore paths (context manager, signal handlers, `atexit`)
 which cover a daemon that dies, and `--release` for manual recovery.
 
-Only `SIGKILL` combined with a full lockout defeats all of these, and the manual
-recovery is one line:
+Cleanup is best effort. The root gate now restores state if its analyzer
+disconnects, including after an analyzer crash. Killing the root gate too,
+kernel failures, or failed sysfs writes still require manual recovery:
 
 ```bash
 echo 1 | sudo tee /sys/bus/usb/devices/usb1/authorized_default
@@ -283,3 +263,14 @@ with `lstat` so a symlink or hardlink planted at that path is refused. An off
 switch any local account could throw is not an off switch; it is a way to
 disable the tool. It lives in `/run` (tmpfs) so a forgotten one cannot survive a
 reboot.
+
+## Controller hotplug and deployment
+
+Only root hubs discovered when the gate starts are closed by the current
+implementation. New host controllers/root hubs require separate boot/udev
+policy; do not assume their first devices are blocked by this daemon. The
+supplied systemd unit was corrected to allow AF_NETLINK and to remain in the
+host network namespace for udev events. Live systemd/USB validation remains
+necessary; a static unit edit is not an integration test.
+
+Kernel authorization semantics: https://docs.kernel.org/usb/authorization.html

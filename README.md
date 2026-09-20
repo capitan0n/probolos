@@ -1,8 +1,7 @@
 # Probolos
 
 > ⚠️ **Alpha — under active development.** This is an early, research-stage
-> project. The core mechanism works in software emulation and the full test
-> suite passes, but **validation on real, physical hardware is still pending** —
+> project. The core mechanism works in software emulation and has automated regression coverage, but **validation on real, physical hardware is still pending** —
 > the tool has not yet been proven to behave correctly against a broad range of
 > genuine USB devices and attack fixtures (e.g. BadUSB via ATmega32u4 / Raspberry
 > Pi Zero). Interfaces, flags and on-disk formats may change without notice.
@@ -14,8 +13,9 @@
 *Probolos* (πρόβολος) — Greek for a jutting barrier: the thing set in front that
 must be got past first.
 
-New USB devices do not work until a human approves them. While a device waits,
-Probolos inspects it — and the device is dead the whole time.
+New USB devices are held for a decision. Identity checks run while blocked;
+optional behavioural and storage inspection temporarily activate the device.
+Remembered devices and configured safety exemptions may be admitted automatically.
 
 ```
 identity · consistency · behaviour
@@ -40,34 +40,20 @@ authorizes it.
 | 3 · Behaviour | What does it do when switched on and gagged? | live, input grabbed |
 | 4 · Contents | What is on the medium? | live, read-only, never mounted |
 
-The stage-3 window is the only moment the device is live before approval, and
-its input is held under `EVIOCGRAB` throughout — nothing it sends reaches your
-session. It is re-blocked the instant observation ends, *before* you are asked.
+Stage 3 grabs evdev input after drivers bind, observes it, then re-blocks the
+device **before releasing the grabs**. Keystrokes may escape before a grab
+succeeds, including with `--close-race-window`: that legacy flag enables
+experimental deferred binding, not race-free isolation. Newly discovered input
+nodes are checked throughout observation; this still requires userspace to react.
 
-**The contribution is the pre-authorization quarantine window**: observation
-time is decoupled from attack success. Existing tools (USBGuard, usbauth, ukip)
-decide from descriptors alone, or watch a device that is already live.
+Stage 4 also temporarily activates the device. Probolos itself never mounts the
+medium, but another service may do so. It is skipped if any parsed configuration
+or alternate setting declares HID input, or if descriptors are incomplete.
 
----
-
-## How it compares
-
-|   | USBGuard | usbauth | ukip | GoodUSB | **Probolos** |
-|---|:---:|:---:|:---:|:---:|:---:|
-| **Policy basis** | descriptors | descriptors + udev rules | keystroke timing | descriptors + user intent | descriptors + behaviour + storage |
-| **Device state during decision** | live (driver bound) | live (driver bound) | live (driver bound) | live (driver bound) | **blocked** (`authorized=0`) |
-| **Pre-authorization observation** | ✗ | ✗ | ✗ | ✗ | **✓** (configurable window) |
-| **Input interception** | ✗ | ✗ | monitors keystrokes | ✗ | **`EVIOCGRAB`** (nothing reaches session) |
-| **Storage inspection before mount** | ✗ | ✗ | ✗ | ✗ | **✓** (raw read, never mounted) |
-| **Human approval required** | optional | ✗ (rule-based) | ✗ (automatic) | ✓ | **✓** (always) |
-| **Race window** | full (post-bind) | full (post-bind) | partial (post-bind) | full (post-bind) | **41–85 ms** (pre-bind) |
-| **Privilege separation** | daemon | PAM module | daemon | daemon | **✓** (root gate ≈ 150 LOC) |
-
-The key difference is *when* the decision happens. Every other tool listed
-reacts to a device that the kernel has already handed to a driver — so a
-malicious device can act before the tool acts. Probolos holds the device
-**inert** from the moment the kernel sees it, inspects it while it is dead or
-gagged, and only then asks the human.
+The research subject is an admission gate combining descriptor, behavioural,
+and storage metadata evidence. Comparative claims about other tools require
+independent measurements of their actual configurations; the previous table
+asserting that other tools invariably decide after driver binding was removed.
 
 ---
 
@@ -94,14 +80,17 @@ sudo python3 -m probolos --privsep --agent --agent-user "$USER"
 python3 -m probolos.agent          # in your graphical session
 ```
 
-`--privsep` keeps root to a ~150-line gate; everything else runs as `nobody`.
+`--privsep` runs the analyzer as `nobody` and routes privileged operations
+through a separate gate. The trusted code also includes startup preparation,
+protocol handling and cleanup; it is not a 150-line security boundary.
 `--agent` moves the prompt into a desktop dialog.
 
 ### Stop automount racing the scan
 
-Stage 4 authorizes the device briefly to read its partition table, and udisks2
-may automount the medium in that window — the exact kernel-filesystem exposure
-stage 4 exists to avoid. Install the inhibitor:
+Stage 4 activates the device temporarily and udisks2 may automount it. If the
+following inhibitor exists in your full checkout, install it before experiments
+with stage 4. It was not present in the review ZIP. Otherwise disable stage 4
+with `--no-storage-scan` until automounting has been controlled:
 
 ```bash
 sudo cp systemd/60-probolos-inhibit-automount.rules /etc/udev/rules.d/
@@ -109,8 +98,8 @@ sudo udevadm control --reload
 sudo udevadm trigger --subsystem-match=block
 ```
 
-USB storage will no longer auto-mount. Probolos reads the raw node itself, so
-it loses nothing; you mount approved devices deliberately afterwards.
+Verify the inhibitor's effect on your system: a udisks rule does not constrain
+other mount services. Probolos itself reads a raw device without mounting it.
 
 ---
 
@@ -179,8 +168,8 @@ No `python-evdev`: the quarantine talks to the kernel directly through one
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests        # 328 tests
-python3 -m unittest discover -b -s tests -t . # quieter: suppresses daemon output
+python3 -m tests.run_all  # unittest classes plus standalone descriptor tests
+python3 -m unittest discover -b -s tests -t .  # unittest classes only
 ```
 
 `testbed/` emulates USB devices in software via `dummy_hcd` + `raw_gadget`,
@@ -207,18 +196,18 @@ Short version:
   separation with kernel-derived scope, lockout safety.
 - **Does not** — anything before the kernel finishes enumerating, anything after
   you approve the device, Thunderbolt/DMA, USB-PD, wireless, or file contents.
-- **Off by default** — `--close-race-window` removes the 41–85 ms exposure
-  window on input devices, at the cost of holding a bus-wide kernel switch for
-  the length of two sysfs writes. Read `SECURITY.md` before enabling it, and
-  note it is not yet validated on real hardware.
+- **Off by default** — `--close-race-window` experiments with deferred binding
+  using a bus-wide switch. It does not remove the input race. See `SECURITY.md`.
+- **No early activation** — use `--observe 0 --no-storage-scan` when holding
+  unknown devices blocked is more important than behavioural/storage evidence.
 - **Not yet** — no HID report descriptor analysis: the parser for it is written
   and hardened, but the report descriptor is not in the sysfs blob and has no
   source wired to it. `CAPABILITIES.md` §2.2 and §3.2.
 
-Status: **alpha — under active development.** All four critical findings from
-the security audit are fixed and covered by regression tests, and the full
-suite passes, but the tool has so far been exercised almost entirely in
-software emulation. **Real-hardware validation is the main open work item**:
+Status: **alpha — under active development.** The supplied ZIP contained tests
+for fixes missing from its implementation. See `AUDIT_REPORT_EL.md` for this
+review's fixes, test results and limitations. A passing mock test does not prove
+USB isolation on a real kernel. **Real-hardware validation is the main open work item**:
 until Probolos has been tested against a range of genuine devices and BadUSB
 fixtures, treat every real-world result as data rather than a guarantee, and
 report anything that surprises you. Known open items are tracked in

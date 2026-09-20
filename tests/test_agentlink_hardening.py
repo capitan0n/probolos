@@ -274,12 +274,21 @@ class SocketOwnership(unittest.TestCase):
         link = self._link(owner_uid=1000, owner_gid=1000)
         calls = []
         with mock.patch.object(agentlink.os, "geteuid", return_value=0), \
+             mock.patch("probolos.securefs.open_directory",
+                        side_effect=lambda p, **kw: os.open(p, os.O_RDONLY | os.O_DIRECTORY)), \
              mock.patch.object(agentlink.os, "chown",
-                               side_effect=lambda p, u, g: calls.append((u, g))):
+                               side_effect=lambda p, u, g, **kw:
+                                   calls.append((u, g, kw))):
             self.assertTrue(link.start())
         link.stop()
-        self.assertIn((1000, 1000), calls,
-                      "socket was not handed to the desktop user")
+        self.assertTrue(any(c[:2] == (1000, 1000) for c in calls),
+                        "socket was not handed to the desktop user")
+        # And it must be done relative to the descriptor that was verified,
+        # without following a link: by name, a symlink planted at the socket
+        # path between bind() and here is a root chown of an arbitrary file.
+        kwargs = [c[2] for c in calls if c[:2] == (1000, 1000)][0]
+        self.assertIn("dir_fd", kwargs)
+        self.assertIs(kwargs.get("follow_symlinks"), False)
 
     def test_non_root_does_not_attempt_chown(self):
         from probolos import agentlink
@@ -294,6 +303,8 @@ class SocketOwnership(unittest.TestCase):
         from probolos import agentlink
         link = self._link()   # owner_uid None: --privsep case
         with mock.patch.object(agentlink.os, "geteuid", return_value=0), \
+             mock.patch("probolos.securefs.open_directory",
+                        side_effect=lambda p, **kw: os.open(p, os.O_RDONLY | os.O_DIRECTORY)), \
              mock.patch.object(agentlink.os, "chown") as chown:
             self.assertTrue(link.start())
         link.stop()

@@ -306,15 +306,9 @@ def main(argv=None) -> None:
                         help="the desktop user allowed to answer through the "
                              "agent (default: the owner of the active session)")
     parser.add_argument("--close-race-window", action="store_true",
-                        help="eliminate the exposure window between authorizing "
-                             "an input device and grabbing it, by holding the "
-                             "bus-wide driver autoprobe switch at 0 for the "
-                             "two sysfs writes it takes to authorize the device "
-                             "with no driver bound. OFF BY DEFAULT: if the "
-                             "process is killed mid-window, no USB device on "
-                             "the machine binds a driver until it is restored "
-                             "by hand. Not available with --privsep. "
-                             "See SECURITY.md before enabling.")
+                        help="experimental deferred driver binding (legacy flag "
+                             "name). DOES NOT eliminate the EVIOCGRAB race. "
+                             "Uses a bus-wide switch; unavailable with --privsep.")
     parser.add_argument("--privsep", action="store_true",
                         help="run with privilege separation: a small root gate "
                              "and an unprivileged analyzer. Recommended")
@@ -417,7 +411,7 @@ def main(argv=None) -> None:
                 "Choose one:\n"
                 "  --privsep              bound the blast radius of an "
                 "analyzer bug (recommended)\n"
-                "  --close-race-window    remove the 41-85 ms exposure window "
+                "  --close-race-window    experiment with deferred driver binding "
                 "on input devices")
         from . import privsep
         from .gate_client import GateBackend

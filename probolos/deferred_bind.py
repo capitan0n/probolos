@@ -47,8 +47,9 @@ autoprobe switch:
        /sys/bus/usb/drivers_probe. Only now does usbhid attach and the evdev
        node appear -- with the monitor already waiting for it.
 
-The window does not shrink; it ceases to exist, because no driver binds until
-step 6, and step 6 happens after the monitor is listening.
+The monitor being ready does NOT prevent input delivery. Step 6 binds drivers
+before userspace can open evdev and take EVIOCGRAB, so a race remains. This is
+experimental binding control, not proof of input isolation.
 
 THE RISK, STATED PLAINLY
 ------------------------
@@ -316,6 +317,38 @@ class DeferredBind:
                 self._deauthorized.remove(intf)
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is not None:
+            # Two defects in the version this replaces, both of which showed up
+            # only on the path nobody exercises -- the failure path.
+            #
+            #   1. The OSError from set_authorized() was allowed to propagate
+            #      out of __exit__, REPLACING the original exception. The real
+            #      cause of the failure was lost and the traceback pointed at
+            #      the cleanup instead.
+            #   2. _deauthorized.clear() threw away the record of which
+            #      interfaces were switched off. Those interfaces stay at
+            #      authorized=0 in the kernel, so a device later approved by
+            #      the user came up permanently non-functional, with nothing
+            #      left to say why.
+            #
+            # Both are now handled here: the interfaces are put back exactly as
+            # on the normal path, and no cleanup error escapes.
+            try:
+                if self._device_authorized and not self.dry_run:
+                    sysfs.set_authorized(self.syspath, 0)
+            except OSError as cleanup_exc:
+                self.log(f"  ! could not re-block {self.syspath.name} after a "
+                         f"failed deferred bind ({cleanup_exc})")
+            finally:
+                for intf in list(self._deauthorized):
+                    try:
+                        if not self.dry_run:
+                            sysfs.set_interface_authorized(intf, 1)
+                    except OSError:
+                        pass  # device unplugged; the path is gone, no matter
+                self._deauthorized.clear()
+                self._release_autoprobe()
+            return False
         # Fail-safe, in this order: the bus first, because a machine that binds
         # no drivers is worse than one device with dead interfaces.
         self._release_autoprobe()

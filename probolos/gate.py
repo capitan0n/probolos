@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import atexit
 import signal
+import threading
 import sys
 from pathlib import Path
 from typing import Dict, List
@@ -40,6 +41,15 @@ class AuthorizationGate:
         self._original: Dict[Path, int] = {}
         self._armed = False
         self._previous_handlers: Dict[int, object] = {}
+        # restore() has three callers that do not coordinate: the watchdog
+        # thread (on_stall -> opened.restore()), the main thread on the way out
+        # of the `with` block, and atexit. Two of them can run at once -- the
+        # watchdog firing while the daemon is already shutting down is the
+        # normal way a stall ends -- and both rebuild self._original from what
+        # they individually managed to restore. Without the lock the second
+        # assignment overwrites the first, which can re-list a hub that was
+        # already put back and drop one that was not.
+        self._lock = threading.RLock()
 
     # ---------- lifecycle ----------
 
@@ -48,39 +58,42 @@ class AuthorizationGate:
         if not hubs:
             raise RuntimeError("no USB root hubs found under /sys/bus/usb/devices")
 
-        for hub in hubs:
-            current = sysfs.get_authorized_default(hub)
-            if current is None:
-                self.log(f"  ! {hub.name}: no authorized_default, skipping")
-                continue
-            # Remember the original value so it can be put back exactly. Some
-            # kernels use 2 ("authorize internal ports only"), and blindly
-            # restoring 1 would silently weaken the machine's configuration.
-            #
-            # EXCEPT when we find it already at 0. A hub sitting at 0 before we
-            # touched anything is not a configuration anyone chose -- it is the
-            # residue of a previous run that died without restoring. Recording
-            # 0 as "the original" and faithfully putting it back on exit would
-            # make the lockout permanent, with each run politely preserving the
-            # damage done by the last. So 0 is treated as "no valid previous
-            # state" and 1 is restored instead, which is the only value that
-            # leaves the machine usable.
-            if current == 0:
-                self.log(f"  ! {hub.name}: was already closed "
-                         f"(authorized_default=0) — this is leftover from a "
-                         f"run that did not shut down cleanly; will restore "
-                         f"to 1, not 0")
-                self._original[hub] = 1
-            else:
-                self._original[hub] = current
-            if not self.dry_run:
-                sysfs.set_authorized_default(hub, 0)
-            state = "would close" if self.dry_run else "closed"
-            self.log(f"  - {hub.name}: {state} (was authorized_default={current})")
-
         self._armed = True
         self._install_handlers()
         atexit.register(self.restore)
+        try:
+            for hub in hubs:
+                current = sysfs.get_authorized_default(hub)
+                if current is None:
+                    self.log(f"  ! {hub.name}: no authorized_default, skipping")
+                    continue
+                # Remember the original value so it can be put back exactly. Some
+                # kernels use 2 ("authorize internal ports only"), and blindly
+                # restoring 1 would silently weaken the machine's configuration.
+                #
+                # EXCEPT when we find it already at 0. A hub sitting at 0 before we
+                # touched anything is not a configuration anyone chose -- it is the
+                # residue of a previous run that died without restoring. Recording
+                # 0 as "the original" and faithfully putting it back on exit would
+                # make the lockout permanent, with each run politely preserving the
+                # damage done by the last. So 0 is treated as "no valid previous
+                # state" and 1 is restored instead, which is the only value that
+                # leaves the machine usable.
+                if current == 0:
+                    self.log(f"  ! {hub.name}: was already closed "
+                             f"(authorized_default=0) — this is leftover from a "
+                             f"run that did not shut down cleanly; will restore "
+                             f"to 1, not 0")
+                    self._original[hub] = 1
+                else:
+                    self._original[hub] = current
+                if not self.dry_run:
+                    sysfs.set_authorized_default(hub, 0)
+                state = "would close" if self.dry_run else "closed"
+                self.log(f"  - {hub.name}: {state} (was authorized_default={current})")
+        except BaseException:
+            self.restore()
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -88,16 +101,21 @@ class AuthorizationGate:
         return False  # never swallow exceptions
 
     def restore(self) -> None:
-        """Idempotent: safe to call from every path, and it will be."""
+        """Idempotent, and safe from more than one thread at a time."""
+        with self._lock:
+            self._restore_locked()
+
+    def _restore_locked(self) -> None:
         if not self._armed:
             return
-        self._armed = False
-        for hub, value in self._original.items():
+        remaining = {}
+        for hub, value in list(self._original.items()):
             try:
                 if not self.dry_run:
                     sysfs.set_authorized_default(hub, value)
                 self.log(f"  - {hub.name}: restored authorized_default={value}")
             except OSError as exc:
+                remaining[hub] = value
                 # Last resort: tell the human exactly how to fix it themselves.
                 print(
                     f"\n!! FAILED to restore {hub.name}: {exc}\n"
@@ -105,6 +123,8 @@ class AuthorizationGate:
                     f"!!   echo {value} > {hub}/authorized_default\n",
                     file=sys.stderr,
                 )
+        self._original = remaining
+        self._armed = bool(remaining)
         self._remove_handlers()
 
     # ---------- signal plumbing ----------

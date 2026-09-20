@@ -45,6 +45,7 @@ from typing import Optional
 
 # Request kinds
 REQ_AUTHORIZE = "authorize"
+REQ_ADMIT = "admit"
 REQ_SET_DEFAULT = "set_default"
 REQ_OPEN_INPUT = "open_input"
 REQ_OPEN_BLOCK = "open_block"
@@ -66,27 +67,36 @@ class Request:
     kind: str
     path: str = ""             # device or node path the request concerns
     value: Optional[int] = None  # for authorize / set_default
+    instance: Optional[tuple] = None
 
     def encode(self) -> bytes:
         obj = {"kind": self.kind, "path": self.path}
         if self.value is not None:
             obj["value"] = self.value
+        if self.instance is not None:
+            obj["instance"] = self.instance
         return json.dumps(obj).encode()
 
     @staticmethod
     def decode(data: bytes) -> "Request":
         obj = _load(data)
         kind = obj.get("kind")
-        if kind not in (REQ_AUTHORIZE, REQ_SET_DEFAULT, REQ_OPEN_INPUT,
+        if kind not in (REQ_AUTHORIZE, REQ_ADMIT, REQ_SET_DEFAULT, REQ_OPEN_INPUT,
                         REQ_OPEN_BLOCK, REQ_AUTHORIZE_INTERFACE, REQ_PING):
             raise ValueError(f"unknown request kind: {kind!r}")
         value = obj.get("value")
-        if value is not None and not isinstance(value, int):
+        if value is not None and type(value) is not int:
             raise ValueError("value must be an integer")
         path = obj.get("path", "")
-        if not isinstance(path, str):
+        if not isinstance(path, str) or "\x00" in path:
             raise ValueError("path must be a string")
-        return Request(kind=kind, path=path, value=value)
+        instance = obj.get("instance")
+        if instance is not None:
+            if (not isinstance(instance, list) or len(instance) != 2
+                    or any(type(n) is not int or n < 0 for n in instance)):
+                raise ValueError("invalid device instance")
+            instance = tuple(instance)
+        return Request(kind=kind, path=path, value=value, instance=instance)
 
 
 @dataclass
@@ -122,7 +132,7 @@ def _load(data: bytes) -> dict:
         raise ValueError(f"message too large: {len(data)} bytes")
     try:
         obj = json.loads(data.decode())
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise ValueError(f"malformed message: {exc}") from exc
     if not isinstance(obj, dict):
         raise ValueError("message is not an object")

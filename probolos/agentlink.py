@@ -185,9 +185,17 @@ def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
     answer questions about hardware, which is not a trade worth making for a
     little convenience.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chown(path.parent, owner_uid, group_gid)
-    os.chmod(path.parent, 0o2770)
+    from .securefs import open_directory
+    directory = os.path.abspath(path.parent)
+    root = str(DEFAULT_SOCKET.parent)
+    if directory != root and not directory.startswith(root + os.sep):
+        raise OSError(f"agent socket directory must be under {root}")
+    fd = open_directory(directory, create=True)
+    try:
+        os.fchown(fd, owner_uid, group_gid)
+        os.fchmod(fd, 0o2770)
+    finally:
+        os.close(fd)
 
 
 class AgentLink:
@@ -233,15 +241,38 @@ class AgentLink:
     # ---- lifecycle ----
 
     def start(self) -> bool:
+        # The directory descriptor is HELD for the rest of this block, not
+        # opened and dropped.
+        #
+        # open_directory(secure=True) verifies every component of the path and
+        # then the fd was closed immediately, after which bind(), chmod() and
+        # chown() all went back to working by NAME. So the directory that was
+        # checked and the directory that was written to were only the same one
+        # by assumption -- the exact pattern securefs.py was introduced to
+        # remove everywhere else. It is not exploitable as the tree ships,
+        # because the verification refuses a group-writable /run/probolos and
+        # the root-owned one it accepts cannot be swapped. But `os.chown` on a
+        # name follows symlinks, so the day that directory is made writable by
+        # the desktop user -- which is exactly what the privsep layout does to
+        # it -- this becomes root chowning a file of someone else's choosing.
+        directory_fd = None
         try:
             created_dir = not self.path.parent.exists()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if os.geteuid() == 0:
+                from .securefs import open_directory
+                directory_fd = open_directory(self.path.parent, create=True,
+                                              secure=True)
+            else:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
             # lexists, not exists: exists() follows symlinks, so a DANGLING
             # symlink left at the socket path -- which anyone in the
             # directory's group can plant -- reads as absent, is never
             # unlinked, and makes bind() fail. The agent path would then be
             # silently unavailable for the whole run.
             if os.path.lexists(self.path):
+                import stat
+                if not stat.S_ISSOCK(os.lstat(self.path).st_mode):
+                    raise OSError("refusing to replace a non-socket agent path")
                 self.path.unlink()
             self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._listener.bind(str(self.path))
@@ -249,13 +280,16 @@ class AgentLink:
             # directory by the launcher and inherited via its setgid bit; in
             # the no-privsep case we chown below to reach the same end.
             os.chmod(self.path, 0o660)
-            self._chown_for_owner(created_dir)
+            self._chown_for_owner(directory_fd)
             self._listener.listen(1)
             self._listener.settimeout(0.5)
         except OSError as exc:
             self.log(f"[agent] could not listen on {self.path}: {exc}")
             self._listener = None
             return False
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
 
         threading.Thread(target=self._accept_loop, daemon=True).start()
         if self.allowed_uids is None:
@@ -269,16 +303,25 @@ class AgentLink:
                      "process that can open the socket may answer")
         return True
 
-    def _chown_for_owner(self, created_dir: bool) -> None:
+    def _chown_for_owner(self, directory_fd) -> None:
         """
         Hand the socket to the desktop user when we bound it as root.
 
         Without this the socket is root:root 0660 and the agent -- which runs
         as the user, not root -- cannot connect. It only applies when an owner
         was supplied AND we are actually root; a non-root daemon has nothing to
-        grant and silently skips. The directory is only chowned if THIS call
-        created it, so a shared /run/probolos set up by something else is left
-        as it was found.
+        grant and silently skips.
+
+        The chown is done relative to the verified directory descriptor and
+        with follow_symlinks=False, so it lands on the socket bind() just
+        created or on nothing. By name it would follow a symlink planted at
+        that path, which is a root chown of an arbitrary file.
+
+        The parameter used to be `created_dir`, whose docstring promised the
+        directory was "only chowned if THIS call created it" -- a protection
+        that did not exist, because the body never chowned the directory and
+        never read the flag. It is replaced by something the code actually
+        uses.
 
         SO_PEERCRED still guards who may answer, so widening filesystem access
         to the socket does not widen who is trusted: an unauthorized uid can
@@ -288,9 +331,15 @@ class AgentLink:
             return
         gid = self.owner_gid if self.owner_gid is not None else -1
         try:
-            os.chown(self.path, self.owner_uid, gid)
-            if created_dir:
-                os.chown(self.path.parent, self.owner_uid, gid)
+            if directory_fd is not None:
+                import stat as _stat
+                st = os.lstat(self.path.name, dir_fd=directory_fd)
+                if not _stat.S_ISSOCK(st.st_mode):
+                    raise OSError("agent path is no longer the socket we bound")
+                os.chown(self.path.name, self.owner_uid, gid,
+                         dir_fd=directory_fd, follow_symlinks=False)
+            else:
+                os.chown(self.path, self.owner_uid, gid)
         except OSError as exc:
             # Non-fatal: the socket still exists and root can use it. Log it so
             # a failed agent connection has an explanation.
@@ -471,7 +520,11 @@ class AgentLink:
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
                     answer = self._parse_answer(line, request_id)
-                    if answer is not None:
+                    if answer == ANSWER_UNAVAILABLE:
+                        return None
+                    if answer == ANSWER_ALWAYS and not allow_always:
+                        continue
+                    if answer is not None and time.monotonic() < deadline:
                         return answer
         finally:
             with self._lock:
@@ -507,7 +560,9 @@ class AgentLink:
     def _parse_answer(self, line: bytes, request_id: int) -> Optional[str]:
         try:
             obj = json.loads(line.decode())
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            return None
+        if not isinstance(obj, dict):
             return None
         if obj.get("type") != MSG_ANSWER:
             return None
@@ -517,7 +572,8 @@ class AgentLink:
             # device the user is not currently looking at.
             return None
         answer = obj.get("answer")
-        return answer if answer in (ANSWER_YES, ANSWER_ALWAYS, ANSWER_NO) else None
+        return answer if answer in (ANSWER_YES, ANSWER_ALWAYS, ANSWER_NO,
+                                    ANSWER_UNAVAILABLE) else None
 
     def _drain(self, conn) -> int:
         """
@@ -531,7 +587,7 @@ class AgentLink:
         except OSError:
             return 0
         try:
-            while True:
+            while discarded < MAX_MESSAGE * 4:
                 try:
                     chunk = conn.recv(MAX_MESSAGE)
                 except (BlockingIOError, InterruptedError):
@@ -548,6 +604,8 @@ class AgentLink:
                 conn.settimeout(previous)
             except OSError:
                 pass
+        if discarded >= MAX_MESSAGE * 4:
+            self._drop(conn)
         if discarded:
             self.log(f"[agent] discarded {discarded} unsolicited bytes before "
                      f"asking -- an agent should only speak when asked")

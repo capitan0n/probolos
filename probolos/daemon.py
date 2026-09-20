@@ -87,13 +87,7 @@ class Probolos:
         self.monitor = monitor or session_mod.AlwaysUnlocked()
         self.lock_policy = lock_policy
         self.agent = agent
-        # Opt-in, and off by default on purpose. Closing the grab race means
-        # switching driver binding off for the whole USB bus for the length of
-        # two sysfs writes (see deferred_bind.py). That is a real lockout risk
-        # on a machine whose keyboard is USB, and it is not a risk to take on
-        # the operator's behalf while the mechanism is still alpha. When it is
-        # off, _quarantine() says so rather than letting the user assume the
-        # window is closed.
+        # Experimental bus-wide binding control, not race-free isolation.
         self.close_race_window = close_race_window
         # Devices attached while the screen was locked. They are held blocked
         # and asked about when someone returns, so nobody has to unplug and
@@ -196,10 +190,28 @@ class Probolos:
             device = monitor.poll(timeout=1.0)
             if device is None:
                 continue
-            if device.action == "add":
-                self._on_add(device.sys_path)
-            elif device.action == "remove":
-                self._on_remove(device.sys_path)
+            # One device must never be able to end the gate. Everything below
+            # this line touches hardware that can vanish mid-call: sysfs writes
+            # return ENODEV, a dialog backend dies, a descriptor read races the
+            # unplug. Those raise OSError and worse, and until now they left
+            # the loop entirely -- the daemon exited, every subsequent device
+            # was admitted by the kernel with no question asked, and the user
+            # saw a traceback rather than a closed gate. Handling it here keeps
+            # the failure to the one device it belongs to.
+            #
+            # KeyboardInterrupt and SystemExit are deliberately NOT caught:
+            # shutdown must stay immediate.
+            try:
+                if device.action == "add":
+                    self._on_add(device.sys_path)
+                elif device.action == "remove":
+                    self._on_remove(device.sys_path)
+            except Exception as exc:   # noqa: BLE001 -- see above
+                import traceback
+                print(f"[!] {Path(device.sys_path).name}: unhandled error "
+                      f"while gating this device: {exc!r}")
+                print(f"[!] It stays BLOCKED. The gate is still running.")
+                traceback.print_exc()
 
     def _on_add(self, sys_path: str, was_held: bool = False) -> None:
         """
@@ -246,9 +258,10 @@ class Probolos:
         protection = self.policy.is_protected(dev)
         if protection and not self.dry_run:
             try:
-                sysfs.set_authorized(dev.syspath, 1)
+                sysfs.admit_device(dev)
             except OSError as exc:
                 print(f"[!] could not authorize protected device: {exc}")
+                return
             print(f"[=] ADMITTED WITHOUT PROMPT ({protection}) — "
                   f"{report.one_liner(dev)}\n")
             self._record(Decision(dev, True, f"protected: {protection}",
@@ -267,7 +280,7 @@ class Probolos:
                 and self.trust.is_trusted(dev)
                 and rules.worst(findings) < rules.Severity.CRITICAL):
             try:
-                sysfs.set_authorized(dev.syspath, 1)
+                sysfs.admit_device(dev)
                 self.trust.record_admission(dev)
                 error = self.trust.save()
                 if error:
@@ -296,26 +309,16 @@ class Probolos:
         # device to read its medium, and on a composite storage+keyboard device
         # that same authorization would switch the keyboard on as well.
         has_input = usbclass.KIND_INPUT in dev.kinds
-        if self.observe > 0 and has_input:
-            obs = self._quarantine(dev)
-            # THE DEVICE GOES STRAIGHT BACK TO BLOCKED.
-            #
-            # Observation requires switching the device on, but the moment the
-            # grab is released it would be both live and unwatched -- and the
-            # human has not decided yet. A malicious keyboard could simply stay
-            # silent for the observation window and then type freely while its
-            # victim reads the report, which makes the whole quarantine
-            # trivially defeatable by waiting. Worse, a composite storage +
-            # keyboard device would have its storage half live and available
-            # for automount during that same window.
-            #
-            # So the device is deauthorized again immediately, and is only
-            # authorized for real if the human approves. Deny-by-default has to
-            # hold at every instant, not just at the start.
-            try:
-                sysfs.set_authorized(dev.syspath, 0)
-            except OSError as exc:
-                print(f"[!] could not re-block after observation: {exc}")
+        complete = dev.inspection_safe
+        if not complete:
+            print("  Incomplete descriptors: early activation is disabled.")
+        if complete and self.observe > 0 and has_input:
+            if self.watchdog:
+                with self.watchdog.paused():
+                    obs = self._quarantine(dev)
+            else:
+                obs = self._quarantine(dev)
+            # quarantine() re-blocks before releasing any captured descriptor.
             behaviour = analyzers.run(
                 analyzers.Context(device=dev, observation=obs,
                                   ledger=self.ledger, config=self.rule_config),
@@ -336,7 +339,7 @@ class Probolos:
         # device that can also type" finding, and its partition table cannot
         # make that verdict any safer. So storage is read only when the device
         # cannot also type.
-        if (self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds
+        if (complete and self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds
                 and not has_input):
             # BOTH guards are needed and they do different jobs. The timeout
             # inside inspect_safely guarantees the scan ENDS; paused() stops
@@ -378,32 +381,29 @@ class Probolos:
         else:
             approved = self._ask(dev, findings)
         if approved:
-            # The user's decision is a fact the moment it is made, so it is
-            # recorded BEFORE the sysfs write. This matters for the ledger:
-            # if the device is yanked between the prompt and the write (a
-            # short-lived test gadget, or a real device pulled at the wrong
-            # moment), the authorization fails -- but the history of "this
-            # identity was seen and approved" must survive regardless, or drift
-            # detection silently forgets devices that were briefly present.
-            self._record(Decision(dev, True, "user approved", time.time()),
-                         findings)
-            if getattr(self, "_remember", False) and self.trust is not None:
-                entry = self.trust.trust(dev)
-                if entry is None:
-                    print("  (cannot remember this device: its descriptors "
-                          "could not be read, so there is nothing to pin "
-                          "trust to)")
-                else:
-                    self.trust.record_admission(dev)
-                    error = self.trust.save()
-                    print(f"  remembered — this device will be admitted "
-                          f"without asking, unless something changes"
-                          + (f" [{error}]" if error else ""))
+            if (self.stop_event is not None and self.stop_event.is_set()):
+                print("[!] Safety stop active; approval discarded.")
+                return
+            if (self.lock_policy != session_mod.POLICY_IGNORE
+                    and self.monitor.is_locked()):
+                self._hold_until_unlocked(dev)
+                return
             try:
-                sysfs.set_authorized(dev.syspath, 1)
-                print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
+                sysfs.admit_device(dev)
             except OSError as exc:
                 print(f"[!] failed to authorize: {exc}\n")
+                self._record(Decision(dev, False, "admission failed", time.time()),
+                             findings)
+                return
+            self._record(Decision(dev, True, "user approved", time.time()), findings)
+            if getattr(self, "_remember", False) and self.trust is not None:
+                entry = self.trust.trust(dev)
+                if entry is not None:
+                    self.trust.record_admission(dev)
+                    error = self.trust.save()
+                    print(f"  trust could not be saved: {error}" if error
+                          else "  remembered for future admissions")
+            print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
         else:
             # For a quarantined device this write genuinely matters: it was
             # switched on for the observation and is alive right now. For every
@@ -497,7 +497,15 @@ class Probolos:
             if not syspath.exists():
                 print(f"[*] {name} was removed while held; nothing to decide\n")
                 continue
-            self._on_add(str(syspath), was_held=True)
+            # Same reasoning as the poll loop: one held device failing must not
+            # abandon the rest of the queue, and must not end the daemon.
+            try:
+                self._on_add(str(syspath), was_held=True)
+            except Exception as exc:   # noqa: BLE001
+                import traceback
+                print(f"[!] {name}: unhandled error while gating this held "
+                      f"device: {exc!r}. It stays BLOCKED.")
+                traceback.print_exc()
 
     def _inspect_medium(self, dev: sysfs.UsbDevice):
         """
@@ -505,8 +513,8 @@ class Probolos:
 
         Same discipline as the behavioural quarantine: authorize, look, and put
         it straight back to blocked before anyone is asked anything. The medium
-        is opened read-only and never mounted, so the kernel's filesystem
-        drivers never see its contents.
+        is opened read-only and never mounted by Probolos. Another service may
+        still mount it during this activation window.
         """
         print("  This is a storage device. Probolos will read its partition")
         print("  table directly, without mounting it.")
@@ -546,10 +554,33 @@ class Probolos:
             else:
                 medium = storage.MediumReport(error="no block device appeared")
         finally:
+            # REPORTED, never raised. Raising here -- and raising from a
+            # `finally`, which also swallows whatever went wrong inside the
+            # scan -- propagated straight out of _on_add into the udev poll
+            # loop, which has no handler, so the daemon died. The most common
+            # cause is not an attack but ENODEV: the stick was pulled during
+            # the 1.5 s the block node takes to appear. Killing the gate over
+            # an ordinary unplug is a fail-open, and a far worse outcome than
+            # the condition being reported.
             try:
                 sysfs.set_authorized(dev.syspath, 0)
             except OSError as exc:
-                print(f"[!] could not re-block after inspection: {exc}")
+                if not dev.syspath.exists():
+                    # The device is gone. There is nothing left to re-block and
+                    # nothing left switched on; this is the benign case.
+                    print(f"  ({dev.name} was removed during inspection)")
+                else:
+                    print(f"\n[!!] COULD NOT RE-BLOCK {dev.name} after "
+                          f"inspection: {exc}\n"
+                          f"[!!] It is still switched on. Unplug it now; do "
+                          f"not rely on the prompt below.\n")
+                    if medium is None:
+                        medium = storage.MediumReport(
+                            device=str(dev.syspath),
+                            error=f"device left authorized: {exc}")
+                    else:
+                        medium.error = (f"{medium.error + '; ' if medium.error else ''}"
+                                        f"device left authorized: {exc}")
         return medium
 
     def _quarantine(self, dev: sysfs.UsbDevice):
@@ -560,20 +591,13 @@ class Probolos:
         device, then anything it sends is something it decided to send.
         """
         print("  This is an input device. Probolos will switch it on with its")
-        print("  input captured, so nothing it sends can reach your session.")
+        print("  input captured after EVIOCGRAB succeeds. Input can escape")
+        print("  before capture, including when deferred binding is enabled.")
         print(f"  >>> DO NOT TOUCH IT for the next {self.observe:.0f} seconds. <<<")
         print()
 
-        # The driverless-authorization path is opt-in. It is the only thing
-        # that actually removes the grab race, but it switches driver binding
-        # off for the whole USB bus for the length of two sysfs writes, and
-        # that is not a risk to take on someone's behalf by default.
-        #
-        # The fallback is announced. It used to be silent -- supported()
-        # returned False on every device for structural reasons and the daemon
-        # quietly took the racy path while the documentation claimed the window
-        # was closed. A security property that degrades without saying so is
-        # worse than one that was never claimed.
+        # A listening monitor does not make driver binding and grabbing atomic.
+        # Keep the legacy experimental flag, with its limitation visible.
         if self.close_race_window:
             if deferred_bind.supported(dev.syspath):
                 db = deferred_bind.DeferredBind(dev.syspath, log=print)
@@ -584,6 +608,7 @@ class Probolos:
                     bind_context=db,
                     duration=self.observe,
                     capture=self.capture_payload,
+                    deauthorize_fn=lambda: sysfs.set_authorized(dev.syspath, 0),
                 )
             print("  ! --close-race-window requested but unavailable: "
                   f"{deferred_bind.unsupported_reason()}")
@@ -592,14 +617,15 @@ class Probolos:
         else:
             print("  Note: the driver binds before the grab, so a short "
                   "exposure window applies.")
-            print("  It is measured and printed below. --close-race-window "
-                  "removes it (see SECURITY.md).")
+            print("  Time until capture is printed below; it is not a proof "
+                  "that no input escaped.")
 
         return quarantine.quarantine(
             dev.syspath,
             authorize_fn=lambda: sysfs.set_authorized(dev.syspath, 1),
             duration=self.observe,
             capture=self.capture_payload,
+            deauthorize_fn=lambda: sysfs.set_authorized(dev.syspath, 0),
         )
 
     def _on_remove(self, sys_path: str) -> None:
@@ -607,8 +633,8 @@ class Probolos:
         if name in self.pending:
             del self.pending[name]
             print(f"[*] {name} removed while held; question withdrawn")
-        if name not in self.known:
-            print(f"[*] removed: {name}")
+        self.known.discard(name)
+        print(f"[*] removed: {name}")
 
     # ------------------------------------------------------------------
     # helpers
@@ -694,7 +720,18 @@ class Probolos:
         else:
             prompt = "  Authorize this device? [y/N] "
         if self.timeout > 0 and not critical:
-            prompt = f"  Authorize this device? [y/N] ({self.timeout:.0f}s, default N) "
+            # The countdown variant used to replace the prompt wholesale with
+            # "[y/N]", which DROPPED the [a]lways option from the text while
+            # the parser below went on accepting it. The result was a hidden
+            # control on the one prompt in the tool that grants something
+            # permanent: a user typing `a` -- for "abort", which is what [y/N]
+            # invites you to assume it is not -- created a trust entry that
+            # admits that device silently from then on. An option that is not
+            # offered must not be accepted, so it is offered.
+            choices = ("[y]es once / [a]lways / [N]o"
+                       if self.trust is not None else "[y/N]")
+            prompt = (f"  Authorize this device? {choices} "
+                      f"({self.timeout:.0f}s, default N) ")
         # The timeout applies to critical prompts too. It expires into DENIAL,
         # which is the safe direction, and it stops one suspicious device from
         # blocking the event loop indefinitely.
@@ -768,8 +805,8 @@ class Probolos:
             ],
         }
         try:
-            with open(self.json_log, "a") as fh:
-                fh.write(json.dumps(entry) + "\n")
+            from .securefs import append_json_line
+            append_json_line(self.json_log, entry)
         except OSError as exc:
             print(f"[!] could not write log: {exc}")
 
@@ -852,8 +889,8 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
     if close_race_window and not dry_run:
         from . import deferred_bind
         if deferred_bind.supported():
-            print("  - grab race: will be closed per device "
-                  "(drivers_autoprobe held at 0 for two writes)")
+            print("  - experimental deferred binding enabled; "
+                  "the input grab race still exists")
         else:
             print(f"[!] --close-race-window is not available here: "
                   f"{deferred_bind.unsupported_reason()}")

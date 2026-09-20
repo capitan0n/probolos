@@ -75,9 +75,10 @@ class TextsafeChokepoint(unittest.TestCase):
         def fake_read_attr(path, name, **kw):
             return strings.get(name)
 
-        with mock.patch.object(sysfs, "read_attr", side_effect=fake_read_attr), \
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(sysfs, "read_attr", side_effect=fake_read_attr), \
              mock.patch.object(sysfs, "read_int_attr", return_value=None):
-            return sysfs.load_device(Path("/sys/bus/usb/devices/9-9"))
+            return sysfs.load_device(Path(directory))
 
     def test_escape_sequences_are_neutralised(self):
         dev = self._load_with_strings(product="Kingston\x1b[2J\x1b[1A")

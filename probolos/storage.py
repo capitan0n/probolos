@@ -272,12 +272,14 @@ def inspect_safely(device: str, timeout: float = 10.0,
         target=_inspect_worker, args=(device, child_conn, fd), daemon=True)
     try:
         proc.start()
+        child_conn.close()
         proc.join(timeout)
         if proc.is_alive():
             proc.terminate()
             proc.join(1.0)
             if proc.is_alive():
                 proc.kill()
+                proc.join(0.1)
             # `inspected` stays False (scheme unknown), so no rule mistakes a
             # stalled device for one that passed. The silence is the finding.
             return MediumReport(
@@ -291,6 +293,10 @@ def inspect_safely(device: str, timeout: float = 10.0,
         return MediumReport(device=device,
                             error="inspection process produced no result")
     finally:
+        parent_conn.close()
+        child_conn.close()
+        if proc.pid is not None and not proc.is_alive():
+            proc.close()
         # The child has its own copy (or was killed); ours must not leak. This
         # matters most on the timeout path, where the child never ran finally.
         if fd is not None:

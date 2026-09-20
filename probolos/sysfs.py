@@ -12,6 +12,7 @@ Nothing here parses, judges, or decides. That belongs in higher layers.
 from __future__ import annotations
 
 import re
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -87,6 +88,7 @@ class UsbDevice:
     # rather than merely filled in. rules.py turns these into findings.
     string_notes: List[str] = field(default_factory=list)
     string_note_fields: Dict[str, List[str]] = field(default_factory=dict)
+    instance_id: Optional[tuple] = None
 
     # ---------- derived views ----------
 
@@ -94,13 +96,14 @@ class UsbDevice:
     def interfaces(self) -> List[descriptors.InterfaceDescriptor]:
         if self.descriptor_set is None:
             return []
-        return self.descriptor_set.primary_interfaces()
+        return [iface for config in self.descriptor_set.configs
+                for iface in config.interfaces]
 
     @property
     def interface_classes(self) -> List[int]:
         if self.descriptor_set is None:
             return []
-        return self.descriptor_set.interface_classes()
+        return list(dict.fromkeys(i.interface_class for i in self.interfaces))
 
     @property
     def kinds(self) -> List[str]:
@@ -113,6 +116,15 @@ class UsbDevice:
         if not found and self.device_class is not None:
             found.append(usbclass.kind_of(self.device_class))
         return found or [usbclass.KIND_OTHER]
+
+    @property
+    def inspection_safe(self) -> bool:
+        """Incomplete function lists must never justify early activation."""
+        ds = self.descriptor_set
+        return bool(ds is not None and not self.parse_error
+                    and not ds.truncated and not ds.length_overstated
+                    and ds.configs and len(ds.configs) == ds.device.num_configurations
+                    and not ds.declared_interface_mismatch())
 
     @property
     def claims(self) -> List[str]:
@@ -141,6 +153,10 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
     Returns None if this is not a usb_device node (e.g. it is an interface
     directory like 1-4:1.0, which has no idVendor).
     """
+    try:
+        before = syspath.stat()
+    except OSError:
+        return None
     vid = read_attr(syspath, "idVendor")
     pid = read_attr(syspath, "idProduct")
     if vid is None or pid is None:
@@ -178,6 +194,12 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
         "iSerialNumber": _serial.notes,
     }
 
+    try:
+        after = syspath.stat()
+    except OSError:
+        return None
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        return None
     return UsbDevice(
         syspath=syspath,
         name=syspath.name,
@@ -199,6 +221,7 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
         removable=read_attr(syspath, "removable"),
         string_notes=sorted({n for notes in _fields.values() for n in notes}),
         string_note_fields={k: v for k, v in _fields.items() if v},
+        instance_id=(before.st_dev, before.st_ino),
     )
 
 
@@ -252,6 +275,29 @@ class _DirectBackend:
     # know BEFORE it starts whether the mechanism can complete.
     supports_bus_wide = True
 
+    def admit(self, syspath, instance) -> None:
+        directory_fd = os.open(syspath, os.O_RDONLY | os.O_DIRECTORY |
+                               os.O_CLOEXEC)
+        try:
+            st = os.fstat(directory_fd)
+            if instance != (st.st_dev, st.st_ino):
+                raise OSError("device changed since inspection; approval discarded")
+            # O_CLOEXEC: this runs in the privileged half, which spawns the
+            # storage worker and the dialog backends. A descriptor open on a
+            # device's `authorized` attribute must not survive into a child
+            # that has no business writing it.
+            fd = os.open("authorized", os.O_WRONLY | os.O_TRUNC |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fd = None      # fdopen owns it from here
+                    fh.write("1")
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        finally:
+            os.close(directory_fd)
+
     def authorize(self, syspath: Path, value: int) -> None:
         (syspath / "authorized").write_text(str(value))
 
@@ -269,7 +315,7 @@ class _DirectBackend:
 
     def open_block(self, device_path) -> int:
         import os
-        return os.open(str(device_path), os.O_RDONLY)
+        return os.open(str(device_path), os.O_RDONLY | os.O_NONBLOCK)
 
     def set_drivers_autoprobe(self, value: int) -> None:
         DRIVERS_AUTOPROBE.write_text(str(value))
@@ -311,6 +357,13 @@ def set_authorized(syspath: Path, value: int) -> None:
     write happens in the root gate, not here.
     """
     _backend.authorize(syspath, value)
+
+
+def admit_device(dev: UsbDevice) -> None:
+    """Approve the inspected instance, not whatever now occupies its port."""
+    if dev.instance_id is None:
+        raise OSError("device instance is unavailable; admission refused")
+    _backend.admit(dev.syspath, dev.instance_id)
 
 
 def get_authorized_default(hub: Path) -> Optional[int]:

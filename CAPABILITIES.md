@@ -24,7 +24,7 @@ Status: **alpha**. Validated largely under software emulation
 |---|---|
 | Deny-by-default for newly attached USB devices | `authorized_default=0` written per USB bus (`gate.py`) |
 | Per-device hold and release | `/sys/bus/usb/devices/<dev>/authorized` |
-| Human decision required before a device becomes live | terminal prompt, or desktop agent |
+| Final admission policy | terminal/agent decision, remembered trust, or safety exemption; inspection can activate earlier |
 | Original bus state restored on exit, crash, or signal | `atexit` + signal handlers in `gate.py`; `--release` recovers manually |
 | Devices already attached at start are left alone | the gate governs *new* attachments only |
 
@@ -70,12 +70,11 @@ defaults and are overridable per rule in a YAML config (`--rules`).
 
 ### 1.4 Stage 3 — Pre-authorization quarantine
 
-The distinguishing capability. The device is switched on **with its input
-captured** (`EVIOCGRAB` on every `/dev/input/event*` node belonging to that USB
-device), observed for a bounded window, and then returned to `authorized=0`
-*before* the human is asked. Observation time is therefore decoupled from attack
-success: waiting longer does not increase exposure, because the device is dark
-again before any decision is made.
+The device is temporarily activated and evdev nodes are grabbed as they appear.
+It is re-blocked before those grabs are released, including on exceptions.
+Input can escape before a grab succeeds. Late nodes are checked throughout the
+window, and failed grabs stop it. Event buffers are bounded; timing comes from
+kernel input-event timestamps rather than Python's batch-read times.
 
 Behavioural rules (`rules.behaviour_findings`):
 
@@ -86,16 +85,17 @@ Behavioural rules (`rules.behaviour_findings`):
 - `incomplete-isolation` (WARNING) — a node could not be grabbed
 - `quarantine-unavailable` (NOTICE)
 
-The residual exposure window between `authorized=1` and the grab completing is
-**measured and printed per device** rather than assumed constant (41–85 ms on
-the hardware tested so far). Optional raw keystroke capture (`--capture-payload`,
-off by default) feeds a payload analyzer.
+Authorization-to-first-grab latency is reported. It is not a measurement of
+all escaped input, and `--close-race-window` does not eliminate the race.
+Optional raw keystroke capture (`--capture-payload`, off by default) feeds a
+payload analyzer.
 
 ### 1.5 Stage 4 — Storage inspection without mounting
 
 Read-only inspection of the first sectors of a USB block device (`storage.py`):
-MBR and GPT partition tables, filesystem identification by magic signature. No
-mount, no write, no filesystem driver involved.
+MBR entries and GPT header/protective-MBR detection, with limited filesystem
+signatures. GPT entries are not parsed. Probolos does not mount or write the
+medium; other services can still mount it during activation.
 
 - `partition-beyond-end-of-device` (WARNING)
 - `overlapping-partitions` (WARNING)
@@ -103,14 +103,15 @@ mount, no write, no filesystem driver involved.
 - `large-unallocated-gap` (NOTICE)
 - `gpt-without-protective-mbr` (NOTICE)
 
-The scan runs in a forked worker with a hard timeout, so a device that stalls
-its reads cannot wedge the daemon. Storage inspection is **refused** on a
+The read/parse phase runs in a forked worker with a timeout. Authorization,
+gate-provided descriptor acquisition and cleanup are outside that deadline. Storage inspection is **refused** on a
 composite storage+input device, because authorizing it to look would switch the
-input half on without a grab.
+input half on without a grab. This guard includes every parsed configuration
+and alternate setting. Incomplete descriptors disable early activation entirely.
 
 ### 1.6 Memory across sessions
 
-- **Ledger** (`ledger.py`) — append-only record of every device seen, with a
+- **Ledger** (`ledger.py`) — bounded per-identity history, with a
   SHA-256 hash of its descriptor set. A device that changes its descriptors
   between visits is detectable.
 - **Trust store** (`trust.py`) — devices pinned by identity *and* descriptor
@@ -132,18 +133,18 @@ descriptors over a `SEQPACKET` socket with `SCM_RIGHTS` to an analyzer running
 as `nobody`. The privilege drop is verified, including that `setuid(0)` fails
 afterwards.
 
-Scope is derived from the **kernel**, not from the request: the gate acts only
-on a USB device whose `authorized` flag currently reads `0`, and on input or
-block nodes whose USB parent is such a device. Consequences: the built-in
-PS/2 keyboard has no USB parent and can never be in scope; a non-USB disk is
-refused; a device you are actively using reads `authorized=1` and cannot be
-disturbed. A compromised analyzer cannot widen its own scope by lying.
+The gate distinguishes temporary activation from final admission. Read scope
+follows the USB device ancestor, skipping interface nodes, and requires blocked
+state or an unexpired temporary permission for the same device instance. Final
+admission gives no continued read/deauthorization permission. Whole-device
+requests cannot target interfaces. See `SECURITY.md` for the limits of this
+boundary; the analyzer still controls admission policy.
 
 ### 1.9 Lockout safety
 
 Watchdog with configurable timeout, panic file, `--release` recovery,
-`--allow-port` to exempt known ports, `--dry-run`, and full restoration of bus
-state on any exit path. On the reference laptop the built-in keyboard is on the
+`--allow-port` to exempt known ports, `--dry-run`, and best-effort restoration of bus
+state, including partial startup failures and analyzer disconnects. On the reference laptop the built-in keyboard is on the
 i8042 PS/2 controller and is unaffected by USB authorization entirely.
 
 ### 1.10 Hostile-text handling
@@ -161,12 +162,13 @@ recognising rather than just repairing:
 
 | Was | Now |
 |---|---|
-| `deferred_bind` decided it was supported by counting interface directories on a device held at `authorized=0`, where none exist. It returned `False` on every device and the daemon silently took the racy path. | Rewritten around bus-wide `drivers_autoprobe`, which is the only kernel control acting at the instant interfaces are created. Opt-in via `--close-race-window`. |
+| `deferred_bind` decided it was supported by counting interface directories on a device held at `authorized=0`, where none exist. It returned `False` on every device and the daemon silently took the racy path. | Uses bus-wide `drivers_autoprobe` to defer binding, opt-in via the legacy `--close-race-window` flag. The input race remains. |
 | `descriptors_safe` was imported by nothing, so its bounds on descriptor count and its `bLength` checks protected nothing. | `descriptors.parse()` walks through it. Truncation is now recorded and surfaced instead of discarded. |
 | `storage_hardening` had one of four functions called. A partition with a legal start and an absurd length was read anyway. | All three bounds are wired, and `MediumReport.suspicious` — previously written and read by nobody — is now a finding. |
 | `TrustStore.load()` parsed an admission list without checking who owned it or who could write it. | Ownership, mode, and symlink checks before the JSON is believed. Fails closed. |
 
-Each has a regression test that was verified to go red when the fix is reverted.
+This audit adds regression scenarios and records the actual run in
+`AUDIT_REPORT_EL.md`; hardware claims are not inferred from mock tests.
 
 ### 1.11 Non-product tooling
 
@@ -218,43 +220,20 @@ store — have been fixed; see §1.12.
   their length. Reaching the report descriptor itself requires the device to be
   authorized and `usbhid` bound, i.e. the quarantine stage. Not yet wired to
   anything; see §3.2.
-- **`--close-race-window` is unvalidated on hardware.** The mechanism is
-  implemented, unit-tested against a synthetic sysfs tree, and off by default.
-  It has not yet been run against a real device on a real kernel. Until it has,
-  treat the exposure window as open unless you have measured otherwise on your
-  own machine.
-- **systemd units ship but should not be enabled yet.** Enabling them commits
-  the machine to whatever the defaults are, unattended, before
-  `--close-race-window` has hardware validation.
+- **Deferred binding remains experimental.** It does not guarantee a zero
+  exposure window. The systemd unit needs live integration testing too.
 
 ---
 
 ## 3. What may be built
 
-Nothing here is promised. Ordering is by "closes a real gap and is achievable"
-first, research second.
+### 3.1 Validate the existing scope before adding features
 
-### 3.1 Validate the race-window fix on hardware
-
-The mechanism is written; what is missing is evidence that it works outside a
-synthetic sysfs tree. In order:
-
-1. Confirm the premise on your kernel — with the gate active and a device held,
-   this should print nothing, because interfaces do not exist before
-   authorization:
-   ```sh
-   ls -d /sys/bus/usb/devices/<dev>:*
-   ```
-2. Run `--close-race-window` against a HID device on the emulated testbed
-   (`dummy_hcd`), where a lockout costs nothing.
-3. Only then a real keyboard, with a second machine or an SSH session available.
-4. Measure the window with and without the flag, on the same device, several
-   times. That before/after pair is the strongest experimental result the
-   project can produce, and it is worth collecting carefully.
-
-The one alternative still worth keeping in view is **`usbip` to a sacrificial
-host**, which removes both the race and the kernel-parsing exposure of §2.1 at
-the cost of a second machine.
+For a thesis, prioritize hardware experiments: escaped keystrokes at the trusted
+host, detection/miss rates, false positives on ordinary devices, stage latency,
+and recovery after failures. Measure actual effects, not just discovery-to-grab
+time. A clear, limited contribution with reproducible evidence is sufficient;
+new detectors, kernel components or a second machine are separate research work.
 
 ### 3.2 Reach the HID report descriptors
 

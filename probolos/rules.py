@@ -33,7 +33,8 @@ from enum import IntEnum
 from typing import Dict, List, Optional, Sequence, Set
 
 from . import usbclass
-from .textsafe import NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE
+from .textsafe import (NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE,
+                       NOTE_STACKED_MARKS)
 
 # Class codes referenced by the rules
 CLS_AUDIO = 0x01
@@ -398,6 +399,19 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
             "this device's text. This is often just careless Unicode rather "
             "than an attack, so it is flagged only for awareness." + detail)
 
+    if NOTE_STACKED_MARKS in notes:
+        fields = _crafted_field_phrases(per_field, {NOTE_STACKED_MARKS})
+        where = _join_phrases(fields)
+        detail = (f" Seen in the {where}." if where else "")
+        add("stacked-combining-marks", Severity.WARNING,
+            "Device strings pile combining marks on one character",
+            "More combining marks are stacked on a single character than any "
+            "writing system uses. They take up no terminal columns, so a long "
+            "run of them renders over the lines around it and can disfigure "
+            "this report while measuring as a short string." + detail +
+            " No manufacturer does this by accident, so it is a strong sign "
+            "the descriptor was written rather than generated.")
+
     # -- 8. What the device says about its own power draw ------------------
     findings.extend(_power_findings(dev, cfg))
 
@@ -601,7 +615,20 @@ def behaviour_findings(obs, config: Optional[RuleConfig] = None) -> List[Finding
             "Behaviour could not be observed",
             f"{obs.error}. The device was judged on its claims alone, which is "
             "exactly the situation a well-made malicious device is built for.")
-        return findings
+
+    # -- did the device actually go back to blocked? -----------------------
+    # CRITICAL, not a notice. Every other finding here is read on the
+    # assumption that the device is off again and cannot act while the human
+    # reads. If the re-block failed, that assumption is false: the device is
+    # live, ungrabbed, and the prompt about to be shown would be misleading in
+    # the one direction that matters.
+    if getattr(obs, "reblock_error", None):
+        add("quarantine-not-restored", Severity.CRITICAL,
+            "The device is STILL SWITCHED ON after observation",
+            f"Probolos could not set authorized=0 again ({obs.reblock_error}). "
+            "If the device is still plugged in it is live and no longer "
+            "captured, so anything it sends now reaches your session. Unplug "
+            "it before answering.")
 
     ungrabbed = [n for n in obs.nodes if n not in obs.grabbed]
     if obs.grab_failures or ungrabbed:
@@ -669,17 +696,9 @@ def race_window_note(obs) -> Optional[str]:
     if not obs.observed:
         return None
     enum_ms = obs.race_window * 1000
-    exp_ms = obs.exposure_window * 1000
-    # Two distinct numbers, because conflating them hides the mechanism:
-    #   enumeration = authorize -> grab (kernel work; ~constant)
-    #   exposure    = live node existed -> grab (the real risk window)
-    if obs.first_node_at > 0.0 and exp_ms < enum_ms:
-        return (f"enumeration {enum_ms:.0f} ms; actual exposure {exp_ms:.0f} ms "
-                f"(a live input node existed for {exp_ms:.0f} ms before capture)")
-    # Fallback path (no deferred bind, or node timing unavailable): the
-    # old honest statement, where enumeration and exposure coincide.
-    return (f"isolated {enum_ms:.0f} ms after authorization; "
-            f"anything sent in that window reached the session")
+    return (f"first input captured {enum_ms:.0f} ms after authorization; "
+            "input may have escaped before capture. Node-discovery time "
+            "does not measure the true exposure window.")
 
 
 def _mean(values) -> Optional[float]:

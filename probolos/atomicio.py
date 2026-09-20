@@ -110,46 +110,30 @@ def write_json_atomic(path: Path, payload: dict) -> None:
     OSError from save() as "could not persist" and report it once, so no new
     error handling is needed at the call sites.
     """
+    from .securefs import open_directory
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _staging_path(path)
-
     data = json.dumps(payload, indent=1).encode("utf-8")
-
-    # O_NOFOLLOW: refuse a symlink at `tmp`. O_EXCL: refuse an existing file at
-    # `tmp` (so we never write into something we did not just create). 0o600:
-    # the store is only ever meant to be read by root or the analyzer user, so
-    # do not create it group/other readable.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-    fd = os.open(str(tmp), flags, 0o600)
+    directory_fd = open_directory(path.parent, create=True)
+    tmp = _staging_path(path).name
+    created = False
     try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(tmp, flags, 0o600, dir_fd=directory_fd)
+        created = True
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-    except BaseException:
-        # Do not leave a half-written temp file behind to block the next save.
+        os.replace(tmp, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        created = False
         try:
-            os.unlink(str(tmp))
+            os.fsync(directory_fd)
         except OSError:
             pass
-        raise
-
-    os.replace(str(tmp), str(path))
-
-    # Persist the rename itself. Without this the file's CONTENTS are on disk
-    # (we fsynced them) while the directory entry pointing at them may not be,
-    # so a power loss can leave the previous version in place. Failing here is
-    # not worth raising over -- the data is written and visible -- but it must
-    # not pass silently either, so the OSError is swallowed only for the case
-    # where the platform will not let us open a directory at all.
-    try:
-        dir_fd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
     finally:
-        os.close(dir_fd)
+        if created:
+            try:
+                os.unlink(tmp, dir_fd=directory_fd)
+            except OSError:
+                pass
+        os.close(directory_fd)

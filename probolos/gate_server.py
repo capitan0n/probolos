@@ -1,64 +1,13 @@
-"""
-The privileged gate. This is the ONLY code that runs as root.
+"""Privileged USB gate.
 
-Read this file whole. It is meant to be short enough that you can, and its
-shortness is a security property, not a style preference: the trusted computing
-base of the whole tool is this file plus the kernel. Everything clever --
-rules, timing, the ledger, payload reconstruction -- lives in the unprivileged
-analyzer, where a bug is a bug and not a root compromise.
+The analyzer is untrusted. Whole-device, interface and root-hub operations are
+separate. Temporary authorization records the kernel directory instance and a
+bounded permission to open its input/block nodes. Final admission records no
+such permission. Input scope climbs past USB interface nodes to the peripheral.
 
-WHAT IT WILL DO
-    - write authorized / authorized_default under /sys/bus/usb/devices
-    - open an input node under /dev/input read-only and hand back the fd
-    - answer a ping
-
-WHAT IT WILL NOT DO, EVER
-    - parse a descriptor, run a rule, read a keystroke, touch the ledger,
-      open a network socket, read a config file, or act on any path outside
-      the two directories below.
-
-Every request is checked against a fixed path prefix before the syscall. The
-analyzer is treated as untrusted input, because the entire value of the split
-is that a compromised analyzer cannot escalate. A message asking to write
-"/etc/shadow" is refused here, not trusted to be well-intentioned.
-
-Beyond "is this a real USB/input/block node", the gate also enforces SCOPE: it
-acts only on a USB device the kernel currently reports as blocked
-(authorized=0), and on input/block nodes whose USB parent is such a device.
-This is derived from the kernel, not from the analyzer's claims, so a
-compromised analyzer cannot open the built-in keyboard, read the system disk,
-or disturb a device you are actively using -- even with otherwise valid paths.
-
-TWO HOLES IN THAT SCOPE, NOW CLOSED
------------------------------------
-The paragraph above was the claim; the code did not fully implement it.
-
-  1. DEAUTHORIZATION WAS UNSCOPED. `value=0` was accepted for any valid USB
-     path, on the reasoning that "tightening is never the risk". It is: the
-     device you are actively using is exactly the one an attacker wants
-     switched off. A compromised analyzer could send authorize(<your USB
-     keyboard>, 0) -- or, worse, unbind one interface of it -- and kill
-     hardware the gate had never been asked about. That contradicts the
-     sentence above, which promises the opposite.
-
-     The gate therefore remembers which devices IT authorized out of
-     quarantine, and will switch off only those, or something already off
-     (a no-op). Everything else is refused.
-
-  2. authorized_default WAS COMPLETELY UNSCOPED. It is the global switch the
-     whole tool rests on: setting it back to 1 means every device attached
-     afterwards is admitted with no question asked. Any path was accepted and
-     any value was written, so the cheapest possible attack on Probolos was to
-     ask its own root half to turn it off -- no exploit needed beyond a
-     compromised analyzer, which is precisely the threat the split exists for.
-
-     Now: only a root hub (usbN) is accepted; 0 is always allowed (closing is
-     never the risk); and the gate will re-open a hub ONLY to the value it
-     itself read there before closing it. A hub the gate never closed cannot
-     be opened by the analyzer at all.
-
-Both records live in this process and are never taken from the wire, so a
-compromised analyzer cannot widen its scope by asserting anything.
+This module plus its protocol and privileged startup/cleanup dependencies form
+the userspace privilege boundary. It is not an independent human-approval
+service: the analyzer still controls admission policy for unknown devices.
 """
 
 from __future__ import annotations
@@ -66,6 +15,8 @@ from __future__ import annotations
 import array
 import os
 import socket
+import stat
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -126,6 +77,9 @@ class GateServer:
         # Root hub path -> the authorized_default value found there before the
         # gate closed it. Only this value may be written back.
         self._closed_defaults: dict = {}
+        self._open_leases: dict = {}
+        self._instances: dict = {}
+
 
     # ---- path validation: the heart of the security boundary ----
 
@@ -154,7 +108,7 @@ class GateServer:
         """
         try:
             resolved = os.path.realpath(path)
-        except OSError:
+        except (OSError, ValueError):
             return None
         # Must resolve into the real device tree and be a directory.
         if not (resolved + "/").startswith(USB_REAL_PREFIX):
@@ -177,14 +131,19 @@ class GateServer:
     def _safe_input_path(path: str) -> Optional[Path]:
         try:
             resolved = os.path.realpath(path)
-        except OSError:
+        except (OSError, ValueError):
             return None
         if not resolved.startswith(INPUT_PREFIX):
             return None
         p = Path(resolved)
         # Must be an actual event node, not a directory or a symlink target
         # that wandered somewhere unexpected.
-        return p if (p.exists() and p.name.startswith("event")) else None
+        try:
+            return p if (p.parent == Path(INPUT_PREFIX)
+                         and _re.fullmatch(r"event[0-9]+", p.name)
+                         and stat.S_ISCHR(p.stat().st_mode)) else None
+        except OSError:
+            return None
 
     @staticmethod
     def _safe_block_path(path: str) -> Optional[Path]:
@@ -199,7 +158,7 @@ class GateServer:
         import stat as _stat
         try:
             resolved = os.path.realpath(path)
-        except OSError:
+        except (OSError, ValueError):
             return None
         p = Path(resolved)
         if p.parent != Path("/dev") or not _BLOCK_NAME.match(p.name):
@@ -207,27 +166,11 @@ class GateServer:
         try:
             if not _stat.S_ISBLK(os.stat(resolved).st_mode):
                 return None
-        except OSError:
+        except (OSError, ValueError):
             return None
         return p
 
-    # ---- scope: the gate acts only on a device that is genuinely blocked ----
-    #
-    # The path checks above prove "this is a real USB / input / block node". They
-    # do NOT prove "this is the device the analyzer is supposed to be inspecting
-    # right now". Without that second question the boundary is far weaker than it
-    # looks: a compromised analyzer could ask the gate to open /dev/input/event0
-    # (your built-in keyboard) for a system-wide keylogger, read /dev/sda, or
-    # deauthorize a device you are actively using -- all with valid paths.
-    #
-    # The invariant that closes this is: the gate only ever acts on a USB device
-    # whose kernel `authorized` flag is currently 0. That is precisely the set of
-    # devices Probolos is holding for a decision. A device you are using is
-    # authorized=1 and is refused; the built-in keyboard is not a USB device at
-    # all and is refused; a raw disk whose USB parent is authorized=1 is refused.
-    #
-    # Crucially this is derived from the KERNEL, not asserted by the analyzer, so
-    # a compromised analyzer cannot widen its own scope by lying.
+    # ---- kernel-derived peripheral identity and temporary inspection scope ----
 
     @staticmethod
     def _usb_device_is_blocked(usb_path: Path) -> bool:
@@ -244,21 +187,11 @@ class GateServer:
         return raw == "0"
 
     @classmethod
-    def _blocked_usb_parent_of(cls, node: Path) -> Optional[Path]:
-        """
-        Walk up from a /dev node's sysfs home to the USB device backing it, and
-        return that USB device path ONLY if it is currently blocked.
-
-        A /dev/input/eventN or /dev/sdX has a sysfs directory under
-        /sys/class/... whose `device` symlink chain climbs the device tree. A
-        USB-backed node's chain passes through a directory that the bus view
-        (/sys/bus/usb/devices/) also links to. A PS/2 keyboard (i8042) or a SATA
-        disk has no such USB ancestor, so this returns None and the node is
-        refused -- which is exactly what keeps the built-in keyboard off-limits.
-        """
+    def _usb_parent_of(cls, node: Path) -> Optional[Path]:
+        """Find the peripheral USB device, never an interface or root hub."""
         try:
             resolved = os.path.realpath(node)
-        except OSError:
+        except (OSError, ValueError):
             return None
         name = Path(resolved).name  # e.g. eventN or sdX
 
@@ -275,66 +208,97 @@ class GateServer:
             while cur != cur.parent and str(cur).startswith(USB_REAL_PREFIX):
                 bus_view = Path(USB_LINK_PREFIX) / cur.name
                 try:
-                    if (bus_view.exists()
+                    if (":" not in cur.name
+                            and not _ROOT_HUB_NAME.fullmatch(cur.name)
+                            and bus_view.exists()
                             and os.path.realpath(bus_view) == str(cur)):
                         # Found the USB device. In scope only if it is blocked.
-                        return cur if cls._usb_device_is_blocked(cur) else None
+                        return cur
                 except OSError:
                     pass
                 cur = cur.parent
         return None
 
+    @classmethod
+    def _blocked_usb_parent_of(cls, node: Path) -> Optional[Path]:
+        parent = cls._usb_parent_of(node)
+        return parent if parent and cls._usb_device_is_blocked(parent) else None
+
+    @staticmethod
+    def _instance(path):
+        st = path.stat()
+        return st.st_dev, st.st_ino
+
+    def _owns_instance(self, path):
+        try:
+            return (str(path) in self._authorized_here
+                    and self._instances.get(str(path)) == self._instance(path))
+        except OSError:
+            return False
+
+    def _open_scope_parent_of(self, node):
+        parent = self._usb_parent_of(node)
+        if parent is None:
+            return None
+        if self._usb_device_is_blocked(parent):
+            return parent
+        if (self._owns_instance(parent)
+                and time.monotonic() < self._open_leases.get(str(parent), 0)):
+            return parent
+        return None
+
     # ---- request handlers ----
 
     def _do_authorize(self, req: protocol.Request) -> protocol.Response:
+        """Temporary activation; final admission uses a separate operation."""
+        return self._change_authorization(req, temporary=True)
+
+    def _do_admit(self, req: protocol.Request) -> protocol.Response:
+        if req.value != 1 or req.instance is None:
+            return protocol.Response(protocol.ERROR, "admission needs a device instance")
+        return self._change_authorization(req, temporary=False)
+
+    def _change_authorization(self, req, temporary):
         if req.value not in (0, 1):
             return protocol.Response(protocol.ERROR, "value must be 0 or 1")
         devpath = self._safe_usb_path(req.path)
-        if devpath is None:
-            # Include the exact path and its resolved form in the denial, so a
-            # rejected request can be diagnosed instead of guessed at.
-            resolved = os.path.realpath(req.path) if req.path else "(empty)"
-            return protocol.Response(
-                protocol.DENIED,
-                f"not a USB device path: {req.path!r} -> {resolved!r}")
-        # Scope, switching ON: only a device that is currently blocked. This
-        # stops a compromised analyzer re-authorizing -- or churning -- a
-        # device you are actively using.
-        if req.value == 1 and not self._usb_device_is_blocked(devpath):
-            return protocol.Response(
-                protocol.DENIED,
-                "refusing to authorize a device that is not under quarantine "
-                f"(authorized != 0): {devpath.name}")
-
-        # Scope, switching OFF. This used to be unconditional, on the reasoning
-        # that tightening cannot hurt. It can: the device an attacker most
-        # wants switched off is the one you are using, and "deauthorize the
-        # user's USB keyboard" is a one-message denial of service that every
-        # other check here was written to prevent.
-        #
-        # The legitimate need is narrow and can be stated exactly: the daemon
-        # authorizes a device for quarantine or a storage read and must be able
-        # to put it straight back. So the gate allows switching off only what
-        # it switched on, plus anything already off (where the write is a
-        # no-op that keeps the daemon's "make the state explicit" calls
-        # working).
-        if req.value == 0 and str(devpath) not in self._authorized_here:
-            if not self._usb_device_is_blocked(devpath):
-                return protocol.Response(
-                    protocol.DENIED,
-                    "refusing to deauthorize a device this gate did not "
-                    f"authorize: {devpath.name}")
+        if (devpath is None or ":" in devpath.name
+                or _ROOT_HUB_NAME.fullmatch(devpath.name)):
+            return protocol.Response(protocol.DENIED, "not a peripheral USB device")
+        directory_fd = None
         try:
-            (devpath / "authorized").write_text(str(req.value))
+            directory_fd = os.open(devpath, os.O_RDONLY | os.O_DIRECTORY |
+                                    os.O_NOFOLLOW | os.O_CLOEXEC)
+            st = os.fstat(directory_fd)
+            instance = (st.st_dev, st.st_ino)
+            if req.instance is not None and req.instance != instance:
+                return protocol.Response(protocol.DENIED, "device changed since inspection")
+            read_fd = os.open("authorized", os.O_RDONLY | os.O_NOFOLLOW,
+                              dir_fd=directory_fd)
+            with os.fdopen(read_fd) as fh:
+                blocked = fh.read(8).strip() == "0"
+            owned = (str(devpath) in self._authorized_here
+                     and self._instances.get(str(devpath)) == instance)
+            if not blocked and (req.value == 1 or not owned):
+                return protocol.Response(protocol.DENIED, "device is outside quarantine")
+            fd = os.open("authorized", os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+                         dir_fd=directory_fd)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(str(req.value))
+            if req.value == 1 and temporary:
+                self._authorized_here.add(str(devpath))
+                self._instances[str(devpath)] = instance
+                self._open_leases[str(devpath)] = time.monotonic() + 30.0
+            else:
+                self._authorized_here.discard(str(devpath))
+                self._instances.pop(str(devpath), None)
+                self._open_leases.pop(str(devpath), None)
+            return protocol.Response(protocol.OK)
         except OSError as exc:
             return protocol.Response(protocol.ERROR, str(exc))
-        # Recorded only after the write succeeded, so a failed authorization
-        # never grants the right to deauthorize something.
-        if req.value == 1:
-            self._authorized_here.add(str(devpath))
-        else:
-            self._authorized_here.discard(str(devpath))
-        return protocol.Response(protocol.OK)
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     def _do_authorize_interface(self, req: protocol.Request) -> protocol.Response:
         """
@@ -361,8 +325,8 @@ class GateServer:
                 f"not an interface (no configuration:interface suffix): {intf.name}")
         parent = intf.parent
         in_scope = (self._usb_device_is_blocked(parent)
-                    or str(parent) in self._authorized_here)
-        if req.value == 1 and not self._usb_device_is_blocked(parent):
+                    or self._owns_instance(parent))
+        if req.value == 1 and not in_scope:
             return protocol.Response(
                 protocol.DENIED,
                 "refusing to bind an interface on a device that is not under "
@@ -378,11 +342,37 @@ class GateServer:
                 protocol.DENIED,
                 "refusing to unbind an interface of a device that is neither "
                 f"under quarantine nor authorized by this gate: {parent.name}")
+        # Written through a descriptor on the interface directory, not by name.
+        # _change_authorization was hardened this way and this path was not,
+        # which left the gate with two ways to write a sysfs `authorized` and
+        # only one of them checking what it was actually writing to. The same
+        # reasoning applies here: between _safe_usb_path() above and the write,
+        # the interface can be unplugged and the name re-created by whatever
+        # enumerates next at that port. Pinning the directory first means the
+        # write either lands on the interface that was validated or fails.
         try:
-            (intf / "authorized").write_text(str(req.value))
-            return protocol.Response(protocol.OK)
+            return self._write_authorized_at(intf, req.value)
         except OSError as exc:
             return protocol.Response(protocol.ERROR, str(exc))
+
+    @staticmethod
+    def _write_authorized_at(directory: Path, value: int) -> "protocol.Response":
+        """Write `authorized` relative to a held descriptor on `directory`."""
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY |
+                               os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            fd = os.open("authorized", os.O_WRONLY | os.O_TRUNC |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fd = None
+                    fh.write(str(value))
+            finally:
+                if fd is not None:
+                    os.close(fd)
+            return protocol.Response(protocol.OK)
+        finally:
+            os.close(directory_fd)
 
     def _do_set_default(self, req: protocol.Request) -> protocol.Response:
         """
@@ -417,7 +407,23 @@ class GateServer:
                 f"authorized_default belongs to a root hub, not to "
                 f"{hubpath.name}")
 
-        attr = hubpath / "authorized_default"
+        # Read and written relative to a descriptor on the hub directory, for
+        # the reason given on _write_authorized_at: this is the single most
+        # powerful attribute in the protocol and it was the last one still
+        # being reached by name after the check that approved it.
+        try:
+            hub_fd = os.open(hubpath, os.O_RDONLY | os.O_DIRECTORY |
+                             os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            return protocol.Response(protocol.ERROR, str(exc))
+        try:
+            return self._set_default_at(hub_fd, hubpath, req.value)
+        finally:
+            os.close(hub_fd)
+
+    def _set_default_at(self, hub_fd: int, hubpath: Path,
+                        value: int) -> "protocol.Response":
+        req = protocol.Request(protocol.REQ_SET_DEFAULT, str(hubpath), value)
 
         if req.value != 0:
             expected = self._closed_defaults.get(str(hubpath))
@@ -440,12 +446,34 @@ class GateServer:
         previous = None
         if req.value == 0:
             try:
-                previous = int(attr.read_text().strip())
+                read_fd = os.open("authorized_default",
+                                  os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                  dir_fd=hub_fd)
+                with os.fdopen(read_fd) as fh:
+                    previous = int(fh.read(16).strip())
             except (OSError, ValueError):
-                previous = None
+                # Unreadable, so there is no true previous value to restore.
+                # It must NOT stay None: the record below is the only thing
+                # that lets this hub be reopened at all, and skipping it left
+                # the hub closed permanently -- restore() iterates
+                # _closed_defaults, so a hub missing from it is never touched
+                # again and no USB device on it binds a driver after the daemon
+                # exits. 1 is the same fallback gate.py already uses for a hub
+                # found at 0: the only value that leaves the machine usable.
+                previous = 1
 
         try:
-            attr.write_text(str(req.value))
+            write_fd = os.open("authorized_default",
+                               os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW |
+                               os.O_CLOEXEC,
+                               dir_fd=hub_fd)
+            try:
+                with os.fdopen(write_fd, "w") as fh:
+                    write_fd = None
+                    fh.write(str(req.value))
+            finally:
+                if write_fd is not None:
+                    os.close(write_fd)
         except OSError as exc:
             return protocol.Response(protocol.ERROR, str(exc))
 
@@ -479,15 +507,22 @@ class GateServer:
         # never be in scope, and a compromised analyzer cannot turn the gate
         # into a system-wide keylogger. An unplugged/authorized device's node
         # is refused too.
-        if self._blocked_usb_parent_of(node) is None:
+        if self._open_scope_parent_of(node) is None:
             return protocol.Response(
                 protocol.DENIED,
                 "input node is not backed by a USB device under quarantine: "
                 f"{node.name}"), None
+        fd = None
         try:
-            fd = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK)
+            fd = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            if (os.fstat(fd).st_rdev != node.stat().st_rdev
+                    or self._open_scope_parent_of(node) is None):
+                os.close(fd)
+                return protocol.Response(protocol.DENIED, "device changed during open"), None
             return protocol.Response(protocol.OK, has_fd=True), fd
         except OSError as exc:
+            if fd is not None:
+                os.close(fd)
             return protocol.Response(protocol.ERROR, str(exc)), None
 
     def _do_open_block(self, req: protocol.Request):
@@ -501,23 +536,49 @@ class GateServer:
         # internal SATA/NVMe disk has no USB parent and is refused, so a
         # compromised analyzer cannot read /dev/sda (your system disk) even
         # though it is a valid whole-disk node.
-        if self._blocked_usb_parent_of(node) is None:
+        if self._open_scope_parent_of(node) is None:
             return protocol.Response(
                 protocol.DENIED,
                 "disk is not backed by a USB device under quarantine: "
                 f"{node.name}"), None
+        fd = None
         try:
-            fd = os.open(str(node), os.O_RDONLY)
+            fd = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            if (os.fstat(fd).st_rdev != node.stat().st_rdev
+                    or self._open_scope_parent_of(node) is None):
+                os.close(fd)
+                return protocol.Response(protocol.DENIED, "device changed during open"), None
             return protocol.Response(protocol.OK, has_fd=True), fd
         except OSError as exc:
+            if fd is not None:
+                os.close(fd)
             return protocol.Response(protocol.ERROR, str(exc)), None
 
     # ---- the loop ----
 
     def serve_forever(self) -> None:
+        try:
+            self._serve_requests()
+        finally:
+            self.restore()
+
+    def restore(self):
+        for path in list(self._authorized_here):
+            if self._owns_instance(Path(path)):
+                resp = self._do_authorize(protocol.Request(
+                    protocol.REQ_AUTHORIZE, path, 0, self._instances[path]))
+                if not resp.ok:
+                    self.log(f"[gate] could not re-block {path}: {resp.detail}")
+        for path, previous in list(self._closed_defaults.items()):
+            resp = self._do_set_default(protocol.Request(
+                protocol.REQ_SET_DEFAULT, path, previous or 1))
+            if not resp.ok:
+                self.log(f"[gate] could not restore {path}: {resp.detail}")
+
+    def _serve_requests(self) -> None:
         while True:
             try:
-                data = self.sock.recv(protocol.MAX_MESSAGE)
+                data = self.sock.recv(protocol.MAX_MESSAGE + 1)
             except OSError:
                 break
             if not data:
@@ -527,27 +588,46 @@ class GateServer:
             try:
                 req = protocol.Request.decode(data)
             except ValueError as exc:
-                self._reply(protocol.Response(protocol.ERROR,
-                                              f"bad request: {exc}"))
+                try:
+                    self._reply(protocol.Response(protocol.ERROR,
+                                                  f"bad request: {exc}"))
+                except _PeerGone:
+                    break
                 continue
 
-            if req.kind == protocol.REQ_PING:
-                resp = protocol.Response(protocol.OK, "pong")
-            elif req.kind == protocol.REQ_AUTHORIZE:
-                resp = self._do_authorize(req)
-            elif req.kind == protocol.REQ_AUTHORIZE_INTERFACE:
-                resp = self._do_authorize_interface(req)
-            elif req.kind == protocol.REQ_SET_DEFAULT:
-                resp = self._do_set_default(req)
-            elif req.kind == protocol.REQ_OPEN_INPUT:
-                resp, fd_to_send = self._do_open_input(req)
-            elif req.kind == protocol.REQ_OPEN_BLOCK:
-                resp, fd_to_send = self._do_open_block(req)
-            else:
-                resp = protocol.Response(protocol.ERROR, "unhandled kind")
+            # A bug in a handler must not end the gate. This process holds the
+            # ONLY record of which hubs it closed and which devices it switched
+            # on; if it dies, restore() runs but nothing else does, and the
+            # analyzer is left talking to a closed socket. Every handler below
+            # is written to return a Response rather than raise, so reaching
+            # this except is itself the bug -- which is exactly why it must be
+            # caught rather than trusted not to happen.
+            try:
+                if req.kind == protocol.REQ_PING:
+                    resp = protocol.Response(protocol.OK, "pong")
+                elif req.kind == protocol.REQ_ADMIT:
+                    resp = self._do_admit(req)
+                elif req.kind == protocol.REQ_AUTHORIZE:
+                    resp = self._do_authorize(req)
+                elif req.kind == protocol.REQ_AUTHORIZE_INTERFACE:
+                    resp = self._do_authorize_interface(req)
+                elif req.kind == protocol.REQ_SET_DEFAULT:
+                    resp = self._do_set_default(req)
+                elif req.kind == protocol.REQ_OPEN_INPUT:
+                    resp, fd_to_send = self._do_open_input(req)
+                elif req.kind == protocol.REQ_OPEN_BLOCK:
+                    resp, fd_to_send = self._do_open_block(req)
+                else:
+                    resp = protocol.Response(protocol.ERROR, "unhandled kind")
+            except Exception as exc:   # noqa: BLE001 -- see above
+                self.log(f"[gate] handler for {req.kind!r} raised: {exc!r}")
+                resp = protocol.Response(protocol.ERROR, "internal gate error")
 
+            peer_gone = False
             try:
                 self._reply(resp, fd_to_send)
+            except _PeerGone:
+                peer_gone = True
             finally:
                 # The kernel duplicated the fd into the analyzer on send; our
                 # copy is no longer needed and must not leak. In a `finally`
@@ -559,15 +639,43 @@ class GateServer:
                         os.close(fd_to_send)
                     except OSError:
                         pass
+            if peer_gone:
+                break
 
     def _reply(self, resp: protocol.Response, fd: Optional[int] = None) -> None:
+        """
+        Send one response. A dead peer is a normal end, not a crash.
+
+        sendmsg() to an analyzer that has already exited raises EPIPE, and
+        nothing caught it: the exception left _serve_requests, left run_gate,
+        and left privsep.start() -- which never reached its os.waitpid(), so
+        the root process died with a traceback and the analyzer child was
+        orphaned. The analyzer dying between its request and this reply is an
+        entirely ordinary way for the tool to shut down (Ctrl-C, a crash, a
+        kill), so it must end the serve loop cleanly instead.
+
+        The detail is also bounded. It can contain a path the analyzer chose,
+        and a response the analyzer cannot parse is useless to it; MAX_MESSAGE
+        is the size its decoder will accept.
+        """
+        if len(resp.detail) > 1024:
+            resp = protocol.Response(resp.status, resp.detail[:1021] + "...",
+                                     resp.has_fd)
         payload = resp.encode()
-        if fd is None:
-            self.sock.sendmsg([payload])
-        else:
-            ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                          array.array("i", [fd]))]
-            self.sock.sendmsg([payload], ancillary)
+        try:
+            if fd is None:
+                self.sock.sendmsg([payload])
+            else:
+                ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                              array.array("i", [fd]))]
+                self.sock.sendmsg([payload], ancillary)
+        except OSError as exc:
+            self.log(f"[gate] analyzer went away before the reply ({exc})")
+            raise _PeerGone from exc
+
+
+class _PeerGone(Exception):
+    """The analyzer is no longer reachable. Ends the serve loop, quietly."""
 
 
 def run_gate(sock: socket.socket, log=print) -> None:
