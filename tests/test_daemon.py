@@ -1,13 +1,16 @@
 """
-Tests for the screen-lock policy.
+The daemon loop: screen-lock policy, the held queue, and the order the
+inspection stages run in.
 
-The requirement being encoded: a device attached while nobody is at the machine
-must not be powered up, must not be admitted even if remembered, and must not
-have to be unplugged and replugged for its owner to decide about it.
-
-All of it is driven through an injected session monitor, so the behaviour is
-tested without arranging a real locked screen.
+Merged from: test_session.py, test_stage_ordering.py
 """
+from __future__ import annotations
+
+# =========================================================================
+# test_session.py
+#
+# Tests for the screen-lock policy.
+# =========================================================================
 
 import unittest
 from pathlib import Path
@@ -213,9 +216,6 @@ class TestUnlockDrainsTheQueue(unittest.TestCase):
         self.assertEqual(engine.pending, {})
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class TestStrandedDevicesAtStartup(unittest.TestCase):
     """
@@ -337,3 +337,88 @@ class TestHeldDevicesBypassTrust(unittest.TestCase):
                                side_effect=lambda p, was_held=False: seen.append(was_held)):
             engine._drain_pending()
         self.assertEqual(seen, [True])
+
+
+# =========================================================================
+# test_stage_ordering.py
+#
+# Regression tests for the stage-3-before-stage-4 ordering (audit finding C1).
+# =========================================================================
+
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from probolos import daemon as daemon_mod
+from probolos import session, sysfs, usbclass
+
+
+def make_stage_device(name="3-9", kinds=None):
+    dev = mock.Mock(spec=sysfs.UsbDevice)
+    dev.name = name
+    dev.syspath = Path(f"/sys/bus/usb/devices/{name}")
+    dev.kinds = kinds or [usbclass.KIND_STORAGE]
+    dev.is_root_hub = False
+    dev.claims = ["Mass Storage (SCSI)"]
+    dev.vendor_id, dev.product_id = "0951", "1665"
+    dev.serial = "ABC"
+    dev.raw_descriptors = b"\x12\x01test"
+    dev.removable = "removable"
+    dev.label.return_value = "Kingston DataTraveler"
+    return dev
+
+
+class StageOrdering(unittest.TestCase):
+
+    def setUp(self):
+        self.writes = []
+        # Unlocked, storage inspection ON, no observation window so the grab
+        # path itself does not need a real device. observe=0 means stage 3 is
+        # skipped, which is fine: what we are pinning is that stage 4 does not
+        # authorize a device that can type.
+        self.engine = daemon_mod.Probolos(
+            monitor=session.AlwaysUnlocked(),
+            observe=0,
+            inspect_storage=True)
+
+    def run_add(self, dev, approved=False):
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized",
+                               side_effect=lambda p, v: self.writes.append(v)), \
+             mock.patch.object(self.engine, "_load_with_retry",
+                               return_value=dev), \
+             mock.patch.object(self.engine, "_ask", return_value=approved), \
+             mock.patch.object(daemon_mod.report, "one_liner",
+                               return_value="x"), \
+             mock.patch.object(daemon_mod.report, "render",
+                               return_value="x"):
+            self.engine._on_add(str(dev.syspath))
+
+    def test_composite_input_storage_is_not_inspected(self):
+        dev = make_stage_device(kinds=[usbclass.KIND_INPUT, usbclass.KIND_STORAGE])
+        with mock.patch.object(self.engine, "_inspect_medium") as inspect_fn:
+            self.run_add(dev, approved=False)
+            inspect_fn.assert_not_called()
+
+    def test_composite_input_storage_is_never_authorized_before_decision(self):
+        """
+        The whole point of C1: no set_authorized(1) may reach a device that can
+        type until the human has said yes. With observe=0 and a rejection, the
+        only writes should be the deny-by-default blocking writes -- never a 1.
+        """
+        dev = make_stage_device(kinds=[usbclass.KIND_INPUT, usbclass.KIND_STORAGE])
+        self.run_add(dev, approved=False)
+        self.assertNotIn(1, self.writes,
+                         "a device that can type was authorized before the "
+                         "human decided -- this is the C1 exposure window")
+
+    def test_pure_storage_is_still_inspected(self):
+        """The fix must not disable stage 4 for ordinary flash drives."""
+        dev = make_stage_device(kinds=[usbclass.KIND_STORAGE])
+        with mock.patch.object(self.engine, "_inspect_medium",
+                               return_value=None) as inspect_fn:
+            self.run_add(dev, approved=False)
+            inspect_fn.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

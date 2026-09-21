@@ -185,13 +185,38 @@ class DirectBackendNeverFollowsASymlink(unittest.TestCase):
         sysfs._DirectBackend().authorize(self.devdir, 1)
         self.assertEqual((self.devdir / "authorized").read_text(), "1")
 
-    def test_a_symlinked_parent_directory_is_refused_too(self):
-        """O_NOFOLLOW|O_DIRECTORY on the parent, not only on the attribute."""
+    def test_a_symlinked_parent_directory_is_ACCEPTED(self):
+        """
+        Inverse of the invariant this test used to assert.
+
+        The round-3 fix opened the parent with O_DIRECTORY|O_NOFOLLOW on the
+        path as GIVEN, which refuses any symlink at the final component --
+        including /sys/bus/usb/devices/<name>, which IS a symlink into
+        /sys/devices/. The whole default (non-privsep) deployment failed with
+        ENOTDIR on every write except _DirectBackend.admit(), which had no
+        O_NOFOLLOW at all -- so the only privileged write that still worked
+        was the one that switches devices ON. In a deny-by-default tool that
+        was the worst possible asymmetry.
+
+        Round 4 fixed it by resolving the path first (realpath), then opening
+        the resolved directory with O_NOFOLLOW so a symlink planted BETWEEN
+        the resolve and the open is still refused. The protection that
+        matters -- O_NOFOLLOW on the ATTRIBUTE, plus holding the directory fd
+        across the write -- is unchanged, and the four "symlinked attribute
+        is refused" tests above still cover it.
+
+        So this test now asserts the CURRENT invariant: a symlinked directory
+        alias resolves to its real target and the write lands there, exactly
+        as it does when the daemon walks the bus view for real.
+        """
         (self.devdir / "authorized").write_text("0")
         alias = self.root / "alias"
         alias.symlink_to(self.devdir)
-        with self.assertRaises(OSError):
-            sysfs._DirectBackend().authorize(alias, 1)
+        sysfs._DirectBackend().authorize(alias, 1)
+        self.assertEqual(
+            (self.devdir / "authorized").read_text(), "1",
+            "the write must land on the real directory the alias points to; "
+            "refusing symlinked directories broke the bus view entirely")
 
     def test_no_descriptor_is_leaked_by_a_refusal(self):
         """

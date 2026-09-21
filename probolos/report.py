@@ -1,233 +1,165 @@
 """
-Turning a device into a question a human can answer.
+Minimal renderer -- no boxes, indent-based hierarchy, color for severity.
 
-Design rule for this file: never show a number the user cannot act on. VID/PID
-appear once, at the bottom, as a forensic reference -- not as the basis of the
-decision. The decision line is always in plain language.
+Same public API as report.py: render(), render_behaviour(), render_medium(),
+one_liner(). Callers replace `from . import report` with `from . import report1
+as report` to try it. Every rule, every finding, every severity, and the whole
+data flow are the ones report.py already builds -- only the DISPLAY changes.
 
-Stages 1-2 report IDENTITY and SEMANTIC CONSISTENCY. Stages 3-4 will add
-behavioural and content findings below the same claim block.
+Design rules for this variant:
+  * no ASCII borders. Section breaks are one blank line and one header line.
+  * one label, one value, one line where possible. Wrapping still happens on
+    long device strings and on finding explanations.
+  * device-supplied text is quoted so a name that reads like a verdict is
+    plainly the device's testimony, not Probolos's.
+  * severity is color + one word + one symbol, not a sentence.
+  * VID/PID/serial appear once, at the bottom of identity, as reference.
 """
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import List, Optional, Sequence
 
 from . import rules, sysfs, textsafe, usbclass
 
-# Severity is shown as a word, not a colour or a number. A user under time
-# pressure reads one word.
-_SEVERITY_MARK = {
-    rules.Severity.CRITICAL: "!!",
-    rules.Severity.WARNING: " !",
-    rules.Severity.NOTICE: " ~",
-    rules.Severity.INFO: "  ",
+# --------------------------------------------------------------------------
+# Color -- ANSI, only when stdout is a TTY and NO_COLOR is not set.
+#
+# Piping the report into a file or a pager should not fill it with escape
+# codes; a machine that ignores NO_COLOR is a machine whose users learn to
+# turn colour off with `| cat`. Detection is done ONCE at import time and
+# cached, because writing findings to a log later must not depend on whatever
+# stream the caller is currently on.
+# --------------------------------------------------------------------------
+def _colour_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+_USE_COLOUR = _colour_enabled()
+
+
+def _c(code: str, text: str) -> str:
+    if not _USE_COLOUR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _bold(text): return _c("1", text)
+def _dim(text): return _c("2", text)
+def _red(text): return _c("1;31", text)
+def _yellow(text): return _c("33", text)
+def _cyan(text): return _c("36", text)
+def _green(text): return _c("32", text)
+
+
+# One symbol + one colour per severity. Severity words come from rules.py
+# unchanged, so a log parser reading "CRITICAL" still finds it.
+_SEVERITY_STYLE = {
+    rules.Severity.CRITICAL: ("✖", _red),
+    rules.Severity.WARNING:  ("⚠", _yellow),
+    rules.Severity.NOTICE:   ("•", _cyan),
+    rules.Severity.INFO:     ("✓", _green),
 }
 
-_VERDICT = {
-    rules.Severity.CRITICAL: "CRITICAL — this matches a known attack pattern",
-    rules.Severity.WARNING: "WARNING — something here does not add up",
-    rules.Severity.NOTICE: "NOTICE — minor oddity, probably harmless",
-    rules.Severity.INFO: "No inconsistencies found in what it claims",
-}
-
+# Width of the terminal we target for wrapping. 62 keeps parity with
+# report.py's box interior, so a fresh eye can compare the two directly.
 WIDTH = 62
+INDENT = "  "
 
 
-def _line(text: str = "") -> str:
-    """
-    One row of the box, exactly WIDTH + 2 terminal columns wide.
-
-    THE BUG THIS FIXES
-    ------------------
-    This was `f"│ {text:<{WIDTH - 1}}│"`. Python's field width counts
-    CHARACTERS, and textsafe.pad/fit/display_width -- written precisely so a
-    device could not push the border off the line, and carrying that reasoning
-    in their own docstrings -- had no callers anywhere in the project. The
-    entire column-width defence was dead code, which is this codebase's
-    recurring failure: a protection written, documented, and never wired to
-    the path that needs it.
-
-    Three consequences, all reachable from the device side, because
-    iManufacturer/iProduct/iSerialNumber are chosen by the device and the
-    identity rows below are not wrapped:
-
-      * a 122-character ASCII product name -- inside sanitize()'s 126-character
-        budget -- produced a 140-column row in a 64-column box;
-      * a CJK name is legitimate and costs two columns per glyph, so an honest
-        Chinese product name broke the box as effectively as an attack;
-      * box-drawing characters are neither Cc nor Cf, so sanitize() passes them
-        through untouched. A product string of spaces, "│", and the text
-        "No inconsistencies found in what it claims" renders as a convincing
-        extra row -- on the one screen where the admission decision is made,
-        and once the terminal wraps the over-long line the device controls
-        whole visual rows of it.
-
-    pad() fits first and then pads to an exact column count, so the row is the
-    right width whatever the device sent.
-    """
-    return f"│ {textsafe.pad(text, WIDTH - 1)}│"
-
-
-def _rule(left="├", right="┤", fill="─") -> str:
-    return left + fill * WIDTH + right
-
-
-def _wrap(text: str, width: int) -> List[str]:
-    """
-    Naive word wrap. Explanations are prose and must not run off the box.
-
-    Measured in terminal COLUMNS, not characters -- see _line. A single token
-    wider than the line is split rather than emitted whole: device-supplied
-    strings are reproduced inside finding explanations (dev.label() appears in
-    self-contradictory-identity), they routinely contain no spaces at all, and
-    `len(candidate) > width and current` let exactly those through untouched.
-    """
+def _wrap(text: str, width: int, indent: str = "") -> List[str]:
+    """Column-aware word wrap. See report.py for the same helper's rationale."""
     words, lines, current = text.split(), [], ""
     for word in words:
         for piece in textsafe.split_width(word, width):
             candidate = f"{current} {piece}".strip()
             if textsafe.display_width(candidate) > width and current:
-                lines.append(current)
+                lines.append(indent + current)
                 current = piece
             else:
                 current = candidate
     if current:
-        lines.append(current)
+        lines.append(indent + current)
     return lines
 
 
-# Width of the "Manufacturer:  " style labels below, so the wrapped
-# continuation of a long device string lines up under the value rather than
-# under the label.
-_LABEL_WIDTH = 15
-
-
-def _field(label: str, value: Optional[str]) -> List[str]:
-    """
-    One "Label: value" row carrying a DEVICE-SUPPLIED string.
-
-    The identity rows were the only ones in the report that went through no
-    wrapping at all, which is what made them the device's way into the layout.
-
-    Only the value is wrapped, never the label with it: _wrap() splits on
-    whitespace, so wrapping the two together collapsed the padding that lines
-    the columns up.
-
-    The value is QUOTED, and that is a security property rather than a style
-    choice. Wrapping stops the device from breaking the box; it does not stop
-    it from writing a plausible sentence inside one. sanitize() passes "│"
-    through untouched -- correctly, since it is a printable character and no
-    list of forbidden glyphs stays complete -- so a product string can still
-    read as a row of the report, and the sentence a device would pick is the
-    verdict. Quotation marks answer that without guessing at characters: they
-    say whose words these are, so anything between them is plainly the
-    device's testimony and not Probolos's conclusion.
-    """
-    if value:
-        rows = _wrap(f'"{value}"', WIDTH - 3 - _LABEL_WIDTH) or ['""']
-    else:
-        rows = ["(none reported)"]
-    head = f"{label + ':':<{_LABEL_WIDTH}}"
-    return ([_line(head + rows[0])]
-            + [_line(" " * _LABEL_WIDTH + row) for row in rows[1:]])
-
-
-def _finding_lines(finding: rules.Finding) -> List[str]:
-    """
-    Render one finding, wrapping BOTH the title and the body.
-
-    Titles are written for humans and some are long; letting them overflow the
-    box was a real bug. Wrapping here means every future rule is safe by
-    construction rather than by remembering to keep titles short.
-    """
-    mark = _SEVERITY_MARK[finding.severity]
-    head = f"{mark} {finding.severity.label}: {finding.title}"
-    lines = []
-    for i, chunk in enumerate(_wrap(head, WIDTH - 3)):
-        lines.append(_line(chunk if i == 0 else f"     {chunk}"))
-    for chunk in _wrap(finding.explanation, WIDTH - 8):
-        lines.append(_line(f"     {chunk}"))
-    return lines
+def _quote(value: Optional[str]) -> str:
+    """Device-supplied text in quotes so it reads as testimony, not verdict."""
+    return f'"{value}"' if value else "—"
 
 
 def render(dev: sysfs.UsbDevice,
            findings: Optional[Sequence[rules.Finding]] = None) -> str:
-    """Build the full report block for one blocked device."""
     findings = list(findings or [])
     verdict = rules.worst(findings)
     out: List[str] = []
-    out.append("┌" + "─" * WIDTH + "┐")
-    out.append(_line("NEW USB DEVICE — BLOCKED, AWAITING DECISION"))
-    out.append(_rule())
 
-    # --- what it claims to be -------------------------------------------
+    # --- header: two words, then a rule of dashes as a soft separator ------
+    out.append("")
+    out.append(_bold("NEW USB DEVICE") + _dim(" · blocked, awaiting decision"))
+    out.append(_dim("─" * WIDTH))
+
+    # --- what it claims to be, top-level identity, and reference number ---
     claims = dev.claims
     if claims:
-        out.append(_line("Claims to be:"))
-        for claim in claims:
-            out.append(_line(f"    • {claim}"))
+        # First claim on the same visual level as the header, further claims
+        # indented, so a composite device (BadUSB) reads at a glance.
+        out.append(INDENT + _bold(claims[0]))
+        for claim in claims[1:]:
+            out.append(INDENT + "+ " + _bold(claim))
     elif dev.parse_error:
-        out.append(_line("Claims to be:  UNKNOWN — descriptors unreadable"))
-        out.append(_line(f"    ({dev.parse_error})"))
+        out.append(INDENT + _bold("UNKNOWN") + _dim(f" — {dev.parse_error}"))
     else:
         cls = dev.device_class if dev.device_class is not None else 0
-        out.append(_line(f"Claims to be:  {usbclass.class_name(cls)}"))
+        out.append(INDENT + _bold(usbclass.class_name(cls)))
 
-    out.append(_line())
+    # Manufacturer/product on ONE line -- the two are read together. Serial
+    # gets its own line because it is long and forensic rather than
+    # descriptive.
+    mp = f"{_quote(dev.manufacturer)}  {_quote(dev.product)}"
+    for row in _wrap(mp, WIDTH - len(INDENT)):
+        out.append(INDENT + row)
+    if dev.serial:
+        out.append(INDENT + _dim("serial ") + _quote(dev.serial))
 
-    # --- who it says it is (device-supplied strings, never trusted) ------
-    # Through _field, so a long or wide name wraps inside the box instead of
-    # drawing outside it. These three values are the most directly
-    # device-controlled text in the whole report.
-    out.extend(_field("Manufacturer", dev.manufacturer))
-    out.extend(_field("Product", dev.product))
-    out.extend(_field("Serial", dev.serial))
+    # Facts on one dim line -- VID/PID, port, speed, power -- so the eye
+    # jumps over them unless it wants them.
+    port = f"port {dev.name}" if dev.bus is None else f"bus {dev.bus} port {dev.name}"
+    parts = [f"{dev.vendor_id}:{dev.product_id}", port,
+             f"{dev.speed or '?'} Mbps"]
+    if dev.descriptor_set and dev.descriptor_set.configs:
+        cfg0 = dev.descriptor_set.configs[0]
+        source = "self-powered" if cfg0.self_powered else "bus-powered"
+        parts.append(f"{cfg0.max_power_ma} mA {source}")
+    out.append(INDENT + _dim(" · ".join(parts)))
 
-    out.append(_rule())
+    # --- findings, most severe first (the caller already sorted them) ------
+    if not findings:
+        out.append("")
+        out.append(INDENT + _green("✓ no inconsistencies in what it claims"))
+    else:
+        for finding in findings:
+            out.append("")
+            symbol, colour = _SEVERITY_STYLE[finding.severity]
+            head = f"{symbol} {finding.severity.label} · {finding.title}"
+            for i, chunk in enumerate(_wrap(head, WIDTH - len(INDENT))):
+                out.append(INDENT + (colour(chunk) if i == 0 else chunk))
+            for chunk in _wrap(finding.explanation,
+                               WIDTH - len(INDENT) - 4):
+                out.append(INDENT + "    " + _dim(chunk))
 
-    # --- raw facts, for the record --------------------------------------
-    port = f"bus {dev.bus} port {dev.name}" if dev.bus else dev.name
-    out.append(_line(f"ID {dev.vendor_id}:{dev.product_id}   {port}   "
-                     f"{dev.speed or '?'} Mbps"))
-
-    if dev.descriptor_set:
-        d = dev.descriptor_set.device
-        n_ifaces = len(dev.interfaces)
-        out.append(_line(f"{n_ifaces} interface(s), {d.num_configurations} "
-                         f"configuration(s)"))
-        cfgs = dev.descriptor_set.configs
-        if cfgs:
-            cfg0 = cfgs[0]
-            source = "self-powered" if cfg0.self_powered else "bus-powered"
-            # The raw byte is shown alongside the milliamps because the two
-            # differ by the USB generation, and that discrepancy was a real bug.
-            out.append(_line(f"declares {cfg0.max_power_ma} mA  ({source}, "
-                             f"bMaxPower={cfg0.max_power_raw} × "
-                             f"{cfg0.power_unit_ma} mA)"))
-
-    # --- what the rules concluded ---------------------------------------
-    out.append(_rule())
-    out.append(_line(_VERDICT[verdict]))
-
-    for finding in findings:
-        out.append(_line())
-        out.extend(_finding_lines(finding))
-
-    out.append("└" + "─" * WIDTH + "┘")
-
-    # --- honesty about what has NOT been checked ------------------------
-    out.append("")
-    out.append("  Checked: identity and internal consistency of what the")
-    out.append("  device CLAIMS. Not checked: how it actually behaves once")
-    out.append("  live, and what it contains. Those are stages 3 and 4.")
-
+    out.append(_dim("─" * WIDTH))
+    out.append(_dim(INDENT + "checked: identity + consistency. "
+                    "Stages 3 & 4 follow."))
     return "\n".join(out)
 
 
 def one_liner(dev: sysfs.UsbDevice,
               findings: Optional[Sequence[rules.Finding]] = None) -> str:
-    """Compact form for logs."""
     claims = ", ".join(dev.claims) or "unknown"
     text = (f"{dev.vendor_id}:{dev.product_id} [{claims}] "
             f"'{dev.label()}' at {dev.name}")
@@ -237,101 +169,90 @@ def one_liner(dev: sysfs.UsbDevice,
 
 
 def render_behaviour(obs, findings: Sequence[rules.Finding]) -> str:
-    """
-    Second report block, printed after the device has been watched in isolation.
-
-    Deliberately a SEPARATE block rather than an update of the first one: the
-    user should see that two independent kinds of evidence were gathered, and
-    that a device passing the identity check can still fail here.
-    """
     out: List[str] = []
-    out.append("┌" + "─" * WIDTH + "┐")
-    out.append(_line("BEHAVIOUR UNDER QUARANTINE"))
-    out.append(_rule())
+    out.append("")
+    out.append(_bold("BEHAVIOUR UNDER QUARANTINE"))
+    out.append(_dim("─" * WIDTH))
 
     if obs.error:
-        out.append(_line(f"Not observed: {obs.error}"))
+        out.append(INDENT + _dim(f"not observed: {obs.error}"))
     else:
         nodes = len(obs.grabbed)
-        out.append(_line(f"Isolated {nodes} input channel(s) for "
-                         f"{obs.duration:.0f}s"))
-        out.append(_line(f"Keystrokes captured : {len(obs.key_presses)}"))
+        out.append(INDENT +
+                   f"isolated {_bold(str(nodes))} input channel(s) for "
+                   f"{obs.duration:.0f}s")
+        out.append(INDENT +
+                   f"keystrokes captured: {_bold(str(len(obs.key_presses)))}")
         if obs.button_presses:
-            out.append(_line(f"Button presses      : {obs.button_presses} "
-                             f"(normal for a mouse)"))
+            out.append(INDENT + _dim(
+                f"button presses: {obs.button_presses} (normal for a mouse)"))
         if obs.motion_events:
-            out.append(_line(f"Motion events       : {obs.motion_events} "
-                             f"(normal for a mouse)"))
-
+            out.append(INDENT + _dim(
+                f"motion events: {obs.motion_events} (normal for a mouse)"))
         note = rules.race_window_note(obs)
         if note:
-            out.append(_line())
-            for line in _wrap(f"Exposure gap: {note}.", WIDTH - 3):
-                out.append(_line(line))
+            for line in _wrap(f"exposure gap: {note}",
+                              WIDTH - len(INDENT)):
+                out.append(INDENT + _dim(line))
 
-    if findings:
-        out.append(_rule())
-        for finding in findings:
-            out.extend(_finding_lines(finding))
-            if finding is not findings[-1]:
-                out.append(_line())
+    for finding in findings:
+        out.append("")
+        symbol, colour = _SEVERITY_STYLE[finding.severity]
+        head = f"{symbol} {finding.severity.label} · {finding.title}"
+        for i, chunk in enumerate(_wrap(head, WIDTH - len(INDENT))):
+            out.append(INDENT + (colour(chunk) if i == 0 else chunk))
+        for chunk in _wrap(finding.explanation, WIDTH - len(INDENT) - 4):
+            out.append(INDENT + "    " + _dim(chunk))
 
-    out.append("└" + "─" * WIDTH + "┘")
+    out.append(_dim("─" * WIDTH))
     return "\n".join(out)
 
 
 def render_medium(medium, findings: Sequence[rules.Finding]) -> str:
-    """
-    Report block for stage 4: what is physically on the medium.
-
-    Presented separately from the identity block for the same reason as the
-    behaviour block -- it is independent evidence, gathered a different way,
-    and a device that passes the first can fail this one.
-    """
     from . import storage as storage_mod
 
     out: List[str] = []
-    out.append("┌" + "─" * WIDTH + "┐")
-    out.append(_line("WHAT IS ON THE MEDIUM (read-only, never mounted)"))
-    out.append(_rule())
+    out.append("")
+    out.append(_bold("MEDIUM") + _dim(" · read-only, never mounted"))
+    out.append(_dim("─" * WIDTH))
 
     if medium.error:
-        out.append(_line(f"Not inspected: {medium.error}"))
+        out.append(INDENT + _dim(f"not inspected: {medium.error}"))
     else:
         size = medium.size_sectors
         if size:
             gib = size * storage_mod.SECTOR / (1024 ** 3)
-            out.append(_line(f"Capacity     : {gib:.1f} GiB ({size} sectors)"))
-        out.append(_line(f"Layout       : {medium.scheme.upper()}"))
+            out.append(INDENT + f"capacity: {_bold(f'{gib:.1f} GiB')} "
+                       + _dim(f"({size} sectors)"))
+        out.append(INDENT + f"layout:   {_bold(medium.scheme.upper())}")
 
         real = [p for p in medium.partitions
                 if p.type_byte != storage_mod.PROTECTIVE_MBR_TYPE]
         if not real and medium.scheme == "none":
             fs = medium.signatures.get(-1)
-            out.append(_line(f"No partition table; contains {fs or 'no known'} "
-                             f"filesystem"))
+            out.append(INDENT + _dim(f"no partition table; "
+                                     f"contains {fs or 'no known'} filesystem"))
         for part in real:
             seen = medium.signatures.get(part.index)
-            boot = " [bootable]" if part.bootable else ""
-            out.append(_line(
-                f"Partition {part.index + 1}  : "
-                f"{storage_mod.type_name(part.type_byte)}{boot}"))
-            out.append(_line(
-                f"               starts at sector {part.start_lba}, "
-                f"{part.sectors} sectors"))
+            boot = " · bootable" if part.bootable else ""
+            type_desc = (f"{storage_mod.type_name(part.type_byte)} "
+                         f"(0x{part.type_byte:02X})")
+            out.append("")
+            out.append(INDENT + _bold(f"partition {part.index + 1}") +
+                       f"  {type_desc}" + _dim(boot))
+            out.append(INDENT + _dim(
+                f"    start sector {part.start_lba} · {part.sectors} sectors"))
             if seen:
-                out.append(_line(f"               contains {seen}"))
+                out.append(INDENT + _dim(f"    contains: {seen}"))
 
-    if findings:
-        out.append(_rule())
-        for finding in findings:
-            out.extend(_finding_lines(finding))
-            if finding is not findings[-1]:
-                out.append(_line())
+    for finding in findings:
+        out.append("")
+        symbol, colour = _SEVERITY_STYLE[finding.severity]
+        head = f"{symbol} {finding.severity.label} · {finding.title}"
+        for i, chunk in enumerate(_wrap(head, WIDTH - len(INDENT))):
+            out.append(INDENT + (colour(chunk) if i == 0 else chunk))
+        for chunk in _wrap(finding.explanation, WIDTH - len(INDENT) - 4):
+            out.append(INDENT + "    " + _dim(chunk))
 
-    out.append("└" + "─" * WIDTH + "┘")
-    out.append("")
-    out.append("  Only the partition table and filesystem signatures were")
-    out.append("  read. No files were opened and nothing was mounted, so the")
-    out.append("  kernel's filesystem drivers never saw this medium.")
+    out.append(_dim("─" * WIDTH))
     return "\n".join(out)

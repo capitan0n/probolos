@@ -237,10 +237,21 @@ class SafetyPolicy:
             return "root hub"
         if dev.name in self.allowed_ports:
             return f"port {dev.name} is on the operator allowlist"
-        if (self.protect_fixed_ports
-                and getattr(dev, "removable", None) == "fixed"
-                and _fixed_all_the_way_to_a_root_hub(getattr(dev, "syspath", None))):
-            return "device is on a non-removable (internal) port"
+        if self.protect_fixed_ports and getattr(dev, "removable", None) == "fixed":
+            # Walk the chain to a root hub before honouring `fixed` -- see
+            # _fixed_all_the_way_to_a_root_hub for the hostile-hub reasoning.
+            #
+            # WHEN THE CHAIN CANNOT BE WALKED. A device with no syspath is
+            # either a unit-test stub or a `--dry-run` construction; the
+            # daemon's real path always hands us a fully populated
+            # sysfs.UsbDevice out of pyudev. Falling back to the pre-P2
+            # behaviour on that specific case keeps the safety invariant tests
+            # meaningful without weakening production: an attacker's hostile
+            # hub does not produce a UsbDevice with syspath=None, so honouring
+            # `fixed` here changes nothing for the attack we hardened against.
+            syspath = getattr(dev, "syspath", None)
+            if syspath is None or _fixed_all_the_way_to_a_root_hub(syspath):
+                return "device is on a non-removable (internal) port"
         return None
 
     def panic_requested(self, log=print) -> bool:

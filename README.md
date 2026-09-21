@@ -1,10 +1,12 @@
 # Probolos
 
 > ⚠️ **Alpha — under active development.** This is an early, research-stage
-> project. The core mechanism works in software emulation and has automated regression coverage, but **validation on real, physical hardware is still pending** —
-> the tool has not yet been proven to behave correctly against a broad range of
-> genuine USB devices and attack fixtures (e.g. BadUSB via ATmega32u4 / Raspberry
-> Pi Zero). Interfaces, flags and on-disk formats may change without notice.
+> project. The admission path has been exercised on real hardware and has
+> automated regression coverage, but **it has never been run against an actual
+> attack**: no BadUSB fixture (ATmega32u4, Raspberry Pi Zero, O.MG cable) has
+> been put through the behavioural quarantine, so the claim that matters most
+> is the one with the least evidence behind it. Interfaces, flags and on-disk
+> formats may change without notice.
 > **Do not rely on it as a security control on a machine you care about.** Treat
 > everything here as experimental and report anything that surprises you.
 
@@ -87,19 +89,32 @@ protocol handling and cleanup; it is not a 150-line security boundary.
 
 ### Stop automount racing the scan
 
-Stage 4 activates the device temporarily and udisks2 may automount it. If the
-following inhibitor exists in your full checkout, install it before experiments
-with stage 4. It was not present in the review ZIP. Otherwise disable stage 4
-with `--no-storage-scan` until automounting has been controlled:
+Stage 4 must briefly authorize the device for its block node to appear, and
+udisks2 may automount the medium inside that window. Probolos itself only ever
+reads raw sectors and never mounts anything, but a desktop session will.
+
+The simplest answer is `--no-storage-scan`, which skips stage 4 entirely and
+removes the window. If you want stage 4, tell udisks not to automount USB block
+devices:
 
 ```bash
-sudo cp systemd/60-probolos-inhibit-automount.rules /etc/udev/rules.d/
+sudo tee /etc/udev/rules.d/60-probolos-inhibit-automount.rules <<'EOF'
+# Probolos stage 4 authorizes a storage device just long enough to read its
+# partition table. udisks2 will automount it in that window unless told not to.
+SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{UDISKS_AUTO}="0"
+EOF
 sudo udevadm control --reload
 sudo udevadm trigger --subsystem-match=block
 ```
 
-Verify the inhibitor's effect on your system: a udisks rule does not constrain
-other mount services. Probolos itself reads a raw device without mounting it.
+**Know what this costs.** The rule is system-wide and permanent: *every* USB
+block device stops automounting, including ones Probolos has approved and ones
+plugged in while it is not running. You mount them by hand afterwards. Remove
+the file and reload to undo it.
+
+It also only constrains **udisks**. Any other automounter on the machine is
+unaffected, so verify the behaviour on your own system rather than assuming the
+window is closed.
 
 ---
 
@@ -168,9 +183,22 @@ No `python-evdev`: the quarantine talks to the kernel directly through one
 ## Development
 
 ```bash
-python3 -m tests.run_all  # unittest classes plus standalone descriptor tests
-python3 -m unittest discover -b -s tests -t .  # unittest classes only
+python3 -m unittest discover -b -s tests -t .   # the whole suite
+python3 -m tests.run_all                        # same, with AF_UNIX skips
 ```
+
+Both collect the same tests. `run_all` exists only to skip the handful that
+need a listening AF_UNIX socket, which some restricted containers refuse; use
+it there and the plain command everywhere else. If the two ever report
+different totals, that difference is a bug — it was one before, when the
+defensive-parsing checks were bare module-level functions that unittest
+discovery does not collect and only `run_all` picked up.
+
+`tests/` holds one module per subject — `test_gate.py`, `test_ledger.py`,
+`test_rules.py` and so on. `tests/audit/` holds the regression tests from each
+security review, named by what that review found rather than by its number: a
+round number stops meaning anything past the third one, while a theme keeps
+working however many passes the project accumulates.
 
 `testbed/` emulates USB devices in software via `dummy_hcd` + `raw_gadget`,
 with presets for BadUSB, descriptor drift and overpowered devices — so the
@@ -204,13 +232,27 @@ Short version:
   and hardened, but the report descriptor is not in the sysfs blob and has no
   source wired to it. `CAPABILITIES.md` §2.2 and §3.2.
 
-Status: **alpha — under active development.** The supplied ZIP contained tests
-for fixes missing from its implementation. See `AUDIT_REPORT_EL.md` for this
-review's fixes, test results and limitations. A passing mock test does not prove
-USB isolation on a real kernel. **Real-hardware validation is the main open work item**:
-until Probolos has been tested against a range of genuine devices and BadUSB
-fixtures, treat every real-world result as data rather than a guarantee, and
-report anything that surprises you. Known open items are tracked in
+Status: **alpha — under active development.** The tree has been through five
+security review passes; each finding has a regression test named after the
+defect, under `tests/audit/`.
+
+**Verified on real hardware.** Closing and restoring `authorized_default` on
+all five root hubs of the reference laptop. A Kingston DataTraveler 3.0 through
+stage 1 and stage 4 — identity, MBR parse, filesystem signature — with the
+device re-blocked before the prompt. Descriptor drift across visits, including
+the false positive that the same stick produces when moved between a USB 2 and
+a USB 3 controller, which is why the ledger fingerprint ignores bus-negotiated
+fields. Both prompt paths, both answers, and gate restoration on `SIGINT`.
+
+**Not verified on real hardware.** Stage 3: no BadUSB or HID fixture has been
+run against the quarantine, so the `EVIOCGRAB` path and the exposure-window
+measurement rest on emulation only. Nor has `--privsep`, `--close-race-window`,
+or either systemd unit. A passing test does not prove USB isolation on a real
+kernel, and these are the claims most worth distrusting until somebody plugs an
+ATmega32u4 in and watches what happens.
+
+Treat every real-world result as data rather than a guarantee, and report
+anything that surprises you. Known open items are tracked in
 [`CHANGELOG.md`](CHANGELOG.md).
 
 ---

@@ -22,7 +22,12 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
+    # GPL, not MIT. LICENSE, README and the `license` field above all say
+    # GPLv3; this classifier said MIT, and the classifier is the one that ends
+    # up in the published metadata -- so an installed package would have told
+    # everyone the opposite of what the repository says, under the one heading
+    # where being wrong has legal consequences rather than cosmetic ones.
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Topic :: Security",
