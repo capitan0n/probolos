@@ -230,6 +230,18 @@ def clean(value, limit: int = MAX_LENGTH) -> Optional[str]:
 # Display width
 # ---------------------------------------------------------------------------
 
+def char_width(char: str) -> int:
+    """
+    Terminal columns one character occupies: 0, 1 or 2.
+
+    The single definition the three functions below share, so they cannot
+    disagree about what a character costs.
+    """
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
 def display_width(text: str) -> int:
     """
     How many terminal columns `text` occupies.
@@ -240,12 +252,35 @@ def display_width(text: str) -> int:
     perfectly legitimate and breaks a box drawn with len()-based padding, so
     this is a correctness fix that happens to also close a forgery route.
     """
-    width = 0
+    return sum(char_width(char) for char in text)
+
+
+def split_width(text: str, columns: int) -> List[str]:
+    """
+    Break `text` into runs of at most `columns` terminal columns, losing none
+    of it.
+
+    fit() truncates, which is right for a fixed-width cell and wrong for a
+    word inside a wrapped paragraph: a single unbroken token longer than the
+    line -- which is what a device-supplied name with no spaces in it is --
+    would either be cut (evidence lost) or pushed through whole (box broken).
+    Splitting keeps both the layout and the content.
+    """
+    if columns < 1:
+        return [text]
+    rows: List[str] = []
+    current: List[str] = []
+    used = 0
     for char in text:
-        if unicodedata.combining(char):
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-    return width
+        step = char_width(char)
+        if used + step > columns and current:
+            rows.append("".join(current))
+            current, used = [], 0
+        current.append(char)
+        used += step
+    if current:
+        rows.append("".join(current))
+    return rows or [""]
 
 
 def fit(text: str, columns: int) -> str:
@@ -260,8 +295,7 @@ def fit(text: str, columns: int) -> str:
         return text
     out, width = [], 0
     for char in text:
-        step = 0 if unicodedata.combining(char) else (
-            2 if unicodedata.east_asian_width(char) in ("W", "F") else 1)
+        step = char_width(char)
         if width + step > columns - 3:
             break
         out.append(char)

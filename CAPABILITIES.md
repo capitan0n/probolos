@@ -112,8 +112,13 @@ and alternate setting. Incomplete descriptors disable early activation entirely.
 ### 1.6 Memory across sessions
 
 - **Ledger** (`ledger.py`) — bounded per-identity history, with a
-  SHA-256 hash of its descriptor set. A device that changes its descriptors
-  between visits is detectable.
+  **normalized** SHA-256 fingerprint of the parsed descriptor set: VID/PID,
+  `bcdDevice`, top-level class triple, and per-interface
+  class/subclass/protocol. Bus-negotiated fields (`bcdUSB`, `bMaxPower`,
+  endpoint descriptors, SuperSpeed companion descriptors) are excluded, so
+  the same physical stick on a USB 2 vs. a USB 3 controller does not produce
+  a spurious drift alarm. The raw-byte hash is stored beside it (`raw_hash`)
+  for forensics but never fed to the CRITICAL rule.
 - **Trust store** (`trust.py`) — devices pinned by identity *and* descriptor
   hash. Trust never overrides a CRITICAL finding. Both files are written
   atomically at mode `0600`; an unreadable trust store fails **closed**
@@ -166,6 +171,12 @@ recognising rather than just repairing:
 | `descriptors_safe` was imported by nothing, so its bounds on descriptor count and its `bLength` checks protected nothing. | `descriptors.parse()` walks through it. Truncation is now recorded and surfaced instead of discarded. |
 | `storage_hardening` had one of four functions called. A partition with a legal start and an absurd length was read anyway. | All three bounds are wired, and `MediumReport.suspicious` — previously written and read by nobody — is now a finding. |
 | `TrustStore.load()` parsed an admission list without checking who owned it or who could write it. | Ownership, mode, and symlink checks before the JSON is believed. Fails closed. |
+| `_write_attr_pinned()` opened the pinned directory with `O_DIRECTORY \| O_NOFOLLOW` on the path as given, but `/sys/bus/usb/devices/<name>` entries are symlinks — so the direct backend failed with ENOTDIR on every write except `admit()`, which lacked the flag. The gate could not close in the default (non-privsep) mode. | `realpath()` before the open, symlink refusal preserved on the attribute. `admit()` uses the same discipline. Measured on real hardware: five root hubs, all closed cleanly. |
+| `SafetyPolicy.is_protected()` accepted `removable=fixed` on any device. For a device behind an EXTERNAL hub that value comes from the hub's own `DeviceRemovable` bitmap, so one hostile hub silently disabled every check on everything behind it. | The chain from the device to the controller is walked; every ancestor must itself be `fixed` and the walk must reach a root hub before the exemption is granted. |
+| `Ledger.record()` overwrote `descriptor_hash` on every decision, and `LedgerAnalyzer` compared against that field. A refusal, a timeout-denial, or merely queueing a device via `_hold_until_unlocked` adopted the attacker's blob as the reference. | A dedicated `baseline_hash` moved only by an explicit approval (`Ledger.record(..., approved=True)`). Old ledgers migrate via `known_hashes[0]`. |
+| `descriptor_fingerprint()` hashed the raw descriptor blob, so the same physical stick on a USB 2 vs. a USB 3 controller produced a different digest — measured false positive on a Kingston DataTraveler. | Normalized fingerprint over the parsed device/interface identity, dropping bus-negotiated fields. The raw hash is kept beside it in `raw_hash` for forensics. Ledgers written by earlier versions clear their baseline on load and re-learn from the next sighting. |
+| `report._line()` padded with Python character count, so a long ASCII name, a CJK product name, or a product string containing box-drawing characters broke the report box. `textsafe.pad`/`fit`/`display_width` were written for exactly this and had no callers. | `_line()` uses `textsafe.pad()`; `_wrap()` measures in terminal columns; a new `_field()` wraps identity rows and quotes device-supplied strings so they read as testimony, not as verdict text. |
+| The shipped systemd unit ran `--privsep --agent --timeout 0` with no `--agent-user`. At boot there is no graphical session, so `_resolve_agent_identity()` called `sys.exit()` and `Restart=on-failure` looped forever with the gate never closing. | Auto-detection failure logs and continues without the agent (explicit unknown `--agent-user` still exits). The unit gained `Environment=PROBOLOS_AGENT_USER` and a drop-in note. |
 
 This audit adds regression scenarios and records the actual run in
 `AUDIT_REPORT_EL.md`; hardware claims are not inferred from mock tests.

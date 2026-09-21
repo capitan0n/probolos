@@ -142,13 +142,23 @@ def format_table(entries: List, verbose: bool = False) -> str:
                 hist = " -> ".join(_clean(d) for d in e.decisions[-6:])
                 lines.append(f"       decision history: {hist}")
             hashes = getattr(e, "known_hashes", None) or []
+            # The hashes shown here are the NORMALIZED fingerprints -- what
+            # the drift alarm compares. Their labelling matters: a user who
+            # reads "different descriptor hashes" alongside a raw-byte diff
+            # is entitled to think the two disagree, when in fact the raw
+            # blob can differ (bus negotiation) without the drift fingerprint
+            # changing. The raw hash is printed separately below so both
+            # views are visible.
             if len(hashes) > 1:
-                lines.append(f"       ! {len(hashes)} different descriptor hashes "
-                             f"(device changed its identity):")
+                lines.append(f"       ! {len(hashes)} different identity "
+                             f"fingerprints (device changed what it claims):")
                 for h in hashes:
                     lines.append(f"           {h[:16]}\u2026")
             elif hashes:
-                lines.append(f"       descriptor: {hashes[0][:16]}\u2026")
+                lines.append(f"       identity fingerprint : {hashes[0][:16]}\u2026")
+            raw = getattr(e, "raw_hash", "") or ""
+            if raw:
+                lines.append(f"       raw descriptor bytes : {raw[:16]}\u2026")
             lines.append("")
 
     if not verbose:

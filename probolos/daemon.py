@@ -858,7 +858,12 @@ class Probolos:
         # persistent state. Recording a decision that was never actually made
         # would also poison the history with dry-run noise.
         if self.ledger is not None and not self.dry_run:
-            self.ledger.record(decision.device, decision.reason)
+            # `approved` is passed, not inferred from the reason string: it is
+            # what moves the drift baseline, and deriving something that
+            # load-bearing from prose that also has to read well in a log is
+            # how "held: screen locked" ends up counting as an endorsement.
+            self.ledger.record(decision.device, decision.reason,
+                               approved=bool(decision.authorized))
             error = self.ledger.save()
             if error:
                 print(f"[!] could not write ledger: {error}")

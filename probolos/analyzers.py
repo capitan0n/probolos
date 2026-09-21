@@ -117,16 +117,46 @@ class LedgerAnalyzer(Analyzer):
             return []
 
         digest = ledger_mod.descriptor_fingerprint(ctx.device)
-        if digest and digest != entry.descriptor_hash:
+        # Compared against the BASELINE -- the set first seen under this
+        # identity, and thereafter only one a human approved -- not against
+        # `descriptor_hash`, which Ledger.record() overwrites on every decision
+        # including a refusal and including the bare act of queueing a device
+        # while the screen was locked. Measuring against a field the attacker's
+        # own appearance had just rewritten meant the alarm fired exactly once
+        # and never again, no matter how the first appearance was answered.
+        #
+        # The digest itself is normalized: it drops fields that vary with the
+        # bus controller (bcdUSB, bMaxPower, endpoint packet sizes, SuperSpeed
+        # companion descriptors), so moving the same physical stick between a
+        # USB 2 and a USB 3 port is not drift. What survives is what the
+        # device says it IS: VID/PID, firmware revision, interface counts,
+        # and each interface's class/subclass/protocol -- the fields a BadUSB
+        # reflash actually has to change to add new functionality. See
+        # ledger.descriptor_fingerprint for the full field list and rationale.
+        #
+        # getattr with a fallback: an Entry rebuilt from a ledger written
+        # before the field existed is migrated in from_raw, but a test stub or
+        # a hand-built Entry may not carry it, and losing the check silently is
+        # the failure mode this whole finding is about.
+        baseline = getattr(entry, "baseline_hash", "") or entry.descriptor_hash
+        if digest and baseline and digest != baseline:
             findings.append(rules.Finding(
                 "descriptor-drift", rules.Severity.CRITICAL,
                 "This device has changed what it says it is",
-                "The same claimed identity was seen before with a different "
-                "descriptor set. Real hardware does not rewrite its own "
-                "descriptors between plug-ins; a device that does has either "
-                "been reflashed or is impersonating one that was here before. "
+                "This identity has been seen before presenting a different "
+                "descriptor set to the one in front of you now. Real hardware "
+                "does not rewrite its own descriptors between plug-ins; a "
+                "device that does has either been reflashed or is "
+                "impersonating one that was here before. The comparison is "
+                "against the set you last approved for this identity and is "
+                "measured on what the device declares itself to be, not on "
+                "how the bus enumerated it, so a mere USB 2 vs. USB 3 port "
+                "change does not trip this. Refusing it -- or leaving it "
+                "queued while you were away -- does not clear it either. "
                 f"Previously seen {entry.times_seen} time(s), first on "
-                f"{_stamp(entry.first_seen)}."))
+                f"{_stamp(entry.first_seen)}; "
+                f"{len(entry.known_hashes) or 1} distinct identity "
+                f"fingerprint(s) recorded under it."))
 
         if "user rejected" in entry.decisions:
             findings.append(rules.Finding(

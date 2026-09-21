@@ -297,8 +297,39 @@ def _write_attr_pinned(directory, name: str, value: str) -> None:
     fails, rather than on whatever took its name meanwhile. O_CLOEXEC because
     this process spawns the storage worker and the dialog backends, and none of
     them have any business inheriting a descriptor onto `authorized`.
+
+    WHY realpath() COMES FIRST (the regression this fixes)
+    ------------------------------------------------------
+    O_NOFOLLOW on the DIRECTORY, applied to the path as given, refuses every
+    path this project actually uses. /sys/bus/usb/devices/<name> IS a symlink
+    into /sys/devices/ -- that is the documented layout, and gate_server.py
+    says so at length, which is exactly why it calls realpath() before it opens
+    anything. This function did not, so open() returned ENOTDIR for:
+
+      * gate.AuthorizationGate.__enter__, whose hubs come from
+        sysfs.list_root_hubs() -- so the gate could not CLOSE at all, and the
+        daemon died in its context manager before listening for a single event;
+      * cmd_release(), whose devices come from sysfs.list_devices() -- so the
+        documented recovery path for a machine full of stranded devices failed
+        on every device and then raised out of set_authorized_default();
+      * daemon.snapshot()'s stranded devices, for the same reason.
+
+    Only the --privsep path was unaffected, because the gate resolves first.
+    The direct backend is the DEFAULT, so the effect was that the one privileged
+    write still working in the default mode was _DirectBackend.admit() -- the
+    one that switches devices ON, which omits O_NOFOLLOW on the directory and
+    therefore followed the bus-view symlink happily.
+
+    realpath() collapses every symlink in the path, including the final
+    component, so what is opened afterwards is a real directory in
+    /sys/devices/ and O_NOFOLLOW still does its job: it refuses a symlink
+    planted at that resolved location between the resolve and the open. The
+    protection that matters -- O_NOFOLLOW on the ATTRIBUTE, plus holding the
+    directory fd across the write -- is untouched. Scope (which paths may be
+    written at all) is the gate's job, not this function's.
     """
-    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY |
+    directory_fd = os.open(os.path.realpath(directory),
+                           os.O_RDONLY | os.O_DIRECTORY |
                            os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         fd = os.open(name, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW |
@@ -325,8 +356,19 @@ class _DirectBackend:
     supports_bus_wide = True
 
     def admit(self, syspath, instance) -> None:
-        directory_fd = os.open(syspath, os.O_RDONLY | os.O_DIRECTORY |
-                               os.O_CLOEXEC)
+        # realpath + O_NOFOLLOW, for the reason spelled out on
+        # _write_attr_pinned. This was the one write in the backend that had no
+        # O_NOFOLLOW on the directory at all, which is why it kept working on a
+        # bus-view path while every re-BLOCK next to it failed -- the worst
+        # possible asymmetry to leave in a deny-by-default tool.
+        #
+        # The instance comparison is unchanged and still correct: load_device()
+        # stats syspath through the symlink, so the (st_dev, st_ino) it recorded
+        # is already the inode of the RESOLVED directory, which is what fstat
+        # returns here.
+        directory_fd = os.open(os.path.realpath(syspath),
+                               os.O_RDONLY | os.O_DIRECTORY |
+                               os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             st = os.fstat(directory_fd)
             if instance != (st.st_dev, st.st_ino):

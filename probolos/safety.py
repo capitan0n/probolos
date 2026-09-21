@@ -38,6 +38,7 @@ machine where you can run `sudo touch`.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import threading
 import time
@@ -45,6 +46,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
+
+# Root hubs -- usb1, usb2, ... -- are the controllers themselves. Reaching one
+# while walking up from a device means the chain ended at the machine, which is
+# the only place `removable` carries platform authority. Defined here rather
+# than imported from sysfs so this module, which is the safety layer, keeps no
+# dependency on the layer it is protecting people from.
+_ROOT_HUB_RE = re.compile(r"^usb\d+$")
+
+# USB permits 7 tiers; 8 is past anything real and bounds the walk regardless of
+# what the tree looks like.
+_MAX_TIERS = 8
 
 # /run rather than /tmp, and BESIDE the runtime directory rather than inside
 # it. /run/probolos looks like the obvious home, but agentlink.prepare_socket_dir
@@ -126,6 +138,73 @@ def panic_file_is_valid(path: Path, required_uid: int = 0,
     return True
 
 
+def _fixed_all_the_way_to_a_root_hub(syspath) -> bool:
+    """
+    True only if `removable=fixed` was decided by the PLATFORM, not by a device.
+
+    THE BUG THIS CLOSES
+    -------------------
+    `removable=fixed` skips everything. daemon._on_add() calls is_protected(),
+    admits the device and RETURNS -- before analyzers.run(), before the
+    behavioural quarantine, before any prompt. So whatever sets that attribute
+    decides whether Probolos runs at all, and the assumption was that it means
+    "soldered to the board".
+
+    That is true for a device on a ROOT HUB port, where the kernel takes the
+    value from ACPI (_PLD/_UPC) -- firmware the machine's own manufacturer
+    wrote. It is NOT true one tier further out. The kernel's own ABI
+    documentation says the value is inferred "from a combination of hub
+    descriptor bits and platform-specific data such as ACPI", and the hub
+    descriptor bits are the DeviceRemovable bitmap, which for an EXTERNAL hub
+    is supplied by that hub's firmware. An attacker's hub declares its
+    downstream ports hard-wired and every device behind it reads `fixed` --
+    so plugging in one hub disables the gate for everything plugged into it.
+
+    THE RULE
+    --------
+    Walk up from the device. Every USB ancestor between it and the controller
+    must ITSELF be `fixed`, and the walk must actually reach a root hub. The
+    chain is then only as trustworthy as its weakest link, and it terminates at
+    the one link the platform vouches for:
+
+        usb1/1-2  (internal hub, ACPI: fixed) / 1-2.1 (camera: fixed)  -> True
+        usb1/1-4  (attacker's hub, ACPI: removable) / 1-4.2 (anything) -> False
+
+    An unreadable ancestor, a walk that runs off the tree, or one that never
+    reaches a root hub all answer False: the exemption is granted only on
+    positive evidence, never on the absence of it. Refusing costs a prompt;
+    granting it wrongly costs the whole tool.
+
+    The path is resolved first because the bus view (/sys/bus/usb/devices/1-4)
+    is a flat directory of symlinks -- its parent is `devices`, not the hub, so
+    walking it unresolved would refuse every genuinely internal device.
+    """
+    if syspath is None:
+        return False
+    try:
+        current = Path(os.path.realpath(str(syspath)))
+    except (OSError, ValueError):
+        return False
+
+    for _tier in range(_MAX_TIERS):
+        parent = current.parent
+        if parent == current:
+            return False                    # ran off the top of the tree
+        name = parent.name
+        if _ROOT_HUB_RE.match(name):
+            return True                     # the controller: ACPI decided this
+        if ":" in name:
+            return False                    # an interface node; not a device chain
+        try:
+            value = (parent / "removable").read_text().strip()
+        except OSError:
+            return False                    # cannot prove it, so do not claim it
+        if value != "fixed":
+            return False                    # this ancestor is itself pluggable
+        current = parent
+    return False
+
+
 @dataclass
 class SafetyPolicy:
     """What must never be blocked, however suspicious it looks."""
@@ -158,7 +237,9 @@ class SafetyPolicy:
             return "root hub"
         if dev.name in self.allowed_ports:
             return f"port {dev.name} is on the operator allowlist"
-        if self.protect_fixed_ports and getattr(dev, "removable", None) == "fixed":
+        if (self.protect_fixed_ports
+                and getattr(dev, "removable", None) == "fixed"
+                and _fixed_all_the_way_to_a_root_hub(getattr(dev, "syspath", None))):
             return "device is on a non-removable (internal) port"
         return None
 

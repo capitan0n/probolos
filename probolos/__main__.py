@@ -104,11 +104,20 @@ def cmd_release() -> None:
         except OSError as exc:
             print(f"  failed {dev.name}: {exc}")
 
+    # Reported, never raised. This is the documented way out of a machine whose
+    # peripherals are all dead, so one hub that will not take the write must
+    # not abandon the others and must not end in a traceback -- the operator is
+    # here because something already went wrong, and a stack trace tells them
+    # nothing they can act on. The manual command is printed instead.
     for hub in sysfs.list_root_hubs():
         current = sysfs.get_authorized_default(hub)
         if current == 0:
-            sysfs.set_authorized_default(hub, 1)
-            print(f"  {hub.name}: authorized_default reset to 1")
+            try:
+                sysfs.set_authorized_default(hub, 1)
+                print(f"  {hub.name}: authorized_default reset to 1")
+            except OSError as exc:
+                print(f"  failed {hub.name}: {exc}")
+                print(f"    run as root:  echo 1 > {hub}/authorized_default")
 
 
 def _active_session_user() -> Optional[str]:
@@ -157,7 +166,8 @@ def _active_session_user() -> Optional[str]:
 
 def _resolve_agent_identity(args):
     """
-    Who is allowed to answer questions about hardware: (uid, gid, name).
+    Who is allowed to answer questions about hardware: (uid, gid, name), or
+    None when there is nobody to ask and the agent must simply be skipped.
 
     Resolved once, before the privsep branch, because both halves need it from
     different angles: prepare_socket_dir needs the GID, to make the socket
@@ -166,23 +176,38 @@ def _resolve_agent_identity(args):
     that produces is quiet -- an agent that connects, shows a dialog, and has
     its answer silently refused.
 
-    Failing here rather than later is deliberate: --agent with an unresolvable
-    user is a configuration error, and it should not be discovered only after
-    the gate has already closed on every USB port.
+    TWO DIFFERENT FAILURES, AND ONLY ONE OF THEM IS FATAL
+    -----------------------------------------------------
+    An explicit --agent-user that does not exist is a configuration error: the
+    operator named somebody, and quietly running without them would grant the
+    prompt to nobody while looking as though it had been set up. That still
+    exits.
+
+    Auto-detection finding no desktop session is NOT an error, and treating it
+    as one was a fail-open in the shipped systemd unit. probolos.service runs
+    `--privsep --agent --timeout 0` with no --agent-user; at boot there is no
+    graphical session for _active_session_user() to find and SUDO_USER is
+    unset under systemd, so this exited, Restart=on-failure restarted it five
+    seconds later, and it looped -- `enabled`, permanently `auto-restart`, and
+    the USB gate never closing once. The notification agent is a convenience;
+    the gate is the security function, and the convenience must not be able to
+    take it down. So: say so loudly, and run without it.
     """
     if not getattr(args, "agent", False):
         return None
 
     import pwd
 
+    explicit = bool(args.agent_user)
     name = args.agent_user or _active_session_user()
     if name is None:
-        sys.exit("--agent needs --agent-user USER (could not detect the "
-                 "desktop user automatically)")
+        return None            # caller reports it and continues without an agent
     try:
         entry = pwd.getpwnam(name)
     except KeyError:
-        sys.exit(f"--agent-user {name}: no such user")
+        if explicit:
+            sys.exit(f"--agent-user {name}: no such user")
+        return None
     return entry.pw_uid, entry.pw_gid, name
 
 
@@ -388,6 +413,16 @@ def main(argv=None) -> None:
     # (set by prepare_socket_dir) and the uid AgentLink checks against can
     # never drift apart. None when --agent is off.
     agent_identity = _resolve_agent_identity(args)
+    if args.agent and agent_identity is None:
+        # Disabled rather than left half-configured. Without an identity the
+        # socket would be created with allowed_uids=None, which AgentLink itself
+        # warns means "any process that can open it may answer" -- a wider
+        # boundary than the operator asked for, reached by a detection failure.
+        print("[!] --agent: no desktop session found to own the agent socket.")
+        print("[!] The gate runs WITHOUT the notification agent; decisions are")
+        print("[!] made in this terminal. Pass --agent-user USER to fix this")
+        print("[!] (a service started at boot always needs it explicitly).\n")
+        args.agent = False
     agent_uid = agent_identity[0] if agent_identity else None
     agent_gid = agent_identity[1] if agent_identity else None
 

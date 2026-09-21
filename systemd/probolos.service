@@ -11,7 +11,31 @@ Type=simple
 # --privsep is not optional here. As a long-running service the analyzer would
 # otherwise sit as root for weeks; the split keeps that surface to a small
 # audited gate.
-ExecStart=/usr/bin/python3 -m probolos --privsep --agent --timeout 0
+#
+# --agent-user IS REQUIRED HERE, and the unit shipped without it.
+#
+# At boot there is no graphical session, so the automatic detection in
+# _active_session_user() finds nothing and SUDO_USER is unset under systemd.
+# The daemon now says so and runs the gate without the notification agent
+# rather than exiting -- but that means a service left like this would protect
+# the machine with no desktop prompt at all, with decisions falling back to a
+# terminal that nobody is watching.
+#
+# So name the account whose desktop session may answer. Do it in a drop-in
+# rather than by editing this file, so an update does not overwrite it:
+#
+#   sudo systemctl edit probolos.service
+#
+#   [Service]
+#   Environment=PROBOLOS_AGENT_USER=yourname
+#
+# Leaving it as `nobody` is deliberate: `nobody` owns no desktop session, so a
+# unit that was never configured fails the way it should -- visibly, with the
+# gate still closed -- instead of handing the prompt to whichever account
+# happened to be logged in when the service started.
+Environment=PROBOLOS_AGENT_USER=nobody
+ExecStart=/usr/bin/python3 -m probolos --privsep --timeout 0 \
+          --agent --agent-user ${PROBOLOS_AGENT_USER}
 Restart=on-failure
 RestartSec=5
 

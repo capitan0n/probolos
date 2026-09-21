@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence
 
-from . import rules, sysfs, usbclass
+from . import rules, sysfs, textsafe, usbclass
 
 # Severity is shown as a word, not a colour or a number. A user under time
 # pressure reads one word.
@@ -35,9 +35,38 @@ WIDTH = 62
 
 
 def _line(text: str = "") -> str:
-    # Border(1) + space(1) + padded text(WIDTH-1) + border(1) == WIDTH + 2,
-    # which is exactly the width of the ─ rules above and below.
-    return f"│ {text:<{WIDTH - 1}}│"
+    """
+    One row of the box, exactly WIDTH + 2 terminal columns wide.
+
+    THE BUG THIS FIXES
+    ------------------
+    This was `f"│ {text:<{WIDTH - 1}}│"`. Python's field width counts
+    CHARACTERS, and textsafe.pad/fit/display_width -- written precisely so a
+    device could not push the border off the line, and carrying that reasoning
+    in their own docstrings -- had no callers anywhere in the project. The
+    entire column-width defence was dead code, which is this codebase's
+    recurring failure: a protection written, documented, and never wired to
+    the path that needs it.
+
+    Three consequences, all reachable from the device side, because
+    iManufacturer/iProduct/iSerialNumber are chosen by the device and the
+    identity rows below are not wrapped:
+
+      * a 122-character ASCII product name -- inside sanitize()'s 126-character
+        budget -- produced a 140-column row in a 64-column box;
+      * a CJK name is legitimate and costs two columns per glyph, so an honest
+        Chinese product name broke the box as effectively as an attack;
+      * box-drawing characters are neither Cc nor Cf, so sanitize() passes them
+        through untouched. A product string of spaces, "│", and the text
+        "No inconsistencies found in what it claims" renders as a convincing
+        extra row -- on the one screen where the admission decision is made,
+        and once the terminal wraps the over-long line the device controls
+        whole visual rows of it.
+
+    pad() fits first and then pads to an exact column count, so the row is the
+    right width whatever the device sent.
+    """
+    return f"│ {textsafe.pad(text, WIDTH - 1)}│"
 
 
 def _rule(left="├", right="┤", fill="─") -> str:
@@ -45,18 +74,63 @@ def _rule(left="├", right="┤", fill="─") -> str:
 
 
 def _wrap(text: str, width: int) -> List[str]:
-    """Naive word wrap. Explanations are prose and must not run off the box."""
+    """
+    Naive word wrap. Explanations are prose and must not run off the box.
+
+    Measured in terminal COLUMNS, not characters -- see _line. A single token
+    wider than the line is split rather than emitted whole: device-supplied
+    strings are reproduced inside finding explanations (dev.label() appears in
+    self-contradictory-identity), they routinely contain no spaces at all, and
+    `len(candidate) > width and current` let exactly those through untouched.
+    """
     words, lines, current = text.split(), [], ""
     for word in words:
-        candidate = f"{current} {word}".strip()
-        if len(candidate) > width and current:
-            lines.append(current)
-            current = word
-        else:
-            current = candidate
+        for piece in textsafe.split_width(word, width):
+            candidate = f"{current} {piece}".strip()
+            if textsafe.display_width(candidate) > width and current:
+                lines.append(current)
+                current = piece
+            else:
+                current = candidate
     if current:
         lines.append(current)
     return lines
+
+
+# Width of the "Manufacturer:  " style labels below, so the wrapped
+# continuation of a long device string lines up under the value rather than
+# under the label.
+_LABEL_WIDTH = 15
+
+
+def _field(label: str, value: Optional[str]) -> List[str]:
+    """
+    One "Label: value" row carrying a DEVICE-SUPPLIED string.
+
+    The identity rows were the only ones in the report that went through no
+    wrapping at all, which is what made them the device's way into the layout.
+
+    Only the value is wrapped, never the label with it: _wrap() splits on
+    whitespace, so wrapping the two together collapsed the padding that lines
+    the columns up.
+
+    The value is QUOTED, and that is a security property rather than a style
+    choice. Wrapping stops the device from breaking the box; it does not stop
+    it from writing a plausible sentence inside one. sanitize() passes "│"
+    through untouched -- correctly, since it is a printable character and no
+    list of forbidden glyphs stays complete -- so a product string can still
+    read as a row of the report, and the sentence a device would pick is the
+    verdict. Quotation marks answer that without guessing at characters: they
+    say whose words these are, so anything between them is plainly the
+    device's testimony and not Probolos's conclusion.
+    """
+    if value:
+        rows = _wrap(f'"{value}"', WIDTH - 3 - _LABEL_WIDTH) or ['""']
+    else:
+        rows = ["(none reported)"]
+    head = f"{label + ':':<{_LABEL_WIDTH}}"
+    return ([_line(head + rows[0])]
+            + [_line(" " * _LABEL_WIDTH + row) for row in rows[1:]])
 
 
 def _finding_lines(finding: rules.Finding) -> List[str]:
@@ -103,9 +177,12 @@ def render(dev: sysfs.UsbDevice,
     out.append(_line())
 
     # --- who it says it is (device-supplied strings, never trusted) ------
-    out.append(_line(f"Manufacturer:  {dev.manufacturer or '(none reported)'}"))
-    out.append(_line(f"Product:       {dev.product or '(none reported)'}"))
-    out.append(_line(f"Serial:        {dev.serial or '(none reported)'}"))
+    # Through _field, so a long or wide name wraps inside the box instead of
+    # drawing outside it. These three values are the most directly
+    # device-controlled text in the whole report.
+    out.extend(_field("Manufacturer", dev.manufacturer))
+    out.extend(_field("Product", dev.product))
+    out.extend(_field("Serial", dev.serial))
 
     out.append(_rule())
 

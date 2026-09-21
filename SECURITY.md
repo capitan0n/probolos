@@ -41,6 +41,21 @@ afterwards passes every check here. The ledger narrows this by detecting a
 device that changes its descriptors between visits, but a device that changes
 only its *behaviour* leaves nothing to compare.
 
+The comparison is a **normalized** fingerprint of the parsed device and
+interface descriptors: `idVendor`, `idProduct`, `bcdDevice`, the top-level
+class triple, and for every configuration and interface the counts and the
+class/subclass/protocol triple. It deliberately drops `bcdUSB`,
+`bMaxPacketSize0`, `bMaxPower`, endpoint descriptors and SuperSpeed
+companion descriptors, because those are negotiated per bus controller and
+change on legitimate port swaps — a Kingston DataTraveler moved from a
+USB 2 to a USB 3 port produces a different raw blob without being a
+different device. So the drift rule fires on added interfaces, changed
+class/subclass/protocol, firmware revision changes and configuration
+changes; it does not fire on speed renegotiation alone. The raw-byte hash
+is still recorded per entry (`raw_hash` in `ledger.json`) for forensics —
+`--history -v` shows both — but it is never the field the CRITICAL rule
+compares.
+
 **Descriptor forgery.** An O.MG cable declares exactly what a real cable
 declares. No identity-based check can separate them — which is the entire
 reason stages 3 and 4 exist, and why active interrogation is being
