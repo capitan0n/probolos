@@ -179,12 +179,30 @@ class GateServer:
 
         Missing/unreadable authorized -> False (fail closed: if we cannot prove
         it is blocked, we do not act on it).
+
+        Read through a descriptor pinned on the directory, with O_NOFOLLOW on
+        both components. This is the function that answers "is this device
+        under quarantine?", and that answer is the whole scoping rule for
+        open_input, open_block and interface authorization -- so reading it by
+        name meant the gate's central check could be aimed at a file the
+        analyzer chose, by planting a symlink at <device>/authorized. The
+        writes were pinned and the READ that authorizes them was not, which is
+        the wrong half to leave open: a "0" read out of an attacker-chosen file
+        turns every scope check in this class into a yes.
         """
+        directory_fd = None
         try:
-            raw = (usb_path / "authorized").read_text().strip()
+            directory_fd = os.open(usb_path, os.O_RDONLY | os.O_DIRECTORY |
+                                   os.O_NOFOLLOW | os.O_CLOEXEC)
+            fd = os.open("authorized", os.O_RDONLY | os.O_NOFOLLOW |
+                         os.O_CLOEXEC, dir_fd=directory_fd)
+            with os.fdopen(fd) as fh:
+                return fh.read(8).strip() == "0"
         except OSError:
             return False
-        return raw == "0"
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     @classmethod
     def _usb_parent_of(cls, node: Path) -> Optional[Path]:
@@ -323,7 +341,22 @@ class GateServer:
             return protocol.Response(
                 protocol.DENIED,
                 f"not an interface (no configuration:interface suffix): {intf.name}")
-        parent = intf.parent
+        # The parent is VALIDATED, not merely taken. `intf.parent` is plain
+        # path arithmetic on a string the analyzer supplied: it was handed
+        # straight to _usb_device_is_blocked and _owns_instance, which is the
+        # gate trusting the analyzer to describe the very relationship the gate
+        # exists to verify. _safe_usb_path is what proves a path is a USB node
+        # the kernel recognises (it must be reachable through the bus view,
+        # which cannot be forged), and the parent of an interface must clear
+        # exactly the same bar as any other device path in this class --
+        # including not being an interface itself and not being a root hub,
+        # since neither owns interfaces and both would widen the target list.
+        parent = self._safe_usb_path(str(intf.parent))
+        if (parent is None or ":" in parent.name
+                or _ROOT_HUB_NAME.fullmatch(parent.name)):
+            return protocol.Response(
+                protocol.DENIED,
+                f"interface {intf.name} has no valid parent USB device")
         in_scope = (self._usb_device_is_blocked(parent)
                     or self._owns_instance(parent))
         if req.value == 1 and not in_scope:

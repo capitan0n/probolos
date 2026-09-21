@@ -265,6 +265,55 @@ def list_root_hubs() -> List[Path]:
 # without rewriting its logic.
 # --------------------------------------------------------------------------
 
+def _write_attr_pinned(directory, name: str, value: str) -> None:
+    """
+    Write one sysfs attribute through a descriptor pinned on its directory.
+
+    THE BUG THIS FIXES. Every write below used to be
+    `(path / name).write_text(value)`, which is open(..., "w") -- and open()
+    FOLLOWS SYMLINKS on the final component. gate_server.py was hardened
+    against exactly this and carries the reasoning in full ("between the check
+    that approved it and the write, the name can be re-created by whatever
+    enumerates next at that port"), but the DIRECT backend -- the one used
+    whenever Probolos runs as plain root WITHOUT --privsep, which is the
+    default and the documented `sudo python -m probolos` invocation -- was
+    never given the same treatment. So the project had two ways to write a
+    privileged sysfs attribute and only the less-used one checked what it was
+    writing to.
+
+    The consequence is a root arbitrary-file-write: anything that can place a
+    symlink at <device>/authorized, <hub>/authorized_default or
+    /sys/bus/usb/drivers_autoprobe gets "0" or "1" written, as root, to a file
+    of its choosing. sysfs itself is not attacker-writable on a healthy
+    system, so this is not remotely triggerable -- but these paths also arrive
+    from --allow-port, from pyudev sys_path, and from the test/emulation trees
+    (dummy_hcd, raw_gadget, testbed/), where they are ordinary directories.
+    A guard that only holds because of where the path happens to come from is
+    not a guard.
+
+    O_NOFOLLOW on the attribute refuses a symlink outright; O_DIRECTORY |
+    O_NOFOLLOW on the parent refuses one there too; holding the directory fd
+    across the write means the write lands on the directory that was opened or
+    fails, rather than on whatever took its name meanwhile. O_CLOEXEC because
+    this process spawns the storage worker and the dialog backends, and none of
+    them have any business inheriting a descriptor onto `authorized`.
+    """
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY |
+                           os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW |
+                     os.O_CLOEXEC, dir_fd=directory_fd)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fd = None          # fdopen owns it from here
+                fh.write(value)
+        finally:
+            if fd is not None:
+                os.close(fd)
+    finally:
+        os.close(directory_fd)
+
+
 class _DirectBackend:
     """Writes sysfs directly. The original behaviour, used when running as root
     without privilege separation."""
@@ -299,15 +348,21 @@ class _DirectBackend:
             os.close(directory_fd)
 
     def authorize(self, syspath: Path, value: int) -> None:
-        (syspath / "authorized").write_text(str(value))
+        # Pinned rather than by name: see _write_attr_pinned. This is the write
+        # that switches a device on, so a symlink here is a root write to a
+        # file of the planter's choosing AND a device that never came alive.
+        _write_attr_pinned(syspath, "authorized", str(value))
 
     def authorize_interface(self, intf_dir, value: int) -> None:
         # Interface-level authorization: controls whether the kernel
         # binds a driver to ONE interface, not the whole device.
-        (intf_dir / "authorized").write_text(str(value))
+        _write_attr_pinned(intf_dir, "authorized", str(value))
 
     def set_default(self, hub: Path, value: int) -> None:
-        (hub / "authorized_default").write_text(str(value))
+        # The most powerful attribute the tool writes: 1 here admits every
+        # device attached from that moment on. It was the last one still being
+        # reached by name in this backend.
+        _write_attr_pinned(hub, "authorized_default", str(value))
 
     def open_input(self, node_path) -> int:
         import os
@@ -318,10 +373,16 @@ class _DirectBackend:
         return os.open(str(device_path), os.O_RDONLY | os.O_NONBLOCK)
 
     def set_drivers_autoprobe(self, value: int) -> None:
-        DRIVERS_AUTOPROBE.write_text(str(value))
+        # Bus-wide, and the single most dangerous write in the codebase: left
+        # at 0 no device on the machine binds a driver. Pinned for the same
+        # reason as the per-device writes -- and here the consequence of a
+        # followed symlink is not only the stray root write but a bus that was
+        # never actually switched back, with the restore path believing it was.
+        _write_attr_pinned(DRIVERS_AUTOPROBE.parent,
+                           DRIVERS_AUTOPROBE.name, str(value))
 
     def trigger_driver_probe(self, name: str) -> None:
-        DRIVERS_PROBE.write_text(name)
+        _write_attr_pinned(DRIVERS_PROBE.parent, DRIVERS_PROBE.name, name)
 
 
 _backend = _DirectBackend()

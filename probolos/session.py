@@ -32,7 +32,7 @@ working must never look like one that is.
 from __future__ import annotations
 
 import os
-import shutil
+import stat as _stat
 import subprocess
 from typing import Optional
 
@@ -40,6 +40,35 @@ from typing import Optional
 POLICY_QUEUE = "queue"        # block now, ask when the screen unlocks
 POLICY_DENY = "deny"          # block now, do not ask later
 POLICY_IGNORE = "ignore"      # take no notice of the lock state
+
+# Where loginctl legitimately lives. NOT shutil.which().
+#
+# which() walks $PATH, and this process is root (or, under --privsep, the
+# parent was). `sudo` preserves PATH under a Defaults:!secure_path or
+# env_keep configuration, systemd units can be given an Environment=PATH, and
+# a cron or service wrapper can set anything at all -- so a writable directory
+# appearing earlier in PATH than /usr/bin turns "ask logind whether the screen
+# is locked" into "execute whatever is called loginctl", as root, once per
+# second from the daemon's main poll loop and again for every device.
+#
+# That is a privilege-escalation primitive handed out by a convenience call,
+# and it costs nothing to close: loginctl is part of systemd and has exactly
+# two real locations. An absolute path cannot be redirected by the
+# environment, and each candidate is checked to be a regular executable file
+# rather than merely present.
+_LOGINCTL_CANDIDATES = ("/usr/bin/loginctl", "/bin/loginctl")
+
+
+def _find_loginctl() -> Optional[str]:
+    """The real loginctl, found by absolute path rather than through $PATH."""
+    for candidate in _LOGINCTL_CANDIDATES:
+        try:
+            info = os.stat(candidate)
+        except OSError:
+            continue
+        if _stat.S_ISREG(info.st_mode) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 class SessionMonitor:
@@ -92,7 +121,10 @@ class LogindMonitor(SessionMonitor):
 
     def __init__(self, seat_user: Optional[str] = None):
         self.seat_user = seat_user
-        self._binary = shutil.which("loginctl")
+        # Absolute path only: see _find_loginctl. Resolving this through $PATH
+        # in a root process is an arbitrary-exec hole, and this call is on the
+        # daemon's hot loop.
+        self._binary = _find_loginctl()
 
     def available(self) -> bool:
         return self._binary is not None

@@ -119,12 +119,22 @@ def _active_session_user() -> Optional[str]:
     Uses logind, which already provides the lock state, rather than guessing
     from SUDO_USER -- although that is used as a fallback, since running under
     sudo is the normal case here and it is a strong hint.
+
+    loginctl is located by absolute path via session._find_loginctl rather than
+    with shutil.which. This function runs as ROOT, before the privilege split,
+    and its result decides which uid is permitted to answer questions about
+    hardware through the agent socket. A which() here is two holes at once: an
+    arbitrary root exec if $PATH was inherited from an attacker-influenced
+    environment, and -- more quietly -- a fake loginctl that simply PRINTS a
+    chosen Name=, handing the agent slot to a uid of its choosing. The same
+    reasoning is spelled out in full in session.py.
     """
     import os
-    import shutil
     import subprocess
 
-    loginctl = shutil.which("loginctl")
+    from .session import _find_loginctl
+
+    loginctl = _find_loginctl()
     if loginctl:
         try:
             out = subprocess.run([loginctl, "list-sessions", "--no-legend"],

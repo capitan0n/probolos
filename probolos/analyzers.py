@@ -45,6 +45,16 @@ class Analyzer:
     title = "base analyzer"
     requires_observation = False
 
+    # Whether this analyzer's silence can be mistaken for a clean verdict.
+    #
+    # `run()` turns a crashing analyzer into a finding so that one broken
+    # heuristic cannot stop somebody admitting their keyboard. That is right
+    # for a speculative check and WRONG for the checks the admission decision
+    # actually rests on: see the note on run() below. An analyzer that carries
+    # verdict-bearing rules sets this, and its failure is reported at the
+    # severity its absence deserves rather than as a footnote.
+    decisive = False
+
     def analyze(self, ctx: Context) -> List[rules.Finding]:
         raise NotImplementedError
 
@@ -53,6 +63,10 @@ class SemanticAnalyzer(Analyzer):
     """Stages 1-2: what the device claims, and whether it is coherent."""
     id = "semantic"
     title = "identity and internal consistency"
+    # Every CRITICAL identity rule lives here: the BadUSB signatures, the
+    # crafted-string escalation, the self-contradiction check. If this does not
+    # run, nothing else produces them.
+    decisive = True
 
     def analyze(self, ctx):
         return rules.evaluate(ctx.device, ctx.config)
@@ -63,6 +77,10 @@ class BehaviourAnalyzer(Analyzer):
     id = "behaviour"
     title = "behaviour under quarantine"
     requires_observation = True
+    # Holds machine-generated-keystrokes, unprompted-typing and -- the one that
+    # matters most -- quarantine-not-restored, which is the only thing that
+    # tells the operator the device is still live while they read the prompt.
+    decisive = True
 
     def analyze(self, ctx):
         return rules.behaviour_findings(ctx.observation, ctx.config)
@@ -131,6 +149,7 @@ class PayloadAnalyzer(Analyzer):
     id = "payload"
     title = "attempted payload"
     requires_observation = True
+    decisive = True
 
     def analyze(self, ctx):
         recovered = payload_mod.reconstruct_observation(ctx.observation)
@@ -159,6 +178,9 @@ class StorageAnalyzer(Analyzer):
     """
     id = "storage"
     title = "what the medium contains"
+    # impossible-partition-geometry and the overlap/past-the-end rules are the
+    # only evidence about the medium the operator ever sees.
+    decisive = True
 
     def analyze(self, ctx):
         medium = ctx.extra.get("medium")
@@ -179,7 +201,45 @@ DEFAULT_ANALYZERS: List[Analyzer] = [
 def run(ctx: Context,
         analyzers: Optional[Sequence[Analyzer]] = None
         ) -> List[rules.Finding]:
-    """Run every applicable analyzer, worst finding first."""
+    """
+    Run every applicable analyzer, worst finding first.
+
+    CONTAINMENT MUST NOT BECOME A FAIL-OPEN (the bug fixed here)
+    ------------------------------------------------------------
+    Catching an analyzer's exception and continuing is right: a crash in a
+    speculative heuristic must never prevent a user from admitting their
+    keyboard. But the failure was recorded as a NOTICE for EVERY analyzer,
+    including SemanticAnalyzer -- which is where all of the CRITICAL identity
+    rules live. So a device that crashed the rule engine produced, in full:
+
+        NOTICE  The 'semantic' check could not run
+
+    and nothing else. Every consumer of that verdict then read it as a clean
+    device:
+
+      * daemon._on_add admits a remembered device without asking whenever
+        `rules.worst(findings) < CRITICAL`, which a NOTICE satisfies;
+      * the terminal prompt drops from "type the word authorize" to a bare
+        [y/N], because `critical` is False;
+      * the desktop agent is offered the device as an ordinary clickable
+        question, which a CRITICAL device is never supposed to be.
+
+    That is a fail-open reachable from the device side: the descriptor blob is
+    attacker-controlled and rules.evaluate() walks it. The rule engine is
+    hardened and the parser is fuzzed, so this is a second line rather than a
+    live hole -- but "the analyzer cannot crash" is precisely the assumption a
+    security tool should not be resting a fail-open on, and the project's own
+    recurring bug is protections that were written and never wired to the path
+    that needs them.
+
+    So the severity of a failure now follows what the failure COSTS. A decisive
+    analyzer is one whose findings the decision rests on; its silence cannot be
+    distinguished from a clean result, so its failure is itself CRITICAL and
+    the operator is made to type the word. A non-decisive one (history, say)
+    stays a NOTICE, because losing it degrades the report rather than the
+    verdict. Either way the run continues and the keyboard can still be
+    admitted -- deliberately, by a human who was told what was not checked.
+    """
     findings: List[rules.Finding] = []
 
     for analyzer in (analyzers if analyzers is not None else DEFAULT_ANALYZERS):
@@ -188,12 +248,28 @@ def run(ctx: Context,
         try:
             findings.extend(analyzer.analyze(ctx))
         except Exception as exc:  # noqa: BLE001 - deliberate containment
-            # A broken heuristic must never stop somebody admitting a keyboard.
+            # A broken heuristic must never stop somebody admitting a keyboard,
+            # so this is still a finding rather than a raise. What changed is
+            # the severity: see the docstring.
+            decisive = getattr(analyzer, "decisive", False)
+            if decisive:
+                severity = rules.Severity.CRITICAL
+                explanation = (
+                    f"{type(exc).__name__}: {exc}. This check is what produces "
+                    f"the verdict for this stage, so its absence is NOT a clean "
+                    f"result -- nothing examined this device at all here. It is "
+                    f"reported as CRITICAL so that it cannot be admitted "
+                    f"without a deliberate decision, and so a remembered device "
+                    f"is not waved through on the strength of a check that "
+                    f"never ran.")
+            else:
+                severity = rules.Severity.NOTICE
+                explanation = (
+                    f"{type(exc).__name__}: {exc}. That check contributed "
+                    f"nothing to the verdict below.")
             findings.append(rules.Finding(
-                f"analyzer-failed:{analyzer.id}", rules.Severity.NOTICE,
-                f"The '{analyzer.id}' check could not run",
-                f"{type(exc).__name__}: {exc}. That check contributed nothing "
-                "to the verdict below."))
+                f"analyzer-failed:{analyzer.id}", severity,
+                f"The '{analyzer.id}' check could not run", explanation))
             ctx.extra.setdefault("tracebacks", []).append(
                 traceback.format_exc())
 

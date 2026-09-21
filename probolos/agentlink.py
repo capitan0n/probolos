@@ -523,7 +523,25 @@ class AgentLink:
                     if answer == ANSWER_UNAVAILABLE:
                         return None
                     if answer == ANSWER_ALWAYS and not allow_always:
-                        continue
+                        # DOWNGRADE, do not discard. `continue` here threw the
+                        # answer away and went back to waiting, so a user who
+                        # clicked a button was left with a question that then
+                        # timed out into a denial -- and the daemon, seeing
+                        # None, printed "no answer from the desktop agent" and
+                        # asked again in a terminal the user may not be looking
+                        # at. A decision that was made must not evaporate.
+                        #
+                        # "Always" is "yes" plus "remember it". When remembering
+                        # is not on offer (no trust store), the honest reading
+                        # of the click is the yes without the remembering --
+                        # which is strictly LESS than the user asked for, so it
+                        # cannot grant anything they did not intend. The agent
+                        # should not have offered the option; that it did is a
+                        # mismatch to log, not a reason to drop the answer.
+                        self.log("[agent] agent returned 'always' although it "
+                                 "was not offered; treating it as 'yes' for "
+                                 "this device only, and remembering nothing")
+                        answer = ANSWER_YES
                     if answer is not None and time.monotonic() < deadline:
                         return answer
         finally:

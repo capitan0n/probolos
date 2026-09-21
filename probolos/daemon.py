@@ -92,7 +92,21 @@ class Probolos:
         # Devices attached while the screen was locked. They are held blocked
         # and asked about when someone returns, so nobody has to unplug and
         # replug hardware just because they stepped away.
-        self.pending: "OrderedDict[str, Path]" = OrderedDict()
+        #
+        # The value is (syspath, instance_id), not the path alone. A held
+        # device is identified by the kernel directory INSTANCE it had when it
+        # was queued -- (st_dev, st_ino) -- because a sysfs name like "1-4" is
+        # a PORT, not a device. Between queueing and unlocking, the original
+        # can be pulled and something else enumerated at the same port; the
+        # name is then identical and the directory is a different inode. With
+        # only the path recorded, _drain_pending would inspect and prompt for
+        # the new device under the queue entry belonging to the old one, and
+        # the operator would be answering about hardware they never saw
+        # arrive. That is the same port-recycling hole already closed in
+        # _on_remove and in sysfs.admit_device; the queue is the third place
+        # the port/device distinction matters and it was the one still using
+        # a bare name.
+        self.pending: "OrderedDict[str, tuple]" = OrderedDict()
         self._was_locked = False
         self.known: Set[str] = set()    # devices present at startup
 
@@ -131,7 +145,7 @@ class Probolos:
                   f"(left over from an earlier run):")
             for dev in stranded:
                 print(f"      {report.one_liner(dev)}")
-                self.pending[dev.name] = dev.syspath
+                self.pending[dev.name] = (dev.syspath, dev.instance_id)
             print("    You will be asked about them now, without unplugging "
                   "anything.\n")
 
@@ -233,6 +247,17 @@ class Probolos:
         if name in self.known:
             return  # a device we deliberately ignore
 
+        # Already live and already decided? Then this is a repeat 'add' for a
+        # device that is past the gate, and re-running the gate on it is
+        # actively harmful rather than merely redundant: _quarantine() writes
+        # authorized=0 and back to 1 on hardware the user is USING, dropping
+        # a keyboard mid-keystroke or a stick mid-write, and it takes an
+        # EVIOCGRAB on a device whose input the user expects to reach their
+        # session. udev delivers duplicate 'add' events routinely -- a
+        # `udevadm trigger`, a settle, a subsystem rescan -- and nothing here
+        # recorded that a device had been admitted, so `known` only ever held
+        # the startup baseline. The device we let through is added to it at
+        # the point of admission below.
         dev = self._load_with_retry(path)
         if dev is None:
             print(f"[!] {name}: vanished before it could be read")
@@ -264,6 +289,9 @@ class Probolos:
                 return
             print(f"[=] ADMITTED WITHOUT PROMPT ({protection}) — "
                   f"{report.one_liner(dev)}\n")
+            # Past the gate: a later duplicate 'add' must not re-gate live
+            # hardware. Cleared again by _on_remove when the device leaves.
+            self.known.add(dev.name)
             self._record(Decision(dev, True, f"protected: {protection}",
                                   time.time()))
             return
@@ -286,6 +314,7 @@ class Probolos:
                 if error:
                     print(f"[!] could not update trust store: {error}")
                 print(f"[=] TRUSTED — {report.one_liner(dev, findings)}\n")
+                self.known.add(dev.name)
                 self._record(Decision(dev, True, "trusted", time.time()),
                              findings)
             except OSError as exc:
@@ -395,6 +424,7 @@ class Probolos:
                 self._record(Decision(dev, False, "admission failed", time.time()),
                              findings)
                 return
+            self.known.add(dev.name)
             self._record(Decision(dev, True, "user approved", time.time()), findings)
             if getattr(self, "_remember", False) and self.trust is not None:
                 entry = self.trust.trust(dev)
@@ -465,7 +495,9 @@ class Probolos:
     def _hold_until_unlocked(self, dev: sysfs.UsbDevice) -> None:
         """Keep a device blocked and remember to ask about it later."""
         if self.lock_policy == session_mod.POLICY_QUEUE:
-            self.pending[dev.name] = dev.syspath
+            # Instance recorded alongside the path: the entry is about THIS
+            # device, not about whatever later occupies this port.
+            self.pending[dev.name] = (dev.syspath, dev.instance_id)
             print(f"[⏸] SCREEN LOCKED — holding {report.one_liner(dev)}")
             print("    It stays blocked. You will be asked when you unlock.\n")
             reason = "held: screen locked"
@@ -487,15 +519,44 @@ class Probolos:
         have changed, but reading it again is what makes the full inspection --
         quarantine, storage scan -- run now, at the moment there is a human to
         see the result.
+
+        What re-reading does NOT establish is that the thing at that path is
+        still the thing that was queued, which is why the recorded instance is
+        checked first. "It has been blocked the whole time" is true of the
+        device that was held and says nothing about the port: an attacker with
+        physical access -- the threat this whole lock policy exists for -- can
+        pull the held device and insert their own at the same port while the
+        screen is locked. Both are named "1-4". Without the instance check the
+        queue entry, and the operator's expectation of what they are being
+        asked about, silently transfers to the substitute.
         """
         if not self.pending:
             return
         print(f"\n[▶] Screen unlocked — {len(self.pending)} device(s) were "
               f"held while you were away.\n")
         held, self.pending = self.pending, OrderedDict()
-        for name, syspath in held.items():
+        for name, (syspath, instance) in held.items():
             if not syspath.exists():
                 print(f"[*] {name} was removed while held; nothing to decide\n")
+                continue
+            # The kernel directory instance is the identity. A mismatch means
+            # the port was recycled, so this is NOT the held device; it is
+            # dropped from the queue and left blocked. It is not silently
+            # inspected instead, and it is not admitted -- a new device gets a
+            # fresh 'add' event of its own if the kernel still has one to give,
+            # and if it does not, staying blocked is the safe direction.
+            #
+            # Skipped entirely when no instance was recorded (load_device could
+            # not stat the directory at queue time). There is then nothing to
+            # compare against, and inventing a comparison would only refuse
+            # devices for a reason that does not exist.
+            if instance is not None and not self._still_same_device(
+                    syspath, instance):
+                print(f"[!] {name}: a DIFFERENT device now occupies this port "
+                      f"than the one held while you were away.")
+                print(f"    It stays blocked and is not being asked about "
+                      f"under the old entry. Replug it to have it gated "
+                      f"normally.\n")
                 continue
             # Same reasoning as the poll loop: one held device failing must not
             # abandon the rest of the queue, and must not end the daemon.
@@ -506,6 +567,27 @@ class Probolos:
                 print(f"[!] {name}: unhandled error while gating this held "
                       f"device: {exc!r}. It stays BLOCKED.")
                 traceback.print_exc()
+
+    @staticmethod
+    def _still_same_device(syspath: Path, instance: tuple) -> bool:
+        """
+        Is the kernel directory at `syspath` still the one recorded as
+        `instance`?
+
+        A sysfs name such as "1-4" names a PORT. The (st_dev, st_ino) pair
+        names the directory the kernel created for one particular enumeration
+        of one particular device, and it changes when the device is unplugged
+        and another is inserted at the same port. That distinction is what the
+        held queue needs and what it did not have.
+
+        An unreadable path answers False: if we cannot prove it is the same
+        device, we do not treat it as one.
+        """
+        try:
+            st = syspath.stat()
+        except OSError:
+            return False
+        return (st.st_dev, st.st_ino) == instance
 
     def _inspect_medium(self, dev: sysfs.UsbDevice):
         """

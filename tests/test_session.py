@@ -29,6 +29,25 @@ def make_device(name="3-9", kinds=None):
     dev.raw_descriptors = b"\x12\x01test"
     dev.removable = "removable"
     dev.label.return_value = "Kingston DataTraveler"
+    # The fields rules.evaluate() actually walks. They were missing, and a
+    # bare Mock returns another Mock for each -- which is not iterable, so
+    # SemanticAnalyzer raised TypeError on every device in this module and
+    # analyzers.run() swallowed it as a NOTICE. The tests still passed,
+    # because a NOTICE is below CRITICAL and the trust path only checks that
+    # threshold: the suite was exercising the fail-open rather than the rule
+    # engine. Now that a decisive analyzer's failure is itself CRITICAL, the
+    # stub has to be a device the rules can actually read.
+    dev.interfaces = []
+    dev.interface_classes = []
+    dev.manufacturer = "Kingston"
+    dev.product = "DataTraveler"
+    dev.parse_error = None
+    dev.descriptor_set = None
+    dev.string_notes = []
+    dev.string_note_fields = {}
+    dev.speed = "480"
+    dev.instance_id = (1, 1000 + abs(hash(name)) % 1000)
+    dev.inspection_safe = True
     return dev
 
 
@@ -145,7 +164,7 @@ class TestUnlockDrainsTheQueue(unittest.TestCase):
         engine = daemon_mod.Probolos(monitor=session.FixedState(True),
                                      lock_policy=session.POLICY_QUEUE,
                                      observe=0)
-        engine.pending["3-9"] = Path("/sys/bus/usb/devices/3-9")
+        engine.pending["3-9"] = (Path("/sys/bus/usb/devices/3-9"), None)
 
         asked = []
         with mock.patch.object(Path, "exists", return_value=True), \
@@ -159,7 +178,7 @@ class TestUnlockDrainsTheQueue(unittest.TestCase):
     def test_a_device_unplugged_while_held_is_not_asked_about(self):
         engine = daemon_mod.Probolos(monitor=session.FixedState(True),
                                      observe=0)
-        engine.pending["3-9"] = Path("/sys/bus/usb/devices/3-9")
+        engine.pending["3-9"] = (Path("/sys/bus/usb/devices/3-9"), None)
 
         asked = []
         with mock.patch.object(Path, "exists", return_value=False), \
@@ -171,14 +190,14 @@ class TestUnlockDrainsTheQueue(unittest.TestCase):
 
     def test_removal_withdraws_a_held_question(self):
         engine = daemon_mod.Probolos(observe=0)
-        engine.pending["3-9"] = Path("/sys/bus/usb/devices/3-9")
+        engine.pending["3-9"] = (Path("/sys/bus/usb/devices/3-9"), None)
         engine._on_remove("/sys/bus/usb/devices/3-9")
         self.assertEqual(engine.pending, {})
 
     def test_queue_preserves_arrival_order(self):
         engine = daemon_mod.Probolos(observe=0)
         for name in ("3-1", "3-2", "3-3"):
-            engine.pending[name] = Path(f"/sys/bus/usb/devices/{name}")
+            engine.pending[name] = (Path(f"/sys/bus/usb/devices/{name}"), None)
 
         asked = []
         with mock.patch.object(Path, "exists", return_value=True), \
@@ -256,7 +275,7 @@ class TestStrandedDevicesAtStartup(unittest.TestCase):
         """Leaving hardware dead without saying so is how a tool gets a name
         for breaking things."""
         engine = daemon_mod.Probolos(observe=0)
-        engine.pending["3-9"] = Path("/sys/bus/usb/devices/3-9")
+        engine.pending["3-9"] = (Path("/sys/bus/usb/devices/3-9"), None)
         with mock.patch("builtins.print") as printed:
             engine.report_blocked_on_exit()
         text = " ".join(str(c) for c in printed.call_args_list)
@@ -308,9 +327,12 @@ class TestHeldDevicesBypassTrust(unittest.TestCase):
 
     def test_drain_marks_devices_as_held(self):
         engine, dev = self.build()
-        engine.pending[dev.name] = dev.syspath
+        engine.pending[dev.name] = (dev.syspath, dev.instance_id)
         seen = []
+        # _still_same_device is stubbed True: this test is about the was_held
+        # flag, and the port-recycling check has tests of its own below.
         with mock.patch.object(Path, "exists", return_value=True), \
+             mock.patch.object(engine, "_still_same_device", return_value=True), \
              mock.patch.object(engine, "_on_add",
                                side_effect=lambda p, was_held=False: seen.append(was_held)):
             engine._drain_pending()

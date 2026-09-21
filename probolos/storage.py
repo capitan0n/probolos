@@ -40,6 +40,7 @@ belongs in a sandbox, not in the admission path.
 
 from __future__ import annotations
 
+import re as _re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,6 +97,20 @@ class MediumReport:
 # Locating the block device
 # --------------------------------------------------------------------------
 
+# Whole disks only: sda, sdb, ... sdaa. NOT a partition (sda1), NOT an
+# internal NVMe/MMC disk, NOT a mapper or loop device, and NOT anything with a
+# path separator or a dot-dot in it.
+#
+# This mirrors gate_server._BLOCK_NAME deliberately. The gate refuses to open
+# anything else, so a name outside this set could only ever produce a denied
+# request under --privsep -- but the DIRECT backend has no such gate, and
+# os.open("/dev/" + name) there is reached with `name` taken verbatim from a
+# directory entry. The two halves must agree about what a whole USB disk is,
+# and the agreement has to be enforced on both sides rather than on the one
+# that happens to be looking.
+_WHOLE_DISK_NAME = _re.compile(r"^sd[a-z]+$")
+
+
 def find_block_devices(usb_syspath) -> List[str]:
     """
     Find /dev/sdX nodes belonging to one USB device.
@@ -103,6 +118,21 @@ def find_block_devices(usb_syspath) -> List[str]:
     Walks the sysfs tree beneath the device looking for `block/<name>`, the
     same ancestry approach used for input nodes -- and for the same reason:
     inspecting the wrong disk would be considerably worse than inspecting none.
+
+    THE FILTER IS NOT COSMETIC. The directory entry under `block/` was being
+    concatenated straight into "/dev/{name}" and handed to os.open() in the
+    direct (non-privsep) backend. Two things follow from that:
+
+      * a name containing ../ escapes /dev entirely, so the "inspect only the
+        medium you were handed" property rested on nothing but the kernel
+        choosing tame names;
+      * a partition node (sda1) or an internal disk name reaching this list is
+        Probolos opening something it was never asked about -- read-only, but
+        read-only access to a raw disk is still access to every byte on it.
+
+    Restricting to whole sdX disks is the same rule gate_server._safe_block_path
+    already enforces on the privileged side, applied here so both deployment
+    modes behave identically instead of one of them relying on the other.
     """
     import os
 
@@ -111,7 +141,8 @@ def find_block_devices(usb_syspath) -> List[str]:
     for dirpath, dirnames, _files in os.walk(root):
         if os.path.basename(dirpath) == "block":
             for name in dirnames:
-                found.append(f"/dev/{name}")
+                if _WHOLE_DISK_NAME.match(name):
+                    found.append(f"/dev/{name}")
             dirnames[:] = []
     return sorted(set(found))
 
