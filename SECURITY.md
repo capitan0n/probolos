@@ -92,6 +92,33 @@ can also cause a denial of service or trigger the deliberate exit-time reopening
 policy. Privilege separation is not a guarantee that protection survives a
 compromised policy process.
 
+**Everything the gate changes, the gate puts back.** Devices it authorized are
+re-blocked and root hubs it closed are reopened when the analyzer disconnects,
+and interface authorization is now on that same list. It was not: an interface
+deauthorized through the gate survived the analyzer's death, leaving a device
+configured but with one function permanently driverless and nothing left that
+would ever touch it again. Restoration is refused when the kernel directory
+instance no longer matches the one recorded, so a recycled port is not
+re-authorized on the strength of an entry that belonged to different hardware.
+
+**The privilege drop is verified in full.** Supplementary groups are dropped
+first and are now asserted to be gone, alongside the uid and gid checks that
+were already made. A surviving `input` or `disk` membership would let the
+analyzer open every evdev node and every raw disk on the machine directly,
+without asking the gate for anything — the gate's entire scoping rule bypassed
+while every check that *was* made still passed.
+
+**Device nodes are validated in both deployment modes.** Under `--privsep` the
+gate refuses to open anything that is not `/dev/input/eventN` or a whole
+`/dev/sdX`, proves the node is the right kind of special file, and opens it
+`O_NOFOLLOW`. Running as plain root without `--privsep` — the default, and the
+documented `sudo python -m probolos` invocation — the same three checks now
+apply before the same `os.open`. Previously none of them did. Nothing in the
+tree sends a bad path there, but the paths arrive from pyudev, from a
+udev-populated `/dev`, and in the emulation trees from ordinary writable
+directories, and a guard that holds only because of where a path happens to
+come from is not a guard.
+
 **Observation temporarily activates the whole device.** Grabs protect only input
 channels successfully captured by Probolos. Storage/network functions of a
 composite device are live too. The cleanup path now re-blocks before releasing
@@ -158,6 +185,41 @@ should be reported as one.
 Operators in the EU should note that capturing input from a device attached to
 a corporate machine may still engage GDPR obligations even under these
 constraints, and that `--capture-payload` should be enabled deliberately.
+
+## The agent socket, and who may write the directory holding it
+
+The same "directory write is stronger than it looks" reasoning that separated
+the trust store from the ledger applies to `/run/probolos/`, and it was not
+applied there. The directory was mode `2770`: owned by the analyzer's account,
+group-owned by the desktop user's group, writable by both.
+
+Write permission on a directory is the right to unlink and replace any file
+inside it, whatever that file's own owner and mode. So every member of the
+desktop user's group — and every process running as the shared `nobody`
+account that owns the directory — could unlink `agent.sock` and bind its own
+listener at that path. The real agent would then connect to *that* listener, be
+asked its questions by it, and hand its answers to it. `SO_PEERCRED` does not
+help: the attacker is never a client of ours at all.
+
+`connect()` needs traverse permission on the path and write permission on the
+**socket inode**, never write permission on the directory. The directory is
+therefore `2750` — the setgid bit still makes the socket inherit the desktop
+group, and the `0660` socket still lets that group open it. Dropping group
+write costs nothing: the analyzer owns the directory and still creates, chmods
+and unlinks its own socket there.
+
+Two smaller defects on the same path are fixed with it. The socket's mode was
+set with `os.chmod` on a bare, operator-supplied path (`--agent-socket`), which
+follows symlinks and runs as root without `--privsep`; it is now set relative
+to a held directory descriptor, after `lstat` confirms the name is still a
+socket — the discipline the adjacent `chown` already used. And `stop()`
+unlinked that path unconditionally, which is a privileged delete of whatever
+happens to be there; it now removes only a socket.
+
+What remains, deliberately: a process running as the desktop user can still
+occupy the agent slot and never answer. `ask()` times out into the terminal
+fallback, which is the safe direction, and a process with that uid can ptrace
+the real agent anyway.
 
 ## State files: trust, ledger, and who may write them
 

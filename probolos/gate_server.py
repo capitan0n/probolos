@@ -79,6 +79,20 @@ class GateServer:
         self._closed_defaults: dict = {}
         self._open_leases: dict = {}
         self._instances: dict = {}
+        # Interfaces this gate switched OFF, with the directory instance they
+        # had at the time. restore() puts them back.
+        #
+        # Every other thing the gate can change is undone when the analyzer
+        # goes away: whole devices it authorized are re-blocked, root hubs it
+        # closed are reopened. Interface authorization was the one operation
+        # with no entry in that ledger, so `authorize_interface(intf, 0)`
+        # survived the analyzer's death -- a device left configured but with
+        # its keyboard half permanently driverless, looking healthy in sysfs,
+        # with nothing in the restore path that would ever touch it again.
+        # That is a persistent denial of service an analyzer compromise could
+        # leave behind, and the lockout-safety argument the rest of this
+        # project is built on applies to it exactly as written.
+        self._interfaces_off: dict = {}
 
 
     # ---- path validation: the heart of the security boundary ----
@@ -384,9 +398,21 @@ class GateServer:
         # enumerates next at that port. Pinning the directory first means the
         # write either lands on the interface that was validated or fails.
         try:
-            return self._write_authorized_at(intf, req.value)
+            resp = self._write_authorized_at(intf, req.value)
         except OSError as exc:
             return protocol.Response(protocol.ERROR, str(exc))
+        # Recorded only once the write actually landed, and dropped again the
+        # moment the interface is authorized, so restore() never writes to an
+        # interface it did not switch off.
+        if resp.ok:
+            if req.value == 0:
+                try:
+                    self._interfaces_off[str(intf)] = self._instance(intf)
+                except OSError:
+                    self._interfaces_off[str(intf)] = None
+            else:
+                self._interfaces_off.pop(str(intf), None)
+        return resp
 
     @staticmethod
     def _write_authorized_at(directory: Path, value: int) -> "protocol.Response":
@@ -596,6 +622,26 @@ class GateServer:
             self.restore()
 
     def restore(self):
+        # Interfaces first, and before the devices they belong to are
+        # re-blocked: writing `authorized` on an interface of a device that
+        # has just been unconfigured fails with ENODEV, and an interface left
+        # at 0 is the failure this record exists to prevent.
+        for path, instance in list(self._interfaces_off.items()):
+            self._interfaces_off.pop(path, None)
+            node = Path(path)
+            try:
+                # The same instance discipline the device paths get: a port
+                # recycled since the write means this directory belongs to
+                # different hardware, and authorizing an interface of a device
+                # nobody inspected is exactly what _do_authorize_interface
+                # refuses to do on the request path.
+                if instance is not None and self._instance(node) != instance:
+                    self.log(f"[gate] not restoring {node.name}: a different "
+                             f"device now occupies that path")
+                    continue
+                self._write_authorized_at(node, 1)
+            except OSError as exc:
+                self.log(f"[gate] could not re-authorize {node.name}: {exc}")
         for path in list(self._authorized_here):
             if self._owns_instance(Path(path)):
                 resp = self._do_authorize(protocol.Request(

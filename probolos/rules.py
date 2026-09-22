@@ -559,18 +559,54 @@ def load_config(path) -> RuleConfig:
     with open(path) as fh:
         data = yaml.safe_load(fh) or {}
 
+    # Every access below assumed a mapping of the expected shape, so a file
+    # that was merely the wrong shape -- a list, a bare string, a `severity:`
+    # that is not a mapping, a `benign_groups:` whose entries are not lists --
+    # raised AttributeError or TypeError. __main__ catches only RuntimeError,
+    # ValueError and OSError around this call, so the result was a traceback
+    # instead of the one-line "rule config: ..." the operator was meant to get,
+    # and the gate never closed. A config file that cannot be read must fail
+    # like a config error, not like a crash.
+    if not isinstance(data, dict):
+        raise ValueError("the rule file must be a mapping of settings at its "
+                         "top level")
+
+    def _mapping(key):
+        value = data.get(key) or {}
+        if not isinstance(value, dict):
+            raise ValueError(f"'{key}' must be a mapping, not "
+                             f"{type(value).__name__}")
+        return value
+
+    def _sequence(key):
+        value = data.get(key) or []
+        if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+            raise ValueError(f"'{key}' must be a list, not "
+                             f"{type(value).__name__}")
+        return value
+
     by_name = {s.name.lower(): s for s in Severity}
     overrides = {}
-    for rule_id, name in (data.get("severity") or {}).items():
+    for rule_id, name in _mapping("severity").items():
         key = str(name).lower()
         if key not in by_name:
             raise ValueError(f"unknown severity '{name}' for rule '{rule_id}'")
-        overrides[rule_id] = by_name[key]
+        overrides[str(rule_id)] = by_name[key]
+
+    groups = []
+    for group in _sequence("benign_groups"):
+        if isinstance(group, (str, bytes)) or not isinstance(group, (list, tuple)):
+            raise ValueError("each entry of 'benign_groups' must be a list of "
+                             "interface class codes, e.g. [0x03, 0xff]")
+        for code in group:
+            if isinstance(code, bool) or not isinstance(code, int):
+                raise ValueError(f"benign_groups: {code!r} is not a class code")
+        groups.append(set(group))
 
     return RuleConfig(
-        disabled=set(data.get("disabled") or []),
+        disabled={str(r) for r in _sequence("disabled")},
         severity_overrides=overrides,
-        extra_benign_groups=[set(g) for g in (data.get("benign_groups") or [])],
+        extra_benign_groups=groups,
     )
 
 

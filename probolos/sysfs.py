@@ -21,6 +21,31 @@ from . import descriptors, textsafe, usbclass
 
 USB_DEVICES = Path("/sys/bus/usb/devices")
 
+# Ceiling on the raw descriptor blob read out of sysfs.
+#
+# A USB configuration's wTotalLength is a 16-bit field, so one configuration
+# cannot exceed 64 KiB, and bNumConfigurations is a byte. 1 MiB is therefore
+# far above anything a conforming device can produce, while still being a
+# bound -- and read_bytes() had none at all. On a real kernel the blob is
+# whatever the kernel cached and is small; the path that matters is the
+# emulation tree (dummy_hcd, raw_gadget, testbed/), where `descriptors` is an
+# ordinary file whose size nothing here controls, and the hardened parser
+# downstream cannot bound an allocation that already happened.
+MAX_DESCRIPTOR_BYTES = 1024 * 1024
+
+
+def _read_descriptor_blob(syspath: Path) -> bytes:
+    """Read the `descriptors` attribute, bounded, without following a link."""
+    fd = os.open(syspath / "descriptors",
+                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as fh:
+        data = fh.read(MAX_DESCRIPTOR_BYTES + 1)
+    if len(data) > MAX_DESCRIPTOR_BYTES:
+        raise OSError(
+            f"descriptors attribute exceeds {MAX_DESCRIPTOR_BYTES} bytes; "
+            f"refusing to parse it")
+    return data
+
 # Bus-wide driver binding controls. Unlike everything else in this module these
 # are NOT per-device: they belong to the whole usb bus_type, which is precisely
 # why touching them is dangerous and why deferred_bind holds them for the
@@ -166,7 +191,7 @@ def load_device(syspath: Path) -> Optional[UsbDevice]:
     parse_error = None
     raw = None
     try:
-        raw = (syspath / "descriptors").read_bytes()
+        raw = _read_descriptor_blob(syspath)
         desc_set = descriptors.parse(raw)
     except FileNotFoundError:
         parse_error = "no descriptors attribute"
@@ -345,6 +370,100 @@ def _write_attr_pinned(directory, name: str, value: str) -> None:
         os.close(directory_fd)
 
 
+# --------------------------------------------------------------------------
+# What a device node the analyzer may be handed looks like.
+#
+# THESE MIRROR gate_server._safe_input_path AND _safe_block_path DELIBERATELY,
+# for the reason storage._WHOLE_DISK_NAME already states about block names:
+# "The two halves must agree about what a whole USB disk is, and the agreement
+# has to be enforced on both sides rather than on the one that happens to be
+# looking."
+#
+# The gate refuses to open anything that is not /dev/input/eventN or /dev/sdX,
+# proves the node is the right KIND of special file, and opens it O_NOFOLLOW.
+# The direct backend -- which is the DEFAULT, the one `sudo python -m probolos`
+# uses, and the one running with real root rather than behind a gate -- did
+# none of those three things: it took whatever string it was handed and called
+# os.open() on it, following symlinks at every component.
+#
+# The same asymmetry _write_attr_pinned was written to remove, on the other
+# half of the privileged surface. Nothing in the tree currently sends a bad
+# path here, but the paths arrive from pyudev, from a udev-populated /dev, and
+# in the emulation trees (dummy_hcd, raw_gadget, testbed/) from ordinary
+# writable directories -- and a guard that holds only because of where a path
+# happens to come from is not a guard.
+#
+# Duplicated rather than shared: gate_server.py is the privileged boundary and
+# imports nothing but `protocol`, precisely so it can be read in full. Pulling
+# sysfs (and with it descriptors, textsafe and usbclass) into the root process
+# to save two regular expressions would be a bad trade.
+# --------------------------------------------------------------------------
+
+_INPUT_DIR = "/dev/input"
+_INPUT_NODE_NAME = re.compile(r"^event[0-9]+$")
+_WHOLE_DISK_NAME = re.compile(r"^sd[a-z]+$")
+
+
+def _safe_input_node(path: str) -> Optional[Path]:
+    """An /dev/input/eventN character device, resolved. None otherwise."""
+    import stat as _stat
+    try:
+        resolved = Path(os.path.realpath(str(path)))
+    except (OSError, ValueError):
+        return None
+    if (str(resolved.parent) != _INPUT_DIR
+            or not _INPUT_NODE_NAME.match(resolved.name)):
+        return None
+    try:
+        if not _stat.S_ISCHR(os.stat(resolved).st_mode):
+            return None
+    except (OSError, ValueError):
+        return None
+    return resolved
+
+
+def _safe_block_node(path: str) -> Optional[Path]:
+    """A whole /dev/sdX disk, resolved. Never a partition. None otherwise."""
+    import stat as _stat
+    try:
+        resolved = Path(os.path.realpath(str(path)))
+    except (OSError, ValueError):
+        return None
+    if (str(resolved.parent) != "/dev"
+            or not _WHOLE_DISK_NAME.match(resolved.name)):
+        return None
+    try:
+        if not _stat.S_ISBLK(os.stat(resolved).st_mode):
+            return None
+    except (OSError, ValueError):
+        return None
+    return resolved
+
+
+def _open_device_node(path, validator, what: str) -> int:
+    """
+    Open a validated device node read-only, refusing a swapped inode.
+
+    O_NOFOLLOW on the final component, and the st_rdev of the opened
+    descriptor is compared against the node that was validated -- the same
+    pair of checks gate_server._do_open_input makes, for the same reason: the
+    validation and the open are two separate syscalls, and /dev is populated
+    by udev while this runs.
+    """
+    node = validator(path)
+    if node is None:
+        raise OSError(f"refusing to open {str(path)!r}: not a {what}")
+    fd = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW |
+                 os.O_CLOEXEC)
+    try:
+        if os.fstat(fd).st_rdev != node.stat().st_rdev:
+            raise OSError(f"{node} changed during open; refusing it")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 class _DirectBackend:
     """Writes sysfs directly. The original behaviour, used when running as root
     without privilege separation."""
@@ -407,12 +526,11 @@ class _DirectBackend:
         _write_attr_pinned(hub, "authorized_default", str(value))
 
     def open_input(self, node_path) -> int:
-        import os
-        return os.open(str(node_path), os.O_RDONLY | os.O_NONBLOCK)
+        return _open_device_node(node_path, _safe_input_node, "input node")
 
     def open_block(self, device_path) -> int:
-        import os
-        return os.open(str(device_path), os.O_RDONLY | os.O_NONBLOCK)
+        return _open_device_node(device_path, _safe_block_node,
+                                 "whole-disk block device")
 
     def set_drivers_autoprobe(self, value: int) -> None:
         # Bus-wide, and the single most dangerous write in the codebase: left

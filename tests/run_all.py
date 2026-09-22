@@ -18,10 +18,17 @@ def main():
     except PermissionError as exc:
         unavailable = str(exc)
     suite = unittest.TestSuite()
-    for path in sorted(Path(__file__).parent.glob("test_*.py")):
-        module = importlib.import_module(f"tests.{path.stem}")
+    # rglob, not glob: tests/audit/ holds one module per security review and a
+    # top-level glob collected none of them, so `python -m tests.run_all` and
+    # `unittest discover` reported different totals -- which README.md says is
+    # itself a bug, and was one before for the same kind of reason.
+    root = Path(__file__).parent
+    for path in sorted(root.rglob("test_*.py")):
+        dotted = ".".join(path.relative_to(root).with_suffix("").parts)
+        module = importlib.import_module(f"tests.{dotted}")
         if unavailable:
-            for name in ("TestAgentLink", "AgentSocketHardening", "SocketOwnership"):
+            for name in ("TestAgentLink", "AgentSocketHardening",
+                         "SocketOwnership", "SocketMetadataIsNotChangedByName"):
                 cls = getattr(module, name, None)
                 if cls is not None:
                     for method in unittest.defaultTestLoader.getTestCaseNames(cls):

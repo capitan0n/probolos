@@ -205,6 +205,59 @@ class Notifier:
             pass
 
 
+# Bounds on the dialog timeout a message may ask for. The floor keeps a
+# question from flashing past unanswerably; the ceiling keeps one from pinning
+# a dialog on the user's screen indefinitely.
+MIN_DIALOG_TIMEOUT = 10.0
+MAX_DIALOG_TIMEOUT = 600.0
+DEFAULT_DIALOG_TIMEOUT = 60.0
+
+
+def _as_text(value, fallback: str) -> str:
+    """
+    A display string from a field on the wire, or the fallback.
+
+    Everything downstream -- html.escape in the dialog backends, string
+    concatenation in the notification path, the subprocess argv itself --
+    assumes str. A JSON null, number, list or object here raised TypeError or
+    AttributeError and took the agent down, which is a way to remove the
+    desktop prompt by sending one malformed message. The text is already
+    sanitised at the descriptor boundary by textsafe, so nothing is re-cleaned
+    here; this is a type check, not a second sanitiser.
+    """
+    return value if isinstance(value, str) else fallback
+
+
+def _dialog_timeout(value) -> float:
+    """
+    How long to leave the dialog up, from a field on the wire.
+
+    `float(message.get("timeout", 60))` raised ValueError on a string and
+    TypeError on a list or a null -- out of _handle(), out of the recv loop,
+    and the agent exited. Losing the agent is not a security failure on its own
+    (the daemon falls back to the terminal), but it is a way to silently remove
+    the desktop prompt, and the value comes off a socket whose occupant the
+    agent does not get to choose.
+
+    Anything unusable becomes the default, and the result is clamped: a
+    negative or absurd number is as much a way to suppress the question as a
+    malformed one.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return DEFAULT_DIALOG_TIMEOUT
+    try:
+        seconds = float(value)
+    except (ValueError, OverflowError):
+        return DEFAULT_DIALOG_TIMEOUT
+    if seconds != seconds or seconds in (float("inf"), float("-inf")):
+        return DEFAULT_DIALOG_TIMEOUT      # NaN / infinity
+    if seconds <= 0:
+        # 0 means "wait forever" to the daemon's terminal prompt, which a
+        # dialog cannot honour. Use the default rather than an unbounded wait.
+        return DEFAULT_DIALOG_TIMEOUT
+    return max(MIN_DIALOG_TIMEOUT, min(MAX_DIALOG_TIMEOUT, seconds))
+
+
 class Agent:
     def __init__(self, socket_path: Path = DEFAULT_SOCKET, log=print):
         self.socket_path = Path(socket_path)
@@ -252,6 +305,21 @@ class Agent:
                     self.log("[agent] Probolos closed the connection")
                     break
                 buffer += chunk
+                if len(buffer) > MAX_MESSAGE:
+                    # MAX_MESSAGE bounded each recv() and not their sum, so a
+                    # peer that sends bytes and never a newline grew this
+                    # without limit. AgentLink.ask() has carried this exact
+                    # bound since the same bug was found on the server side;
+                    # the agent is the half running in the user's session with
+                    # their privileges, and it was the one still unbounded.
+                    #
+                    # It matters because the agent does not get to choose what
+                    # it is talking to: it connects to a path, and anything
+                    # able to occupy that path is what answers. A question
+                    # from Probolos is a few hundred bytes.
+                    self.log("[agent] oversized message from the socket; "
+                             "disconnecting")
+                    break
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
                     self._handle(line)
@@ -269,12 +337,15 @@ class Agent:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
 
+        if not isinstance(message, dict):
+            return
+
         kind = message.get("type")
         if kind == MSG_CRITICAL:
             # Display only. Deliberately offers no way to allow anything.
             self.notifier.notify(
-                message.get("title", "Probolos"),
-                message.get("body", "") +
+                _as_text(message.get("title"), "Probolos"),
+                _as_text(message.get("body"), "") +
                 "\n\nThis device matches an attack pattern and cannot be "
                 "approved from here. Use the terminal.",
                 urgency=URGENCY_CRITICAL, actionable=False)
@@ -283,7 +354,7 @@ class Agent:
             return
 
         request_id = message.get("id")
-        timeout = float(message.get("timeout", 60))
+        timeout = _dialog_timeout(message.get("timeout"))
         answer = self._ask_user(message, timeout)
         self._reply(request_id, answer)
 
@@ -294,8 +365,8 @@ class Agent:
         The notification exists so the question is not missed if it opens behind
         something; the dialogs are where the decision actually happens.
         """
-        title = message.get("title", "New USB device")
-        body = message.get("body", "")
+        title = _as_text(message.get("title"), "New USB device")
+        body = _as_text(message.get("body"), "")
         allow_always = bool(message.get("allow_always"))
 
         announcement = None

@@ -129,9 +129,25 @@ class ParserUsesTheHardenedWalker(unittest.TestCase):
         COUNT, so 200_000 two-byte items were walked one at a time. Not fatal
         on its own -- which is exactly how a bound goes missing.
         """
-        blob = device_desc() + b"\x02\x02" * 5000
+        from probolos.descriptors_safe import MAX_DESCRIPTOR_ITEMS
+        blob = device_desc() + b"\x02\x02" * (MAX_DESCRIPTOR_ITEMS + 1)
         with self.assertRaises(descriptors.DescriptorParseError):
             descriptors.parse(blob)
+
+    def test_an_ordinary_composite_device_is_not_refused_as_a_flood(self):
+        """The ceiling must sit above real hardware, not through it.
+
+        At 256 descriptors for the whole blob, a UVC webcam with its usual
+        run of alternate settings tripped the flood guard, and the flood
+        guard is non-recoverable -- so the device was refused outright:
+        parse_error set, inspection_safe False, no behavioural or storage
+        stage, and a WARNING on somebody's own camera.
+        """
+        body = config_desc(total=9 + 9 * 300) + iface_desc() * 300
+        ds = descriptors.parse(device_desc() + body)
+        self.assertIsNone(ds.truncated)
+        self.assertEqual(len(ds.configs), 1)
+        self.assertEqual(len(ds.configs[0].interfaces), 300)
 
     def test_a_truncated_tail_is_still_kept_and_now_reported(self):
         """The behaviour that had to survive the rewrite.

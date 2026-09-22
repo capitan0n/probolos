@@ -80,6 +80,23 @@ def drop_privileges(uid: int, gid: int) -> None:
         raise PrivsepError("uid did not drop as expected")
     if os.getgid() != gid or os.getegid() != gid:
         raise PrivsepError("gid did not drop as expected")
+    # The supplementary groups were dropped FIRST and never checked, which is
+    # the one step of the three this module's own docstring calls "a classic
+    # source of silent security holes" and then did not verify. A surviving
+    # `input` or `disk` membership is precisely what the privilege split
+    # exists to remove: it would let the analyzer open every evdev node and
+    # every raw disk on the machine directly, without ever asking the gate --
+    # so the gate's entire scoping rule would be bypassed while every uid and
+    # gid check above still passed. Some systems leave a group behind
+    # regardless of setgroups() (a container with a restricted user namespace
+    # is the realistic case), so the assertion has to be made rather than
+    # assumed.
+    remaining = set(os.getgroups()) - {gid}
+    if remaining:
+        raise PrivsepError(
+            f"supplementary groups survived the drop: {sorted(remaining)} -- "
+            f"refusing to continue, because the analyzer would keep direct "
+            f"access the gate is supposed to mediate")
     try:
         os.setuid(0)
         raise PrivsepError("regained root after drop -- refusing to continue")

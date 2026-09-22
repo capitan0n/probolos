@@ -42,8 +42,22 @@ decision to the terminal.
 
 WHO IS ALLOWED TO BE THE AGENT
 ------------------------------
-The socket is mode 0660 in a 2770 directory, so only the desktop user's group
-can open it at all. That is a real boundary, but it is filesystem permission
+The socket is mode 0660 in a 2750 directory, so only the desktop user's group
+can open it at all.
+
+Group WRITE on that directory is deliberately withheld, and the distinction is
+the whole of the boundary rather than a detail of it. connect() needs traverse
+permission on every path component and write permission on the SOCKET inode; it
+never needs write permission on the directory holding it. Directory write is
+what allows unlinking and replacing a file regardless of that file's own owner
+and mode -- so while the directory was 2770, every member of the desktop user's
+group, and every process running as the shared `nobody` account that owns it,
+could unlink the admission socket and bind its own listener in its place. The
+real agent would then connect to that listener, be asked its questions by it,
+and hand its answers to it. Nothing about the uid check below prevented that,
+because the attacker was never a client of ours at all.
+
+That is a real boundary, but it is filesystem permission
 alone, and three things have to hold on top of it before a click on a
 notification can be treated as a human decision:
 
@@ -176,7 +190,7 @@ def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
     reach it, and nobody else can.
 
     Called by the launcher while still root. The directory is owned by the
-    analyzer's user, group-owned by the desktop user's group, mode 2770 -- the
+    analyzer's user, group-owned by the desktop user's group, mode 2750 -- the
     setgid bit matters: it makes the socket the analyzer creates inherit the
     group, which is how a process running as `nobody` ends up with a socket the
     desktop user can open without anyone having to be given broad permissions.
@@ -184,6 +198,23 @@ def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
     The alternative -- a world-writable socket -- would let any local account
     answer questions about hardware, which is not a trade worth making for a
     little convenience.
+
+    WHY 2750 AND NOT 2770
+    ---------------------
+    The group needs to REACH the socket, not to manage the directory holding
+    it. connect() requires traverse (x) on each path component and write on the
+    socket inode; the 0660 socket plus the inherited group supplies both. Write
+    permission on the DIRECTORY supplies something else entirely -- the right
+    to unlink and replace any file inside it, whatever that file's own owner
+    and mode -- and that is the right to put a different listener at the path
+    where the admission prompt is expected. The same reasoning is already
+    written out at length in ledger.default_path() about the trust store, and
+    in trust._integrity_error about its directory; this is the third store of
+    authority in the project that a writable parent directory hands away, and
+    it was the one still handing it.
+
+    Dropping group write costs nothing: the analyzer owns the directory and
+    still creates, chmods and unlinks its own socket there.
     """
     from .securefs import open_directory
     directory = os.path.abspath(path.parent)
@@ -193,7 +224,7 @@ def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
     fd = open_directory(directory, create=True)
     try:
         os.fchown(fd, owner_uid, group_gid)
-        os.fchmod(fd, 0o2770)
+        os.fchmod(fd, 0o2750)
     finally:
         os.close(fd)
 
@@ -275,11 +306,40 @@ class AgentLink:
                     raise OSError("refusing to replace a non-socket agent path")
                 self.path.unlink()
             self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self._listener.bind(str(self.path))
+            # bind() creates the socket with 0777 & ~umask, and the process
+            # umask is whatever the operator's shell or the systemd unit left
+            # behind. Between that creation and the chmod below there is a
+            # window in which the socket can be more permissive than anything
+            # this module intends -- 0775 under a umask of 002, which is every
+            # member of the group with write access before the uid check is
+            # even reachable. Binding under an explicit umask removes the
+            # window rather than closing it quickly.
+            #
+            # umask is process-global, which is why it is touched here and
+            # nowhere else: start() runs before this process has spawned any
+            # thread of its own -- the accept thread below is the first -- and
+            # before listen(), so nothing else is creating files meanwhile and
+            # nothing can connect to the socket yet either.
+            previous_umask = os.umask(0o117)
+            try:
+                self._listener.bind(str(self.path))
+            finally:
+                os.umask(previous_umask)
             # Group-accessible only. Under --privsep the group was set on the
             # directory by the launcher and inherited via its setgid bit; in
             # the no-privsep case we chown below to reach the same end.
-            os.chmod(self.path, 0o660)
+            #
+            # Relative to the HELD directory descriptor, and only after lstat
+            # confirms the name still refers to the socket we just bound.
+            # os.chmod on a bare path follows symlinks, and this runs as root
+            # in the no-privsep case: a symlink planted at the socket path
+            # between bind() and here would be a root chmod 0660 of a file of
+            # the planter's choosing. _chown_for_owner was hardened against
+            # exactly this and carries the reasoning; the chmod two lines above
+            # it was not, which left the project with two privileged metadata
+            # changes on the same path and only one of them checking what it
+            # was changing.
+            self._chmod_socket(directory_fd, 0o660)
             self._chown_for_owner(directory_fd)
             self._listener.listen(1)
             self._listener.settimeout(0.5)
@@ -294,7 +354,7 @@ class AgentLink:
         threading.Thread(target=self._accept_loop, daemon=True).start()
         if self.allowed_uids is None:
             # Visible rather than silent. Without a uid the only thing keeping
-            # other accounts off this socket is the 0660/2770 permission pair,
+            # other accounts off this socket is the 0660/2750 permission pair,
             # and on a distribution whose useradd puts everyone in a shared
             # primary group (`users`, gid 100) that is every interactive
             # account on the machine. The caller is expected to pass a uid;
@@ -302,6 +362,34 @@ class AgentLink:
             self.log("[agent] WARNING: no permitted uid configured; any "
                      "process that can open the socket may answer")
         return True
+
+    def _chmod_socket(self, directory_fd, mode: int) -> None:
+        """
+        Set the socket's mode without following a symlink at its path.
+
+        Linux has no fchmodat(AT_SYMLINK_NOFOLLOW) and a Unix socket cannot be
+        open()ed to reach os.fchmod, so the guard is the same one
+        _chown_for_owner uses: resolve relative to a descriptor pinned on the
+        verified directory, and refuse unless lstat still says the name is a
+        socket. A symlink there is then an error rather than a redirection.
+        """
+        import stat as _stat
+        try:
+            if directory_fd is not None:
+                st = os.lstat(self.path.name, dir_fd=directory_fd)
+                if not _stat.S_ISSOCK(st.st_mode):
+                    raise OSError("agent path is no longer the socket we bound")
+                os.chmod(self.path.name, mode, dir_fd=directory_fd)
+            else:
+                st = os.lstat(self.path)
+                if not _stat.S_ISSOCK(st.st_mode):
+                    raise OSError("agent path is no longer the socket we bound")
+                os.chmod(self.path, mode)
+        except OSError as exc:
+            # Fatal, unlike the chown: an agent socket whose mode was not set
+            # is one whose permissions are whatever the umask happened to give
+            # it, and start() must not report success for that.
+            raise OSError(f"could not set the agent socket's mode: {exc}") from exc
 
     def _chown_for_owner(self, directory_fd) -> None:
         """
@@ -357,8 +445,16 @@ class AgentLink:
                         pass
             self._conn = self._listener = None
             self._peer = None
+        # Only ever unlink a socket. Shutdown runs as root in the no-privsep
+        # case, and `self.path` is operator-supplied via --agent-socket, so an
+        # unconditional unlink is a privileged delete of whatever now sits at
+        # that name. lstat rather than stat: a symlink must be judged as a
+        # symlink, not as whatever it points at. Removing a symlink someone
+        # planted is fine; following it is not.
         try:
-            self.path.unlink()
+            import stat as _stat
+            if _stat.S_ISSOCK(os.lstat(self.path).st_mode):
+                self.path.unlink()
         except OSError:
             pass
 

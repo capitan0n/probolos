@@ -232,7 +232,7 @@ Short version:
   and hardened, but the report descriptor is not in the sysfs blob and has no
   source wired to it. `CAPABILITIES.md` §2.2 and §3.2.
 
-Status: **alpha — under active development.** The tree has been through five
+Status: **alpha — under active development.** The tree has been through six
 security review passes; each finding has a regression test named after the
 defect, under `tests/audit/`.
 

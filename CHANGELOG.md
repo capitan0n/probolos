@@ -2,6 +2,96 @@
 
 All notable changes to Probolos. Versioning is semantic.
 
+## [Unreleased] — the sixth review
+
+A pass over the privilege boundary, the agent socket and the parsers. Every
+finding below has a regression test under `tests/audit/`, each proven to fail
+against the original defect before being kept.
+
+The theme this time is **a rule enforced on one side of a pair and not the
+other**: the gate validated device nodes and the direct backend did not, the
+chown was pinned to a directory descriptor and the chmod beside it was not, the
+gate restored devices and hubs but not interfaces, the drop verified uid and gid
+but not groups.
+
+### Fixed — security
+
+- **The direct backend opened any device node it was handed.** `gate_server`
+  refuses anything that is not `/dev/input/eventN` or a whole `/dev/sdX`,
+  proves the node is the right kind of special file, and opens it
+  `O_NOFOLLOW`. `sysfs._DirectBackend` — the DEFAULT, used by the documented
+  `sudo python -m probolos`, running with real root rather than behind a gate —
+  did none of the three: `os.open()` on the string it was given, following
+  symlinks at every component. The same asymmetry `_write_attr_pinned` was
+  written to remove on the other half of the privileged surface, and the one
+  `storage._WHOLE_DISK_NAME` already names for block devices.
+- **The agent socket lived in a group-writable directory.** `/run/probolos`
+  was `2770`, so every member of the desktop user's group and every process
+  running as the shared `nobody` account that owns it could unlink `agent.sock`
+  and bind its own listener at that path — and `SO_PEERCRED` cannot see an
+  attacker who is not a client at all. `connect()` needs traverse on the path
+  and write on the socket inode, never write on the directory, so the
+  directory is now `2750`.
+- **The socket's mode was set by name, as root.** `os.chmod` follows symlinks,
+  the path comes from `--agent-socket`, and `_chown_for_owner` two lines below
+  was hardened against exactly this and carries the reasoning. The chmod now
+  runs relative to the held directory descriptor after `lstat` confirms the
+  name is still the socket that was bound, and the bind itself runs under an
+  explicit umask so the socket is never momentarily more permissive than
+  intended. `stop()` no longer unlinks whatever happens to sit at that path.
+- **Interfaces deauthorized through the gate were never restored.** Devices
+  the gate authorized are re-blocked and hubs it closed are reopened when the
+  analyzer disconnects; `authorize_interface(intf, 0)` had no entry in that
+  ledger, so it survived the analyzer's death — a device configured with one
+  function permanently driverless, looking healthy in sysfs. Restoration
+  checks the kernel directory instance, so a recycled port is not
+  re-authorized under an entry belonging to different hardware.
+- **The privilege drop did not verify that supplementary groups were gone.**
+  `drop_privileges` asserted the uid and the gid and not the step its own
+  docstring calls "a classic source of silent security holes". A surviving
+  `input` or `disk` membership would let the analyzer open every evdev node
+  and every raw disk directly, bypassing the gate's whole scoping rule while
+  every check that *was* made still passed.
+
+### Fixed — robustness
+
+- **The agent's receive buffer was unbounded.** `MAX_MESSAGE` bounded each
+  `recv()` and not their sum, so anything able to occupy the socket path could
+  grow it without limit. `AgentLink.ask()` has carried this bound since the
+  same bug was found on the server side; the agent — the half running in the
+  user's session, with the user's privileges — was the one still without it.
+- **`float(message["timeout"])` took the agent down.** A string, a list or a
+  null raised out of the recv loop, which is a way to remove the desktop
+  prompt by sending one malformed message. The value is now validated and
+  clamped, and the display fields are type-checked rather than assumed.
+- **256 descriptors per blob was reachable by ordinary hardware.** The flood
+  guard counted every descriptor of every configuration, and a UVC webcam with
+  its usual run of alternate settings exceeds it — as a NON-recoverable error,
+  so the whole descriptor set was refused: `parse_error`, no behavioural or
+  storage stage, and a WARNING on somebody's own camera. This project treats a
+  false alarm on your own hardware as a defect in its own right. The ceiling is
+  4096, the blob is now bounded where it is read, and the walk was already
+  bounded by advancing at least two bytes per item.
+- **An astral escape decoded to the wrong character.** `textsafe._escape` wrote
+  `\u1f600` for U+1F600, which reads as U+1F60 followed by `0`. The escape
+  exists so the operator sees exactly what the device sent.
+- **A malformed rule file produced a traceback, not a config error.**
+  `load_config` assumed a mapping of the expected shape throughout, and
+  `__main__` catches only `RuntimeError`, `ValueError` and `OSError` around it,
+  so the gate never closed.
+
+### Tests
+
+- `tests/test_payload.py` now exists. SECURITY.md said the three keystroke
+  privacy invariants were "asserted in `tests/test_payload.py` and
+  `tests/test_safety.py`"; only the second file was in the tree, so the
+  invariants that decide whether this tool can record what somebody typed were
+  asserted nowhere.
+- `tests/audit/` now exists, as README.md describes it.
+- `tests/run_all.py` walks subdirectories. It globbed only the top level, so
+  the two documented ways of running the suite reported different totals —
+  which README.md says is itself a bug, and was one before for the same reason.
+
 ## [0.9.0] — the audit
 
 An external security review of the whole codebase produced four critical

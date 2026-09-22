@@ -113,9 +113,23 @@ class Sanitized:
 
 
 def _escape(char: str) -> str:
-    """Visible, unambiguous, and ASCII: \\x1b or \\u202e."""
+    """
+    Visible, unambiguous, and ASCII: \\x1b, \\u202e or \\U0001f600.
+
+    The three widths are not cosmetic. `\\u{point:04x}` was applied to every
+    code point above 0xFF, including those above 0xFFFF, where it emits five
+    hex digits: U+1F600 became `\\u1f600`, which reads as U+1F60 followed by
+    the digit 0. The escape exists so the operator can see exactly what the
+    device sent, and an escape that decodes to a different character than the
+    one it describes fails at the only job it has -- while looking correct.
+    Python's own convention (\\U plus eight digits) is used for that range.
+    """
     point = ord(char)
-    return f"\\x{point:02x}" if point < 0x100 else f"\\u{point:04x}"
+    if point < 0x100:
+        return f"\\x{point:02x}"
+    if point <= 0xFFFF:
+        return f"\\u{point:04x}"
+    return f"\\U{point:08x}"
 
 
 def sanitize(value, limit: int = MAX_LENGTH) -> Sanitized:

@@ -60,9 +60,10 @@ _MAX_TIERS = 8
 
 # /run rather than /tmp, and BESIDE the runtime directory rather than inside
 # it. /run/probolos looks like the obvious home, but agentlink.prepare_socket_dir
-# chowns it to the analyzer's uid and chmods it 2770 so the desktop agent can
-# reach the socket -- which would put the panic file back within reach of both
-# `nobody` and the desktop user's group. /run itself is root:root 0755.
+# chowns it to the analyzer's uid and chmods it 2750 so the desktop agent can
+# reach the socket -- which would put the panic file back within reach of
+# `nobody`, which owns that directory and is a shared account. /run itself is
+# root:root 0755.
 #
 # A second benefit falls out of tmpfs: a forgotten panic file no longer
 # survives a reboot, so the "it would fire the watchdog instantly" startup

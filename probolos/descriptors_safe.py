@@ -24,7 +24,31 @@ from typing import Iterator, Tuple
 # --------------------------------------------------------------------------
 # Limits. Conservative but well above any legitimate device.
 # --------------------------------------------------------------------------
-MAX_DESCRIPTOR_ITEMS = 256      # number of descriptors in one configuration
+# Descriptors in ONE sysfs blob -- every configuration of the device, not one
+# configuration, because that is what descriptors.parse() hands to
+# walk_descriptors().
+#
+# It was 256, and 256 is reachable by ordinary hardware. A UVC webcam declares
+# a control interface plus a streaming interface with one alternate setting per
+# bandwidth mode -- commonly eight to sixteen -- and each alternate setting
+# carries its own interface descriptor, endpoint descriptor and class-specific
+# blocks, on top of the VS format and frame descriptors, one per resolution.
+# Two hundred descriptors is unremarkable for such a device.
+#
+# Exceeding it raised a NON-recoverable error, so descriptors.parse() refused
+# the whole set: parse_error, `inspection_safe` False, no behavioural or
+# storage stage, and a WARNING on a device that had done nothing wrong. This
+# project treats a false alarm on somebody's own hardware as a security defect
+# in its own right -- "a tool that raises an alarm about your own mouse teaches
+# you to ignore its alarms" (rules.py) -- and this was one.
+#
+# The exhaustion the limit was written against is already bounded twice over:
+# the walk advances by bLength >= 2 on every item, so the item count cannot
+# exceed half the buffer, and the buffer itself is now bounded where it is read
+# (sysfs.MAX_DESCRIPTOR_BYTES). The ceiling stays as a third, independent
+# backstop, raised to a number no legitimate device reaches: a configuration
+# would have to be ~36 KiB of nine-byte descriptors to get near it.
+MAX_DESCRIPTOR_ITEMS = 4096
 MAX_HID_ITEMS = 4096            # number of items in a HID report descriptor
 MAX_HID_PUSH_DEPTH = 16         # PUSH/POP stack depth (spec sets no limit)
 MAX_HID_COLLECTION_DEPTH = 32   # depth of nested Collections

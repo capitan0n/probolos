@@ -257,9 +257,27 @@ class DefensiveParsing(unittest.TestCase):
 
 
     def test_item_flood_rejected(self):
-        """Χιλιάδες ελάχιστα descriptors — exhaustion μέσω πλήθους, όχι μεγέθους."""
-        flood = b"\x02\x02" * 5000
+        """Χιλιάδες ελάχιστα descriptors — exhaustion μέσω πλήθους, όχι μεγέθους.
+
+        Το πλήθος παράγεται από το ίδιο το MAX_DESCRIPTOR_ITEMS. Με σταθερό
+        νούμερο (ήταν 5000) το test περνούσε ή έπεφτε ανάλογα με το όριο, κι
+        έτσι μια αλλαγή του ορίου δεν φαινόταν εδώ ως αλλαγή συμπεριφοράς.
+        """
+        from probolos.descriptors_safe import MAX_DESCRIPTOR_ITEMS
+        flood = b"\x02\x02" * (MAX_DESCRIPTOR_ITEMS + 1)
         _expect_error(walk_descriptors, flood)
+
+    def test_a_realistic_composite_device_is_not_a_flood(self):
+        """Μια webcam με πολλά alternate settings δεν είναι επίθεση.
+
+        Το όριο ήταν 256 descriptors για ΟΛΟ το blob, και μια συνηθισμένη UVC
+        κάμερα το ξεπερνά. Το αποτέλεσμα ήταν μη ανακτήσιμο σφάλμα: όλο το
+        descriptor set απορριπτόταν, χωρίς στάδιο 3 ή 4, με WARNING σε
+        υλικό που δεν είχε κάνει τίποτα.
+        """
+        chain = bytes([0x09, 0x04, 0x00, 0x00, 0x01, 0x0E, 0x02, 0x00, 0x00])
+        items = list(walk_descriptors(chain * 300))
+        assert len(items) == 300
 
 
     def test_valid_chain_parses(self):
