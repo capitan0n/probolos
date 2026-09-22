@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
 #
-# hid_gadget_down.sh — Αποσυναρμολογεί το HID gadget.
+# hid_gadget_down.sh -- Tears the HID gadget down.
 #
-# Η ΣΕΙΡΑ ΕΧΕΙ ΣΗΜΑΣΙΑ. Το configfs δεν σε αφήνει να σβήσεις κάτι που
-# χρησιμοποιείται. Πρέπει να λύσεις με ΑΝΤΙΣΤΡΟΦΗ σειρά από το στήσιμο:
-#   1. αποσύνδεσε από τον UDC (κάνει το gadget offline)
-#   2. διάγραψε το symlink function->config
-#   3. σβήσε strings, configs, functions, το ίδιο το gadget
-# Αν παραλείψεις ένα βήμα, το rmdir δίνει "Device or resource busy".
+# ORDER MATTERS. configfs will not let you remove anything that is in use.
+# The teardown is the setup in REVERSE:
+#   1. detach from the UDC (takes the gadget offline)
+#   2. remove the function->config symlink
+#   3. delete strings, configs, functions, then the gadget itself
+# Skip a step and rmdir returns "Device or resource busy".
 #
 set -uo pipefail
 
 G=/sys/kernel/config/usb_gadget/probolos_test
 
 if [ ! -d "$G" ]; then
-    echo "[i] Δεν υπάρχει gadget να καθαρίσω."
+    echo "[i] No gadget to clean up."
     exit 0
 fi
 
-# 1. Offline: άδειασε το UDC attribute. Δεν σβήνει, απλώς αποσυνδέει.
+# 1. Offline: empty the UDC attribute. Does not delete, just detaches.
 echo "" > "$G/UDC" 2>/dev/null || true
 
-# 2. Λύσε το symlink της function από τη config.
+# 2. Break the symlink from the config to the function.
 rm -f "$G/configs/c.1/hid.usb0"
 
-# 3. Σβήσε με αντίστροφη σειρά. Τα rmdir ΘΕΛΟΥΝ τους καταλόγους άδειους.
+# 3. Delete in reverse order. rmdir NEEDS the directories empty.
 rmdir "$G/configs/c.1/strings/0x409" 2>/dev/null || true
 rmdir "$G/configs/c.1"               2>/dev/null || true
 rmdir "$G/functions/hid.usb0"        2>/dev/null || true
@@ -32,7 +32,7 @@ rmdir "$G/strings/0x409"             2>/dev/null || true
 rmdir "$G"                           2>/dev/null || true
 
 if [ -d "$G" ]; then
-    echo "[!] Κάτι έμεινε busy. Δες: find $G"
+    echo "[!] Something is still busy. See: find $G"
 else
-    echo "[+] Καθαρίστηκε."
+    echo "[+] Cleaned up."
 fi

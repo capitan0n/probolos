@@ -1,48 +1,50 @@
-# Πείραμα διαρροής: μετράμε πόσα keystrokes φτάνουν στη συνεδρία
+# Leakage experiment: how many keystrokes reach the session
 
-Στόχος: αριθμημένο, ασφαλές πριν/μετά. Πόσα key events ενός BadUSB payload
-διαρρέουν στη συνεδρία **με** deferred bind vs **χωρίς**.
+The measurable question, before and after: with deferred bind **on** vs
+**off**, how many key events of a BadUSB payload actually reach the user's
+session? Everything else in the quarantine documentation is theory; this is
+the number.
 
-Τρία αρχεία, όλα στο ίδιο σημείο (π.χ. `~/Lab/personal/probolos/testbed/hidexp/`):
+Three files, all in the same place (e.g. `~/Lab/personal/probolos/testbed/hidexp/`):
 
 ```bash
 mkdir -p ~/Lab/personal/probolos/testbed/hidexp
-\cp -f ~/Downloads/hid_gadget_up.sh ~/Downloads/hid_gadget_down.sh \
-       ~/Downloads/hid_attack.py ~/Lab/personal/probolos/testbed/hidexp/
+cp -f ~/Downloads/hid_gadget_up.sh ~/Downloads/hid_gadget_down.sh \
+      ~/Downloads/hid_attack.py ~/Lab/personal/probolos/testbed/hidexp/
 chmod +x ~/Lab/personal/probolos/testbed/hidexp/*.sh
 ```
 
 ---
 
-## Βήμα 0 — Smoke test (ΧΩΡΙΣ Probolos, δες ότι δουλεύει το gadget)
+## Step 0 — Smoke test (WITHOUT Probolos, confirm the gadget works)
 
-Πρώτα βεβαιώσου ότι το gadget στήνεται και παράγει `/dev/hidg0`:
+First make sure the gadget assembles and produces `/dev/hidg0`:
 
 ```bash
 cd ~/Lab/personal/probolos/testbed/hidexp
 sudo ./hid_gadget_up.sh
 ```
 
-Πρέπει να δεις `[+] HID keyboard gadget live` και ένα `/dev/hidg0`. Επίσης
-θα εμφανιστεί ένα ΝΕΟ evdev node — το «πληκτρολόγιο» υπάρχει τώρα στο
-σύστημά σου. Επιβεβαίωσε:
+You should see `[+] HID keyboard gadget live` and a `/dev/hidg0`. A NEW
+evdev node also appears — the "keyboard" now exists on your system.
+Confirm:
 
 ```bash
 ls /dev/hidg*
-sudo dmesg | tail -5        # θα δεις "hid-generic ... Keyboard"
+sudo dmesg | tail -5        # will show "hid-generic ... Keyboard"
 ```
 
-**ΠΡΟΣΟΧΗ:** αυτή τη στιγμή το gadget είναι πραγματικό πληκτρολόγιο δεμένο
-στη συνεδρία σου. Αν τρέξεις το attack ΤΩΡΑ (χωρίς Probolos), τα markers
-ΘΑ πληκτρολογηθούν όπου έχεις focus. Άνοιξε έναν κενό editor και δες:
+**WARNING:** at this point the gadget is a real keyboard attached to your
+session. If you run the attack NOW (without Probolos), the markers WILL be
+typed wherever focus is. Open an empty editor and see for yourself:
 
 ```bash
-# Σε κενό αρχείο/editor με focus:
+# With focus on an empty file/editor:
 sudo python3 hid_attack.py --markers 2
-# Θα δεις χαρακτήρες να εμφανίζονται. Αυτό είναι το "χωρίς προστασία".
+# You will see characters appear. That is the "no protection" case.
 ```
 
-Καθάρισε πριν συνεχίσεις:
+Clean up before continuing:
 
 ```bash
 sudo ./hid_gadget_down.sh
@@ -50,99 +52,107 @@ sudo ./hid_gadget_down.sh
 
 ---
 
-## Βήμα 1 — ΜΕ Probolos, deferred bind ON (η κανονική κατάσταση)
+## Step 1 — WITH Probolos, deferred bind ON (the normal case)
 
-Δύο terminals.
+Two terminals.
 
-**Terminal A** — ο Probolos, με capture ώστε να μετρήσει keystrokes:
+**Terminal A** — Probolos, with capture so it counts keystrokes:
 
 ```bash
 cd ~/Lab/personal/probolos
-sudo python -m probolos --observe 3 --capture-payload
+sudo python -m probolos --observe 3 --capture-payload --close-race-window
 ```
 
-Άφησέ τον να ακούει.
+Let it listen.
 
-**Terminal B** — στήσε το gadget (ο Probolos θα το πιάσει ως νέα συσκευή)
-και μετά επίθεση:
+**Terminal B** — bring up the gadget (Probolos will see it as a new device)
+and then attack:
 
 ```bash
 cd ~/Lab/personal/probolos/testbed/hidexp
 sudo ./hid_gadget_up.sh
-# Ο Probolos στο Α τυπώνει τώρα "NEW USB DEVICE — keyboard".
-# Μόλις μπει σε καραντίνα (DO NOT TOUCH), τρέξε ΑΜΕΣΩΣ:
+# Probolos in A now prints "NEW USB DEVICE — keyboard".
+# The moment it enters quarantine (DO NOT TOUCH), run immediately:
 sudo python3 hid_attack.py --markers 8
 ```
 
-**Τι να κοιτάξεις στο report του Probolos (Terminal A):**
+**What to look for in the Probolos report (Terminal A):**
 
-- `Keystrokes captured : 41` (ή όσα έστειλες) — τα έπιασε ΟΛΑ
-- Finding: `machine-generated-keystrokes` (CRITICAL) — αναγνώρισε τον ρυθμό
-- Finding: `immediate-activity` (WARNING) — χτύπησε αμέσως
-- Το exposure: `actual exposure 0 ms` — δεν πρόλαβαν να διαρρεύσουν
+- `Keystrokes captured : 41` (or however many you sent) — it caught them all
+- Finding: `machine-generated-keystrokes` (CRITICAL) — recognised the rhythm
+- Finding: `immediate-activity` (WARNING) — hit straight away
+- Exposure: `actual exposure 0 ms` — nothing had time to leak
 
-**ΤΟ ΚΡΙΣΙΜΟ:** στο Terminal B, ΚΑΝΕΝΑΣ χαρακτήρας δεν πρέπει να εμφανιστεί.
-Ο Probolos κρατά το grab· τα markers πάνε σε αυτόν, όχι στη συνεδρία.
-Αυτό είναι το «0 keystrokes leaked».
+**THE CRITICAL PART:** in Terminal B, NO character should appear. Probolos
+holds the grab; the markers go to it, not to your session. That is the
+"0 keystrokes leaked" result.
 
-Καθάρισε:
+Clean up:
 
 ```bash
 sudo ./hid_gadget_down.sh
-# Ctrl-C στον Probolos (Terminal A)
+# Ctrl-C on Probolos (Terminal A)
 ```
 
 ---
 
-## Βήμα 2 — ΜΕ Probolos, deferred bind OFF (το control πείραμα)
+## Step 2 — WITH Probolos, deferred bind OFF (the control run)
 
-Για να δείξεις τη ΔΙΑΦΟΡΑ, χρειάζεσαι το ίδιο σενάριο χωρίς το deferred
-bind. Πρόσθεσε προσωρινό flag ή, πιο απλά, force το fallback:
+The control experiment is the same setup **without** `--close-race-window`:
+its absence IS the control, its presence IS the treatment. No code change is
+needed.
+
+**Terminal A** — same as Step 1 but drop the flag:
 
 ```bash
-# Πρόχειρος τρόπος: πες στο daemon να μη χρησιμοποιεί deferred bind.
-# Αν δεν έχεις flag, σχολίασε προσωρινά το supported() check ή
-# ρύθμισε ένα env var. Πες μου να προσθέσω --no-deferred-bind flag.
+sudo python -m probolos --observe 3 --capture-payload
 ```
 
-Στο fallback, ο driver δένει αμέσως στο authorize. Στα ~50 ms πριν το grab,
-τα πρώτα markers ΔΙΑΡΡΕΟΥΝ. Θα δεις:
+**Terminal B** — identical to Step 1:
 
-- Στο Terminal B: μερικοί χαρακτήρες ΕΜΦΑΝΙΖΟΝΤΑΙ (η διαρροή)
-- Keystrokes captured: λιγότερα από όσα στάλθηκαν
-- exposure: `~50 ms` αντί για 0
+```bash
+sudo ./hid_gadget_up.sh
+sudo python3 hid_attack.py --markers 8
+```
+
+In the fallback path the driver binds immediately at authorize. For the ~50
+ms before the grab succeeds, the first markers LEAK. You will see:
+
+- In Terminal B: a few characters APPEAR (the leak)
+- Keystrokes captured: fewer than were sent
+- Exposure: `~50 ms` instead of 0
 
 ---
 
-## Ο πίνακας που παράγεις για τη διπλωματική
+## The table you produce for the thesis
 
-| Συνθήκη | enumeration | exposure | keystrokes leaked |
-|---|---|---|---|
-| Χωρίς Probolos | — | ∞ | ΟΛΑ (41/41) |
-| Probolos, deferred OFF | ~50 ms | ~50 ms | μερικά (π.χ. 3-8) |
-| Probolos, deferred ON | ~50 ms | ~0 ms | 0 |
+| Condition                | enumeration | exposure | keystrokes leaked |
+|--------------------------|-------------|----------|-------------------|
+| No Probolos              | —           | ∞        | ALL (41/41)       |
+| Probolos, deferred OFF   | ~50 ms      | ~50 ms   | some (e.g. 3–8)   |
+| Probolos, deferred ON    | ~50 ms      | ~0 ms    | 0                 |
 
-Αυτός ο πίνακας είναι το αποτέλεσμα. Δείχνει μετρημένη, όχι θεωρητική,
-βελτίωση — και μάλιστα με πραγματικό kernel gadget, όχι mock.
+That table is the result. It shows a measured — not theoretical — improvement,
+against a real kernel gadget rather than a mock.
 
-**Επανάλαβε κάθε γραμμή 10+ φορές** και ανάφερε median/p95, όχι μία τιμή.
-Το «leaked 0/41 σε 10/10 δοκιμές» είναι πολύ ισχυρότερο από ένα single run.
+**Repeat each row 10+ times** and report median and p95, not a single value.
+"leaked 0/41 in 10/10 trials" reads much stronger than a single run.
 
 ---
 
 ## Troubleshooting
 
-**Δεν δημιουργείται `/dev/hidg0`:** το `usb_f_hid` ίσως δεν φορτώθηκε.
-`sudo modprobe usb_f_hid` χειροκίνητα, μετά ξανά το up script.
+**`/dev/hidg0` does not appear:** `usb_f_hid` may not have loaded. Run
+`sudo modprobe usb_f_hid` by hand, then the up script again.
 
-**`echo dummy_udc.0 > UDC` δίνει "Device or resource busy":** κάτι άλλο
-κρατά τον UDC. `cat /sys/class/udc/dummy_udc.0/state` — αν λέει
-"configured", τρέξε πρώτα το down script.
+**`echo dummy_udc.0 > UDC` reports "Device or resource busy":** something
+else is holding the UDC. `cat /sys/class/udc/dummy_udc.0/state` — if it
+reads "configured", run the down script first.
 
-**Ο Probolos δεν βλέπει το gadget:** το `dummy_hcd` δημιουργεί συσκευές
-στο bus 5 (`usb5`). Βεβαιώσου ότι ο Probolos δεν φιλτράρει το bus 5 —
-στο baseline output πρέπει να δεις `usb5: closed`.
+**Probolos does not see the gadget:** `dummy_hcd` creates devices on
+bus 5 (`usb5`). Make sure Probolos is not filtering bus 5 — you should see
+`usb5: closed` in the baseline output.
 
-**Το down script αφήνει σκουπίδια:** `find /sys/kernel/config/usb_gadget/probolos_test`
-δείχνει τι έμεινε. Σχεδόν πάντα είναι το UDC ακόμη δεμένο — 
-`echo "" > .../probolos_test/UDC` και ξανά.
+**The down script leaves debris:** `find /sys/kernel/config/usb_gadget/probolos_test`
+shows what remains. It is almost always the UDC still bound —
+`echo "" > .../probolos_test/UDC` then try again.
