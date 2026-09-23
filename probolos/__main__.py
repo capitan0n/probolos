@@ -413,6 +413,23 @@ def main(argv=None) -> None:
     # (set by prepare_socket_dir) and the uid AgentLink checks against can
     # never drift apart. None when --agent is off.
     agent_identity = _resolve_agent_identity(args)
+    if args.privsep and agent_identity is not None:
+        # The account that answers must not be the account the analyzer runs
+        # as. The shipped unit's placeholder is `--agent-user nobody`, the same
+        # shared account as the default --privsep-user, so without this every
+        # process running as `nobody` could connect and approve devices.
+        import pwd
+        try:
+            analyzer_uid = pwd.getpwnam(args.privsep_user).pw_uid
+        except KeyError:
+            analyzer_uid = None
+        if agent_identity[0] == analyzer_uid:
+            print(f"[!] --agent-user {agent_identity[2]} is the account the "
+                  f"analyzer runs as (--privsep-user {args.privsep_user}).")
+            print("[!] The gate runs WITHOUT the notification agent. Set "
+                  "PROBOLOS_AGENT_USER to your desktop account.\n")
+            agent_identity = None
+            args.agent = False
     if args.agent and agent_identity is None:
         # Disabled rather than left half-configured. Without an identity the
         # socket would be created with allowed_uids=None, which AgentLink itself

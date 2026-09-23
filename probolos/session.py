@@ -129,6 +129,18 @@ class LogindMonitor(SessionMonitor):
     def available(self) -> bool:
         return self._binary is not None
 
+    def reachable(self) -> bool:
+        """True when logind answers at all, even with no sessions yet."""
+        if not self._binary:
+            return False
+        try:
+            result = subprocess.run([self._binary, "list-sessions",
+                                     "--no-legend"],
+                                    capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
     def is_locked(self) -> Optional[bool]:
         if not self._binary:
             return None
@@ -208,10 +220,15 @@ def detect(force: Optional[bool] = None) -> SessionMonitor:
 
     `force` overrides everything, for testing the policy without arranging an
     actual locked screen.
+
+    Chosen on whether logind answers, not on whether a graphical session
+    exists yet: a service started at boot sees no session, and deciding then
+    would disable the lock policy for the whole run. Unknown lock state is
+    still treated as unlocked by the daemon, exactly as before.
     """
     if force is not None:
         return FixedState(force)
     monitor = LogindMonitor()
-    if monitor.available() and monitor.is_locked() is not None:
+    if monitor.available() and monitor.reachable():
         return monitor
     return AlwaysUnlocked()

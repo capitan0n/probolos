@@ -139,6 +139,10 @@ class Notifier:
             actions = '["allow", "Allow", "default", "Allow"]'
         else:
             actions = "[]"
+        # The body is markup to servers advertising body-markup (Plasma renders
+        # links and images from it) and carries device-supplied strings, so it
+        # gets the same escaping as the dialogs. The summary is plain text.
+        body = dialogs._markup_safe(body)
         args = [
             self._gdbus, "call", "--session",
             "--dest", "org.freedesktop.Notifications",

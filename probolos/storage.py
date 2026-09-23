@@ -57,6 +57,11 @@ PROTECTIVE_MBR_TYPE = 0xEE
 # plus the start of the first partition to sniff a filesystem signature.
 HEADER_READ = SECTOR * 34
 
+# Per partition: enough to reach every signature sniff_filesystem() checks.
+# One sector stopped short of the ext magic (0x438) and the btrfs magic
+# (0x10040), so those filesystems were never recognised inside a partition.
+PARTITION_SNIFF_READ = SECTOR * 129       # 0x10200 >= 0x10048
+
 # Partition type bytes seen on ordinary removable media.
 FAT_TYPES = {0x01, 0x04, 0x06, 0x0B, 0x0C, 0x0E}
 NTFS_EXFAT_TYPES = {0x07}
@@ -232,10 +237,8 @@ def sniff_filesystem(data: bytes) -> Optional[str]:
     # checks and were not -- the kind of thing that makes a signature list read
     # as more thorough than it is.
     #
-    # Note this only fires if the caller hands over a buffer large enough to
-    # contain the btrfs superblock; the 512-byte and 17 KiB reads above never
-    # are. Correct now rather than silently wrong, so it works the day a larger
-    # read is passed in.
+    # Only reachable with a buffer that contains the btrfs superblock, which is
+    # why inspect() reads PARTITION_SNIFF_READ bytes per partition.
     if len(data) >= 0x10048 and data[0x10040:0x10048] == b"_BHRfS_M":
         return "btrfs"
     return None
@@ -447,7 +450,7 @@ def inspect(device: str, open_fn=None) -> MediumReport:
                     f'partition {part.index}: start_lba {part.start_lba} '
                     f'does not fit the device; not read')
                 continue
-            chunk = _read_at(fd, offset, SECTOR)
+            chunk = _read_at(fd, offset, PARTITION_SNIFF_READ)
             if chunk:
                 fs = sniff_filesystem(chunk)
                 if fs:
