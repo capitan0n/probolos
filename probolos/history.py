@@ -149,16 +149,19 @@ def format_table(entries: List, verbose: bool = False) -> str:
             # blob can differ (bus negotiation) without the drift fingerprint
             # changing. The raw hash is printed separately below so both
             # views are visible.
+            # Cleaned like every other field: the ledger is written by the
+            # unprivileged analyzer, and these strings are printed to root.
             if len(hashes) > 1:
                 lines.append(f"       ! {len(hashes)} different identity "
                              f"fingerprints (device changed what it claims):")
                 for h in hashes:
-                    lines.append(f"           {h[:16]}\u2026")
+                    lines.append(f"           {_clean(h[:16])}\u2026")
             elif hashes:
-                lines.append(f"       identity fingerprint : {hashes[0][:16]}\u2026")
+                lines.append(f"       identity fingerprint : "
+                             f"{_clean(hashes[0][:16])}\u2026")
             raw = getattr(e, "raw_hash", "") or ""
             if raw:
-                lines.append(f"       raw descriptor bytes : {raw[:16]}\u2026")
+                lines.append(f"       raw descriptor bytes : {_clean(raw[:16])}\u2026")
             lines.append("")
 
     if not verbose:

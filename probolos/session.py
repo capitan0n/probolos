@@ -59,6 +59,22 @@ POLICY_IGNORE = "ignore"      # take no notice of the lock state
 _LOGINCTL_CANDIDATES = ("/usr/bin/loginctl", "/bin/loginctl")
 
 
+def _is_user_class(value: Optional[str]) -> bool:
+    """
+    True for a logind session that belongs to a person, not to the system.
+
+    A display manager's greeter is a graphical session too: GDM keeps its
+    login screen (Class=greeter, user `gdm`) running on tty1 while the real
+    session sits on tty2, and it never sets LockedHint. Counted as a user, it
+    made every locked screen read as "someone is present", and it could be
+    picked as the account allowed to answer the agent. systemd names person
+    sessions "user", "user-early", "user-light" and so on; greeter,
+    lock-screen, background and manager sessions are not people. A missing
+    Class (an old or unusual logind) keeps the previous behaviour.
+    """
+    return value is None or value.startswith("user")
+
+
 def _find_loginctl() -> Optional[str]:
     """The real loginctl, found by absolute path rather than through $PATH."""
     for candidate in _LOGINCTL_CANDIDATES:
@@ -197,10 +213,12 @@ class LogindMonitor(SessionMonitor):
         graphical = []
         for session_id in ids:
             info = self._run("show-session", session_id, "-p", "Type",
-                             "-p", "Remote")
+                             "-p", "Remote", "-p", "Class")
             values = dict(
                 line.split("=", 1) for line in info.splitlines() if "=" in line)
             if values.get("Remote") == "yes":
+                continue
+            if not _is_user_class(values.get("Class")):
                 continue
             if values.get("Type") in ("x11", "wayland", "mir"):
                 graphical.append(session_id)

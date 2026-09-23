@@ -705,3 +705,31 @@ class TrustStoreStillPinsRawBytes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HistoryDoesNotReplayLedgerEscapes(unittest.TestCase):
+    """
+    `--history -v` runs as root and prints the ledger, which the unprivileged
+    analyzer writes. Identity, ports and decisions were cleaned; the two hash
+    fields were printed raw, so a tampered ledger reached root's terminal.
+    """
+
+    def test_hash_fields_are_cleaned(self):
+        import os
+        import time
+        from probolos import history
+
+        now = time.time()
+        entry = {"identity": "0951:1665:ABC", "descriptor_hash": "x",
+                 "first_seen": now, "last_seen": now,
+                 "known_hashes": ["\x1b]0;pwned\x07\x1b[2J", "b" * 64],
+                 "raw_hash": "\x1b[8m\x1b]2;x\x07"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ledger.json")
+            with open(path, "w") as fh:
+                json.dump({"schema": 1, "fingerprint_scheme": "normalized-v1",
+                           "entries": {"0951:1665:ABC": entry}}, fh)
+            os.chmod(path, 0o600)
+            out = history.show_history(verbose=True, path=path)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x07", out)

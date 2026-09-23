@@ -141,7 +141,7 @@ def _active_session_user() -> Optional[str]:
     import os
     import subprocess
 
-    from .session import _find_loginctl
+    from .session import _find_loginctl, _is_user_class
 
     loginctl = _find_loginctl()
     if loginctl:
@@ -153,11 +153,19 @@ def _active_session_user() -> Optional[str]:
                 if len(parts) >= 3:
                     info = subprocess.run(
                         [loginctl, "show-session", parts[0], "-p", "Type",
-                         "-p", "Name"],
+                         "-p", "Name", "-p", "Class", "-p", "Active",
+                         "-p", "Remote"],
                         capture_output=True, text=True, timeout=3)
                     values = dict(l.split("=", 1)
                                   for l in info.stdout.splitlines() if "=" in l)
-                    if values.get("Type") in ("x11", "wayland", "mir"):
+                    # The ACTIVE, local, person's session -- not merely the
+                    # first graphical one listed. GDM's greeter (user `gdm`)
+                    # and another user's background session are graphical
+                    # too, and whichever this returns may answer the agent.
+                    if (values.get("Type") in ("x11", "wayland", "mir")
+                            and _is_user_class(values.get("Class"))
+                            and values.get("Remote") != "yes"
+                            and values.get("Active", "yes") == "yes"):
                         return values.get("Name")
         except (OSError, subprocess.SubprocessError):
             pass

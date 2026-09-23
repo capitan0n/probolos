@@ -108,6 +108,47 @@ class LockMonitorIsNotDecidedBeforeLogin(unittest.TestCase):
             self.assertIsInstance(session.detect(), session.AlwaysUnlocked)
 
 
+class GreeterSessionIsNotSomeonePresent(unittest.TestCase):
+    """
+    GDM keeps its greeter (user `gdm`, Class=greeter, Type=wayland) running
+    beside the real session and never sets LockedHint. It counted as an
+    unlocked graphical session, so a locked screen read as "someone present"
+    and the greeter account could be chosen to answer the agent.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.loginctl = os.path.join(self.tmp, "loginctl")
+        with open(self.loginctl, "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = list-sessions ]; then\n'
+                '  echo "c1 120 gdm seat0 tty1"; echo "2 1000 alice seat0 tty2"\n'
+                "  exit 0\n"
+                "fi\n"
+                'sid="$2"; shift 2\n'
+                'for p in "$@"; do case "$sid:$p" in\n'
+                "  c1:Class) echo Class=greeter;; 2:Class) echo Class=user;;\n"
+                "  c1:LockedHint) echo LockedHint=no;; 2:LockedHint) echo LockedHint=yes;;\n"
+                "  c1:Name) echo Name=gdm;; 2:Name) echo Name=alice;;\n"
+                "  c1:Active) echo Active=no;; 2:Active) echo Active=yes;;\n"
+                "  *:Type) echo Type=wayland;; *:Remote) echo Remote=no;;\n"
+                "esac; done\n")
+        os.chmod(self.loginctl, 0o755)
+
+    def test_locked_user_session_is_locked_despite_greeter(self):
+        with mock.patch.object(session, "_LOGINCTL_CANDIDATES",
+                               (self.loginctl,)):
+            self.assertTrue(session.detect().is_locked())
+
+    def test_agent_user_is_the_active_person_not_the_greeter(self):
+        with mock.patch.object(session, "_LOGINCTL_CANDIDATES",
+                               (self.loginctl,)), \
+                mock.patch.dict(os.environ, {"SUDO_USER": ""}):
+            self.assertEqual(cli._active_session_user(), "alice")
+
+
 class PartitionSignaturesAreReachable(unittest.TestCase):
     """Per-partition reads were one sector: ext and btrfs magics never fit."""
 

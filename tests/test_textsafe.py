@@ -57,6 +57,12 @@ class DangerousStrings(unittest.TestCase):
     def test_a_nul_byte_is_neutralised(self):
         self.assertNeutralised("ACME\x00Corp", NOTE_CONTROL, "\x00")
 
+    def test_unicode_line_separators_cannot_inject_dialog_lines(self):
+        """U+2028/U+2029 are line breaks to Qt and Pango, not category Cc."""
+        raw = "Kingston INFO: no findings "
+        self.assertNeutralised(raw, NOTE_CONTROL, "  ")
+        self.assertIn("\\u2028", sanitize(raw).text)
+
     # ---- rendering attacks ----
 
     def test_a_bidi_override_cannot_reorder_the_prompt(self):

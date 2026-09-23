@@ -189,8 +189,10 @@ def sanitize(value, limit: int = MAX_LENGTH) -> Sanitized:
 
         # Cc is C0 and C1 control characters: ESC, CR, BS, NUL and the 0x80-9f
         # range that some terminals still interpret. This is the class that
-        # lets a device redraw the screen above the prompt.
-        elif category == "Cc":
+        # lets a device redraw the screen above the prompt. Zl/Zp are U+2028
+        # and U+2029: Qt (kdialog) and Pango (zenity, notifications) break
+        # lines on them, so a device could add forged lines to the dialog.
+        elif category in ("Cc", "Zl", "Zp"):
             notes.append(NOTE_CONTROL)
             token = _escape(char)
         elif char in _BIDI:

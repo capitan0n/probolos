@@ -419,6 +419,55 @@ class StageOrdering(unittest.TestCase):
             self.run_add(dev, approved=False)
             inspect_fn.assert_called_once()
 
+    def test_storage_plus_other_functions_is_not_inspected(self):
+        """
+        Storage + network (RNDIS/ECM), serial or vendor interfaces: stage 4
+        would switch those functions on before any decision. Only a device
+        that declares storage and nothing else may be activated to look.
+        """
+        for extra in (usbclass.KIND_OTHER, usbclass.KIND_WIRELESS,
+                      usbclass.KIND_HUB):
+            with self.subTest(extra=extra):
+                self.writes.clear()
+                dev = make_stage_device(kinds=[usbclass.KIND_STORAGE, extra])
+                with mock.patch.object(self.engine,
+                                       "_inspect_medium") as inspect_fn:
+                    self.run_add(dev, approved=False)
+                    inspect_fn.assert_not_called()
+                self.assertNotIn(1, self.writes)
+
+    def test_parsed_storage_plus_rndis_is_never_authorized_before_decision(self):
+        """End to end from a real blob: a Pi Zero g_multi-style composite."""
+        import struct
+        import tempfile
+        from probolos import storage
+
+        def intf(num, cls, sub, proto):
+            return (struct.pack("<BBBBBBBBB", 9, 4, num, 0, 1, cls, sub, proto, 0)
+                    + struct.pack("<BBBBHB", 7, 5, 0x81, 2, 512, 0))
+
+        body = intf(0, 0xE0, 1, 3) + intf(1, 0x0A, 0, 0) + intf(2, 0x08, 6, 0x50)
+        blob = (struct.pack("<BBHBBBBHHHBBBB", 18, 1, 0x0200, 0xEF, 2, 1, 64,
+                            0x1d6b, 0x0104, 0x0100, 1, 2, 3, 1)
+                + struct.pack("<BBHBBBBB", 9, 2, 9 + len(body), 3, 1, 0, 0x80, 50)
+                + body)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "3-9"
+            path.mkdir()
+            for name, value in (("idVendor", "1d6b"), ("idProduct", "0104"),
+                                ("authorized", "0"), ("removable", "removable")):
+                (path / name).write_text(value)
+            (path / "descriptors").write_bytes(blob)
+            dev = sysfs.load_device(path)
+            self.assertTrue(dev.inspection_safe)
+            self.assertIn(usbclass.KIND_STORAGE, dev.kinds)
+            with mock.patch.object(storage, "find_block_devices",
+                                   return_value=[]):
+                self.run_add(dev, approved=False)
+        self.assertNotIn(1, self.writes,
+                         "a storage+network composite was switched on before "
+                         "the human decided")
+
 
 if __name__ == "__main__":
     unittest.main()

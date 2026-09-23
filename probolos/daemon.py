@@ -368,7 +368,16 @@ class Probolos:
         # device that can also type" finding, and its partition table cannot
         # make that verdict any safer. So storage is read only when the device
         # cannot also type.
-        if (complete and self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds
+        #
+        # "Cannot also type" was not enough: the condition only excluded HID,
+        # so a storage device that ALSO declared a network function (RNDIS /
+        # CDC-ECM -- a Pi Zero running g_multi), a serial port or a vendor
+        # interface was switched on whole, with no decision, for the 1.5 s node
+        # wait plus a scan the device itself can stall for the full 10 s
+        # timeout. Long enough for NetworkManager to DHCP a hostile gateway.
+        # The medium is read only when storage is ALL the device declares.
+        storage_only = set(dev.kinds) == {usbclass.KIND_STORAGE}
+        if (complete and self.inspect_storage and storage_only
                 and not has_input):
             # BOTH guards are needed and they do different jobs. The timeout
             # inside inspect_safely guarantees the scan ENDS; paused() stops
@@ -397,6 +406,12 @@ class Probolos:
             print("  Its medium will NOT be read: authorizing it to look would")
             print("  also switch the input half on without a grab. It is held")
             print("  for your decision on the strength of that alone.\n")
+        elif (self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds
+                and not storage_only):
+            print("  This device declares storage AND other functions.")
+            print("  Its medium will NOT be read: authorizing it to look would")
+            print("  also switch those functions (network, serial, vendor) on")
+            print("  before you decide. It is held for your decision as is.\n")
 
         if was_held and self.trust is not None and self.trust.is_trusted(dev):
             print("  Note: this device is on your remembered list, but it was")

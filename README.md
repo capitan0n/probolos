@@ -49,8 +49,9 @@ experimental deferred binding, not race-free isolation. Newly discovered input
 nodes are checked throughout observation; this still requires userspace to react.
 
 Stage 4 also temporarily activates the device. Probolos itself never mounts the
-medium, but another service may do so. It is skipped if any parsed configuration
-or alternate setting declares HID input, or if descriptors are incomplete.
+medium, but another service may do so. It is skipped unless every parsed
+configuration and alternate setting declares mass storage only (no HID, network,
+serial or vendor function), or if descriptors are incomplete.
 
 The research subject is an admission gate combining descriptor, behavioural,
 and storage metadata evidence. Comparative claims about other tools require

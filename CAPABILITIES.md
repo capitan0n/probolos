@@ -106,8 +106,9 @@ medium; other services can still mount it during activation.
 The read/parse phase runs in a forked worker with a timeout. Authorization,
 gate-provided descriptor acquisition and cleanup are outside that deadline. Storage inspection is **refused** on a
 composite storage+input device, because authorizing it to look would switch the
-input half on without a grab. This guard includes every parsed configuration
-and alternate setting. Incomplete descriptors disable early activation entirely.
+input half on without a grab, and on any other composite (storage+network,
+serial or vendor), because it would switch those functions on before a
+decision. This guard includes every parsed configuration and alternate setting. Incomplete descriptors disable early activation entirely.
 
 ### 1.6 Memory across sessions
 
