@@ -66,7 +66,7 @@ The gate needs root, so the units restrict what root can still reach:
 | Setting | Effect |
 |---|---|
 | `ProtectSystem=strict` | the whole filesystem read-only except the state and runtime directories |
-| `PrivateNetwork=yes` | no sockets at all — a compromised analyzer cannot send anything anywhere |
+| `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any` | no IP sockets or traffic; `PrivateNetwork` stays `no` because udev events arrive over host netlink |
 | `DevicePolicy=closed` | only input nodes and block devices; no sound, video, tty or GPU |
 | `MemoryDenyWriteExecute=yes` | no writable-executable memory |
 | `SystemCallFilter` | denies module loading, raw I/O, mounting, reboot, and the rest |
