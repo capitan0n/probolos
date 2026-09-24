@@ -205,10 +205,18 @@ class Entry:
         # remembered device the day of the upgrade.
         fingerprint_scheme = as_str(raw.get("fingerprint_scheme")) or "raw"
         baseline = as_str(raw.get("baseline_hash")) or ""
+        # "-" is record()'s placeholder for unreadable descriptors and must
+        # never be a baseline (see record()). The fallback below used to
+        # promote it from known_hashes[0] on every reload, so a device whose
+        # first sighting could not be read was reported as CRITICAL drift on
+        # every later, readable appearance until someone approved it.
+        if baseline == "-":
+            baseline = ""
         if fingerprint_scheme != "normalized-v1":
             baseline = ""
         elif not baseline:
-            baseline = known[0] if known else digest
+            baseline = next((h for h in known if h != "-"),
+                            digest if digest != "-" else "")
 
         return cls(
             identity=identity,

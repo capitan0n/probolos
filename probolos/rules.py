@@ -305,13 +305,30 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
     # These attributes are read with getattr so the rule engine stays
     # trivially unit-testable with lightweight stubs that only carry the
     # fields a given rule needs. A real sysfs.UsbDevice always defines them.
+    #
+    # The three findings below all mean the same thing: part of what the
+    # device declared was never examined, so every rule above ran on a partial
+    # list of its functions. They are CRITICAL for the reason analyzers.run()
+    # gives for a crashed rule engine -- an unexamined function list is not a
+    # clean result. As WARNINGs they made an incomplete view CHEAPER to
+    # approve than a complete one: a storage+keyboard device whose descriptors
+    # could not be read in full dropped from "type the word authorize" to a
+    # clickable [y/N], and a remembered one was admitted without a question.
+    #
+    # The kernel reads every descriptor itself and trims malformed tails before
+    # exposing them (drivers/usb/core/config.c adjusts wTotalLength), so on
+    # real hardware these arise from Probolos's own limits -- the descriptor
+    # count bound, or the 18 + 65535 byte cap on the sysfs `descriptors`
+    # attribute -- not from ordinary buggy devices.
     parse_error = getattr(dev, "parse_error", None)
     if parse_error:
-        add("unreadable-descriptors", Severity.WARNING,
+        add("unreadable-descriptors", Severity.CRITICAL,
             "Device descriptors could not be read",
             f"{parse_error}. A device whose own descriptors do not parse "
             "is either broken or deliberately malformed. Either way its claims "
-            "cannot be checked, so it cannot be assessed.")
+            "cannot be checked, so it cannot be assessed -- and whatever it "
+            "declared in the part that was not read, the kernel will still "
+            "configure.")
 
     descriptor_set = getattr(dev, "descriptor_set", None)
     if descriptor_set and descriptor_set.declared_interface_mismatch():
@@ -331,11 +348,23 @@ def evaluate(dev, config: Optional[RuleConfig] = None) -> List[Finding]:
     # without recording that it had done so.
     truncated = getattr(descriptor_set, "truncated", None)
     if truncated:
-        add("descriptor-chain-truncated", Severity.WARNING,
+        add("descriptor-chain-truncated", Severity.CRITICAL,
             "The descriptor chain stops before it should",
             f"{truncated}. What was parsed is still shown, but the device did "
             "not deliver everything it promised, so any function described in "
             "the missing part is invisible to every check below.")
+
+    configs = getattr(descriptor_set, "configs", None)
+    declared_configs = getattr(getattr(descriptor_set, "device", None),
+                               "num_configurations", None)
+    if (isinstance(configs, list) and isinstance(declared_configs, int)
+            and len(configs) < declared_configs):
+        add("configurations-missing", Severity.CRITICAL,
+            "Some of the device's configurations were never examined",
+            f"The device declares {declared_configs} configuration(s) but "
+            f"only {len(configs)} could be read. The kernel may select one "
+            "that was not examined, and nothing it declares there has been "
+            "checked.")
 
     overstated = getattr(descriptor_set, "length_overstated", 0)
     if overstated > 0:

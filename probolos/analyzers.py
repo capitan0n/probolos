@@ -138,8 +138,19 @@ class LedgerAnalyzer(Analyzer):
         # before the field existed is migrated in from_raw, but a test stub or
         # a hand-built Entry may not carry it, and losing the check silently is
         # the failure mode this whole finding is about.
-        baseline = getattr(entry, "baseline_hash", "") or entry.descriptor_hash
-        if digest and baseline and digest != baseline:
+        #
+        # The fallback applies only when the field is ABSENT. An EMPTY baseline
+        # is a deliberate "nothing to compare against yet": from_raw clears it
+        # for ledgers written under the old raw-blob fingerprint, and record()
+        # leaves it empty after an unreadable first sighting. Falling back to
+        # descriptor_hash there compared the new fingerprint against an
+        # old-scheme digest or the "-" placeholder, and reported CRITICAL drift
+        # on every remembered device the first time it was seen after an
+        # upgrade -- the exact false alarm the migration exists to avoid.
+        baseline = getattr(entry, "baseline_hash", None)
+        if baseline is None:
+            baseline = entry.descriptor_hash
+        if digest and baseline and baseline != "-" and digest != baseline:
             findings.append(rules.Finding(
                 "descriptor-drift", rules.Severity.CRITICAL,
                 "This device has changed what it says it is",

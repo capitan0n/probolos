@@ -71,11 +71,11 @@ ProtectHostname=yes
 ProtectControlGroups=yes
 # Device access is restricted to the two classes actually needed: input nodes
 # to observe behaviour, block devices to read a partition table. Everything
-# else -- sound, video, tty, GPU -- is denied.
+# else -- sound, video, tty, GPU, and the misc class (/dev/uinput, /dev/kvm,
+# /dev/fuse ...) which nothing in Probolos opens -- is denied.
 DevicePolicy=closed
 DeviceAllow=char-input rw
 DeviceAllow=block-* r
-DeviceAllow=char-misc rw
 
 # Privileges: no path to gaining more than it starts with.
 NoNewPrivileges=yes

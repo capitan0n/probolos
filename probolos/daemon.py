@@ -108,6 +108,7 @@ class Probolos:
         # a bare name.
         self.pending: "OrderedDict[str, tuple]" = OrderedDict()
         self._was_locked = False
+        self._stream_failing = False    # udev event stream overflowed
         self.known: Set[str] = set()    # devices present at startup
 
     # ------------------------------------------------------------------
@@ -201,7 +202,19 @@ class Probolos:
                         self._drain_pending()
                     self._was_locked = bool(locked)
 
-            device = monitor.poll(timeout=1.0)
+            # The event stream itself can fail, and that must not end the gate
+            # either. When the netlink receive buffer overflows -- events
+            # arriving faster than this loop drains them, e.g. while it waits
+            # on a prompt -- the kernel flags ENOBUFS on the socket, and pyudev
+            # raises from EVERY poll() until that error is consumed. Uncaught,
+            # that left run(), the gate reopened and the daemon exited.
+            try:
+                device = monitor.poll(timeout=1.0)
+            except OSError as exc:
+                if not self._recover_event_stream(monitor, exc):
+                    raise
+                continue
+            self._stream_failing = False
             if device is None:
                 continue
             # One device must never be able to end the gate. Everything below
@@ -226,6 +239,40 @@ class Probolos:
                       f"while gating this device: {exc!r}")
                 print(f"[!] It stays BLOCKED. The gate is still running.")
                 traceback.print_exc()
+
+    def _recover_event_stream(self, monitor, exc: OSError) -> bool:
+        """
+        Survive a netlink overflow; True if the loop may carry on.
+
+        Only ENOBUFS is recovered from. It means events were DROPPED, not that
+        the stream is broken: reading SO_ERROR consumes the flag and the socket
+        works again. Devices whose events were lost stay blocked (they never
+        got an 'add' here), which is the safe direction, and the operator is
+        told so. Anything else is re-raised exactly as before.
+        """
+        import errno
+        import socket as _socket
+        pending = 0
+        try:
+            sock = _socket.fromfd(monitor.fileno(), _socket.AF_NETLINK,
+                                  _socket.SOCK_RAW)
+            try:
+                pending = sock.getsockopt(_socket.SOL_SOCKET,
+                                          _socket.SO_ERROR)
+            finally:
+                sock.close()
+        except (OSError, AttributeError, ValueError):
+            return False
+        if errno.ENOBUFS not in (exc.errno, pending):
+            return False
+        if not self._stream_failing:
+            print("[!] USB event queue overflowed; some attach/remove events "
+                  "were lost.")
+            print("[!] The gate is still closed. A device attached meanwhile "
+                  "stays BLOCKED -- replug it to be asked about it.")
+        self._stream_failing = True
+        time.sleep(0.05)
+        return True
 
     def _on_add(self, sys_path: str, was_held: bool = False) -> None:
         """

@@ -51,11 +51,14 @@ defaults and are overridable per rule in a YAML config (`--rules`).
 - `storage-with-keyboard` — a mass-storage device that also declares HID input
 - `network-with-keyboard` — a network interface that also declares HID input
 - `crafted-strings-hid` — text-manipulation characters in the strings of an input device
+- `unreadable-descriptors`, `descriptor-chain-truncated`, `configurations-missing`
+  — part of what the device declared was never examined (parse failure, a chain
+  cut short, or fewer configurations read than declared), so no rule above can
+  vouch for it
 
 **WARNING**
 - `keyboard-with-unrelated-function`
 - `self-contradictory-identity`
-- `unreadable-descriptors`
 - `interface-count-mismatch` — declared `bNumInterfaces` vs. interfaces present
 - `crafted-strings`
 - `power-exceeds-bus-limit` — declares more than the specification permits

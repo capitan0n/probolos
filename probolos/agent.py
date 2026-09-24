@@ -372,6 +372,13 @@ class Agent:
         title = _as_text(message.get("title"), "New USB device")
         body = _as_text(message.get("body"), "")
         allow_always = bool(message.get("allow_always"))
+        # The analyzer stops listening `timeout` seconds after it asked (the
+        # small margin covers the reply's trip back). The first dialog may use
+        # nearly all of that, and the second one used to get a fixed 30 s on
+        # top -- so a person who read the first dialog carefully could click
+        # "Yes, switch it on" after the analyzer had already given up, and the
+        # device stayed blocked while they believed they had approved it.
+        deadline = time.monotonic() + timeout - 1.0
 
         announcement = None
         if self.notifier.available():
@@ -411,12 +418,19 @@ class Agent:
                             "read and write storage, or use the network, "
                             "depending on what it is.")
 
+            # Whatever is left of the analyzer's budget, never more than the
+            # 30 s this dialog always had. With nothing left, an answer could
+            # not be honoured anyway, so none is collected.
+            remaining = min(30.0, deadline - time.monotonic())
+            if remaining <= 0:
+                return ANSWER_NO
+
             if not allow_always:
                 confirmed = self.dialog.confirm(
                     title="Probolos — confirm",
                     text=confirm_text,
                     yes_label="Yes, switch it on", no_label="Cancel",
-                    timeout=30.0)
+                    timeout=remaining)
                 return ANSWER_YES if confirmed else ANSWER_NO
 
             # Three outcomes, the same set the terminal offers. Without this the
@@ -432,7 +446,7 @@ class Agent:
                 once_label="Just this once",
                 always_label="Always allow",
                 no_label="Cancel",
-                timeout=30.0)
+                timeout=remaining)
             if choice == dialogs.CHOICE_ONCE:
                 return ANSWER_YES
             if choice == dialogs.CHOICE_ALWAYS:
