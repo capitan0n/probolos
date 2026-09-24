@@ -230,8 +230,12 @@ def render_medium(medium, findings: Sequence[rules.Finding]) -> str:
                 if p.type_byte != storage_mod.PROTECTIVE_MBR_TYPE]
         if not real and medium.scheme == "none":
             fs = medium.signatures.get(-1)
-            out.append(INDENT + _dim(f"no partition table; "
-                                     f"contains {fs or 'no known'} filesystem"))
+            if fs:
+                out.append(INDENT + _dim(f"whole-device {fs} filesystem "
+                                         f"(no partition table)"))
+            else:
+                out.append(INDENT + _dim("no partition table; "
+                                         "contains no known filesystem"))
         for part in real:
             seen = medium.signatures.get(part.index)
             boot = " · bootable" if part.bootable else ""

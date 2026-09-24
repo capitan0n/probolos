@@ -80,6 +80,24 @@ but not groups.
   `__main__` catches only `RuntimeError`, `ValueError` and `OSError` around it,
   so the gate never closed.
 
+### Fixed — detection
+
+- **A dd-written live image was reported as a blank medium.** With no
+  partition table, stage 4 sniffed only its 17 KiB header read, which ends
+  before the ISO 9660 / UDF volume descriptors at sector 16 (0x8000). A
+  bootable Slax stick — a whole operating system, kernel modules included —
+  was shown as `contains no known filesystem`, the description an operator is
+  most likely to approve. A partitionless medium is now read over the same
+  descriptor for as far as a partition is (0x10200 bytes), and
+  `sniff_filesystem` recognises ISO 9660 (`CD001`) and UDF (an `NSR02`/`NSR03`
+  descriptor in the recognition sequence). btrfs without a partition table had
+  the same cause and is recognised too. LBA-0 signatures still win, so a FAT
+  superfloppy is unchanged. **This changes what stage 4 reports to the
+  operator**: partitionless image filesystems now read as
+  `whole-device <fs> filesystem (no partition table)`; `contains no known
+  filesystem` is emitted only when no signature matches. Detection only — no
+  rule, verdict or authorization path changed.
+
 ### Tests
 
 - `tests/test_payload.py` now exists. SECURITY.md said the three keystroke
@@ -91,6 +109,9 @@ but not groups.
 - `tests/run_all.py` walks subdirectories. It globbed only the top level, so
   the two documented ways of running the suite reported different totals —
   which README.md says is itself a bug, and was one before for the same reason.
+- `tests/test_partitionless_filesystems.py` covers the raw ISO 9660 regression
+  and the acceptance cases around it: UDF, superfloppy FAT32/exFAT, MBR and GPT
+  unchanged, a blank medium, and media too short to hold a descriptor.
 
 ## [0.9.0] — the audit
 

@@ -60,7 +60,20 @@ HEADER_READ = SECTOR * 34
 # Per partition: enough to reach every signature sniff_filesystem() checks.
 # One sector stopped short of the ext magic (0x438) and the btrfs magic
 # (0x10040), so those filesystems were never recognised inside a partition.
+# The same length is read for a partitionless medium, whose filesystem starts
+# at LBA 0: HEADER_READ ends at 0x4400, before the ISO 9660 / UDF descriptors
+# at 0x8000, so a raw-written live image read as "no known filesystem".
 PARTITION_SNIFF_READ = SECTOR * 129       # 0x10200 >= 0x10048
+
+# Optical-image filesystems (ISO 9660, UDF) leave the first 16 sectors of 2 KiB
+# -- the "system area" -- to the medium, and begin their volume descriptors at
+# byte 0x8000. Each descriptor is one 2 KiB sector: a type byte, then a
+# five-byte standard identifier. ISO 9660 says "CD001"; UDF's Volume
+# Recognition Sequence says "BEA01", then "NSR02"/"NSR03", then "TEA01".
+OPTICAL_VD_START = 0x8000
+OPTICAL_VD_STRIDE = 0x800
+ISO9660_ID = b"CD001"
+UDF_NSR_IDS = (b"NSR02", b"NSR03")
 
 # Partition type bytes seen on ordinary removable media.
 FAT_TYPES = {0x01, 0x04, 0x06, 0x0B, 0x0C, 0x0E}
@@ -241,6 +254,32 @@ def sniff_filesystem(data: bytes) -> Optional[str]:
     # why inspect() reads PARTITION_SNIFF_READ bytes per partition.
     if len(data) >= 0x10048 and data[0x10040:0x10048] == b"_BHRfS_M":
         return "btrfs"
+    # Optical images: ISO 9660 and UDF, from sector 16 (0x8000). Checked after
+    # every LBA-0 signature, because the 32 KiB system area in front of the
+    # descriptors is the medium's to use: an isohybrid image keeps an MBR in
+    # it, and a FAT boot sector there is what the medium is actually booted as.
+    return _sniff_optical(data)
+
+
+def _sniff_optical(data: bytes) -> Optional[str]:
+    """
+    ISO 9660 / UDF volume descriptors, matched by identifier only.
+
+    Nothing inside a descriptor is followed. UDF is judged by an NSR
+    descriptor anywhere in the recognition area (2 KiB stride covers both
+    2 KiB and 4 KiB block sizes); BEA01 alone only opens the sequence and does
+    not name a filesystem. A UDF/ISO 9660 bridge image carries both and is
+    reported as UDF, the structure a modern reader actually uses -- the same
+    choice blkid makes.
+    """
+    if len(data) < OPTICAL_VD_START + 6:
+        return None
+    iso = data[OPTICAL_VD_START + 1:OPTICAL_VD_START + 6] == ISO9660_ID
+    for off in range(OPTICAL_VD_START, len(data) - 5, OPTICAL_VD_STRIDE):
+        if data[off] == 0 and data[off + 1:off + 6] in UDF_NSR_IDS:
+            return "UDF (ISO 9660 bridge)" if iso else "UDF"
+    if iso:
+        return "ISO 9660"
     return None
 
 
@@ -413,10 +452,20 @@ def inspect(device: str, open_fn=None) -> MediumReport:
         else:
             # No partition table. Common and legitimate: many USB sticks are
             # formatted as a "superfloppy", with a filesystem written directly
-            # to the medium. Sniff it so this is reported as a fact, not an
-            # anomaly.
+            # to the medium, and every dd-written live image (Slax, Tails, any
+            # isohybrid) is an ISO 9660 filesystem starting at LBA 0. Sniff it
+            # so this is reported as a fact, not an anomaly.
+            #
+            # The header read stops at 0x4400, short of the optical-image
+            # descriptors at 0x8000 and the btrfs magic at 0x10040, so the
+            # medium is read again over the same descriptor for as far as a
+            # partition would be. Reporting a whole operating system as "no
+            # known filesystem" reads as a blank stick -- the opposite of the
+            # truth, and the medium an operator is most likely to wave through.
+            # A short or failed read simply means "signature absent".
             report.scheme = "none"
-            fs = sniff_filesystem(data)
+            chunk = _read_at(fd, 0, PARTITION_SNIFF_READ)
+            fs = sniff_filesystem(chunk if len(chunk) > len(data) else data)
             if fs:
                 report.signatures[-1] = fs
             return report
