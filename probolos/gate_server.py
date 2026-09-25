@@ -48,6 +48,9 @@ SYS_CLASS_PREFIX = "/sys/class/"
 BLOCK_PREFIX = "/dev/"
 import re as _re
 _BLOCK_NAME = _re.compile(r"^sd[a-z]+$")
+# The kernel's index of block devices by number. Whether a node is a whole disk
+# or a partition is read from here, never inferred from its name or minor.
+SYS_DEV_BLOCK = "/sys/dev/block"
 # Root hubs -- usb1, usb2, ... -- are the only devices that own
 # authorized_default. Anything else asking for it is either confused or
 # probing, and neither deserves a write.
@@ -160,29 +163,56 @@ class GateServer:
             return None
 
     @staticmethod
-    def _safe_block_path(path: str) -> Optional[Path]:
+    def _check_block_path(path: str):
         """
-        Confirm a path is a whole USB-attached disk node.
+        Confirm a path is a whole USB-attached disk node: (node, reason).
 
-        Deliberately narrow: only /dev/sdX with no partition suffix, and only
-        if the kernel agrees it is a block device. Read-only access to a raw
-        disk is still access to every byte on it, so this is the request that
-        most deserves a tight check.
+        Deliberately narrow: only /dev/sdX, only if the kernel agrees it is a
+        block device, and only if the kernel's own record for that device
+        number (SYS_DEV_BLOCK) is a whole disk -- no `partition` attribute --
+        under the same name. Read-only access to a raw disk is still access to
+        every byte on it, so this is the request that most deserves a tight
+        check. Mirrors sysfs._check_block_node; the reason travels back in the
+        DENIED detail so a refusal says why instead of only that it happened.
         """
         import stat as _stat
         try:
             resolved = os.path.realpath(path)
         except (OSError, ValueError):
-            return None
+            return None, "path cannot be resolved"
         p = Path(resolved)
-        if p.parent != Path("/dev") or not _BLOCK_NAME.match(p.name):
-            return None
+        block_dir = BLOCK_PREFIX.rstrip("/")
+        if str(p.parent) != block_dir:
+            return None, f"not a node directly under {block_dir}"
+        if not _BLOCK_NAME.match(p.name):
+            return None, "not a SCSI disk node (sdX)"
         try:
-            if not _stat.S_ISBLK(os.stat(resolved).st_mode):
-                return None
+            st = os.stat(resolved)
+        except FileNotFoundError:
+            return None, "device node does not exist yet"
+        except (OSError, ValueError) as exc:
+            return None, f"cannot stat the node: {exc}"
+        if not _stat.S_ISBLK(st.st_mode):
+            return None, "not a block device"
+        number = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
+        try:
+            kernel = Path(os.path.realpath(f"{SYS_DEV_BLOCK}/{number}"))
+            registered = kernel.is_dir()
+            is_partition = registered and os.path.lexists(kernel / "partition")
         except (OSError, ValueError):
-            return None
-        return p
+            registered, is_partition = False, False
+        if not registered:
+            return None, f"the kernel has no block device {number} yet"
+        if is_partition:
+            return None, f"the kernel reports {number} is a partition"
+        if kernel.name != p.name:
+            return None, (f"device {number} is {kernel.name} to the kernel, "
+                          f"not {p.name}")
+        return p, ""
+
+    @classmethod
+    def _safe_block_path(cls, path: str) -> Optional[Path]:
+        return cls._check_block_path(path)[0]
 
     # ---- kernel-derived peripheral identity and temporary inspection scope ----
 
@@ -586,11 +616,11 @@ class GateServer:
 
     def _do_open_block(self, req: protocol.Request):
         """Open a whole disk read-only and pass the descriptor back."""
-        node = self._safe_block_path(req.path)
+        node, reason = self._check_block_path(req.path)
         if node is None:
             return protocol.Response(
                 protocol.DENIED,
-                f"not a whole-disk block device: {req.path!r}"), None
+                f"not a whole-disk block device: {req.path!r} ({reason})"), None
         # Scope: the disk must trace back to a USB device under quarantine. An
         # internal SATA/NVMe disk has no USB parent and is refused, so a
         # compromised analyzer cannot read /dev/sda (your system disk) even

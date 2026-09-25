@@ -401,7 +401,16 @@ def _write_attr_pinned(directory, name: str, value: str) -> None:
 
 _INPUT_DIR = "/dev/input"
 _INPUT_NODE_NAME = re.compile(r"^event[0-9]+$")
+# SCOPE, not the whole-disk test: every USB mass-storage device -- BOT or UAS
+# -- reaches the block layer through the SCSI disk driver, which names it sdX.
+# Internal NVMe/MMC disks, loop and mapper devices are out of scope by name.
 _WHOLE_DISK_NAME = re.compile(r"^sd[a-z]+$")
+
+# Where block device nodes live, and where the kernel indexes block devices by
+# device number. Module globals so tests can point the check at a synthetic
+# tree, as gate_server.SYS_CLASS_PREFIX already is.
+_BLOCK_DIR = "/dev"
+SYS_DEV_BLOCK = "/sys/dev/block"
 
 
 def _safe_input_node(path: str) -> Optional[Path]:
@@ -422,22 +431,85 @@ def _safe_input_node(path: str) -> Optional[Path]:
     return resolved
 
 
-def _safe_block_node(path: str) -> Optional[Path]:
-    """A whole /dev/sdX disk, resolved. Never a partition. None otherwise."""
+def _check_block_node(path):
+    """
+    Is `path` a whole USB-class disk? Returns (node, reason, transient).
+
+    `node` is the resolved path when the answer is yes, else None with a
+    `reason`. `transient` is True only when waiting could change the answer:
+    the device node, or the kernel's record of it, has not appeared yet.
+
+    WHOLE DISK IS THE KERNEL'S ANSWER, NOT A NAMING RULE
+    ----------------------------------------------------
+    The node's own device number (st_rdev) is looked up under /sys/dev/block,
+    which is the kernel's index of every block device by number. A partition's
+    entry there carries a `partition` attribute and a whole disk's does not.
+    That holds for every naming scheme and every minor-number layout, so no
+    part of the decision rests on a name suffix or on minor % 16. The entry's
+    kernel name must also be the node's name: a node whose number belongs to a
+    different device is not the device its name claims.
+
+    WHY THE REASON IS RETURNED
+    --------------------------
+    This used to answer None for everything, and os.stat() failing was folded
+    into the same None. A /dev/sda that udev had not finished creating was
+    therefore reported as "not a whole-disk block device" -- a healthy disk
+    refused with a reason that was false, and the real one (the node was not
+    there yet) discarded. stage 4 was skipped for every medium that hit it.
+    """
     import stat as _stat
     try:
         resolved = Path(os.path.realpath(str(path)))
     except (OSError, ValueError):
-        return None
-    if (str(resolved.parent) != "/dev"
-            or not _WHOLE_DISK_NAME.match(resolved.name)):
-        return None
+        return None, "path cannot be resolved", False
+    if str(resolved.parent) != _BLOCK_DIR:
+        return None, f"not a node directly under {_BLOCK_DIR}", False
+    if not _WHOLE_DISK_NAME.match(resolved.name):
+        return None, "not a SCSI disk node (sdX)", False
     try:
-        if not _stat.S_ISBLK(os.stat(resolved).st_mode):
-            return None
+        st = os.stat(resolved)
+    except FileNotFoundError:
+        return None, "device node does not exist yet", True
+    except (OSError, ValueError) as exc:
+        return None, f"cannot stat the node: {exc}", False
+    if not _stat.S_ISBLK(st.st_mode):
+        return None, "not a block device", False
+
+    number = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
+    try:
+        kernel = Path(os.path.realpath(f"{SYS_DEV_BLOCK}/{number}"))
+        registered = kernel.is_dir()
+        is_partition = registered and os.path.lexists(kernel / "partition")
     except (OSError, ValueError):
-        return None
-    return resolved
+        registered, is_partition = False, False
+    if not registered:
+        return None, f"the kernel has no block device {number} yet", True
+    if is_partition:
+        return None, f"the kernel reports {number} is a partition", False
+    if kernel.name != resolved.name:
+        return None, (f"device {number} is {kernel.name} to the kernel, "
+                      f"not {resolved.name}"), False
+    return resolved, "", False
+
+
+def _safe_block_node(path: str) -> Optional[Path]:
+    """A whole /dev/sdX disk, resolved. Never a partition. None otherwise."""
+    return _check_block_node(path)[0]
+
+
+def block_node_pending(path) -> Optional[str]:
+    """
+    Why the block node is not ready to open YET, or None.
+
+    None means waiting would not change anything: the node is ready, or it is
+    refused for good and open_block_device will say why. The daemon polls on
+    this after authorizing a device, because the sysfs `block/sdX` directory it
+    finds first is created before the /dev node is -- and opening in that gap
+    is what turned a whole disk into a refusal. Stat and sysfs reads only, so
+    it needs no privilege and no round trip through the gate.
+    """
+    _node, reason, transient = _check_block_node(path)
+    return reason if transient else None
 
 
 def _open_device_node(path, validator, what: str) -> int:
@@ -449,10 +521,17 @@ def _open_device_node(path, validator, what: str) -> int:
     pair of checks gate_server._do_open_input makes, for the same reason: the
     validation and the open are two separate syscalls, and /dev is populated
     by udev while this runs.
+
+    `validator` returns (node, reason, transient). A transient failure is
+    reported as what it is -- the node is not there yet -- and never as "not a
+    <what>", which would be a false statement about a healthy device.
     """
-    node = validator(path)
+    node, reason, transient = validator(path)
     if node is None:
-        raise OSError(f"refusing to open {str(path)!r}: not a {what}")
+        if transient:
+            raise OSError(f"cannot open {str(path)!r}: {reason}")
+        detail = f" ({reason})" if reason else ""
+        raise OSError(f"refusing to open {str(path)!r}: not a {what}{detail}")
     fd = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW |
                  os.O_CLOEXEC)
     try:
@@ -526,10 +605,12 @@ class _DirectBackend:
         _write_attr_pinned(hub, "authorized_default", str(value))
 
     def open_input(self, node_path) -> int:
-        return _open_device_node(node_path, _safe_input_node, "input node")
+        return _open_device_node(
+            node_path, lambda p: (_safe_input_node(p), "", False),
+            "input node")
 
     def open_block(self, device_path) -> int:
-        return _open_device_node(device_path, _safe_block_node,
+        return _open_device_node(device_path, _check_block_node,
                                  "whole-disk block device")
 
     def set_drivers_autoprobe(self, value: int) -> None:

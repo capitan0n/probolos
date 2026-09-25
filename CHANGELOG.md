@@ -97,6 +97,24 @@ but not groups.
   `whole-device <fs> filesystem (no partition table)`; `contains no known
   filesystem` is emitted only when no signature matches. Detection only — no
   rule, verdict or authorization path changed.
+- **Stage 4 refused healthy whole disks as "not a whole-disk block device".**
+  The whole-disk guard (`sysfs._safe_block_node`, mirrored by
+  `gate_server._safe_block_path`) answered `None` for every failure and folded
+  an `os.stat()` error into it, while the daemon's 1.5 s poll waited only for
+  the sysfs `block/sdX` entry — which the kernel creates before `/dev/sdX`. A
+  node opened in that gap was refused with a reason that was false about the
+  device, and the medium was "judged on its declared identity alone": stage 4
+  skipped for every mass-storage device that hit it. **The whole-disk guard is
+  now sysfs-based**: the node's own device number is looked up under
+  `/sys/dev/block`, a `partition` attribute there refuses it, and the kernel's
+  name for that number must be the node's name — no name suffix or minor-number
+  rule decides it. The `sdX` name check remains as scope (USB mass storage is
+  always a SCSI disk), not as the whole-disk test. Every refusal now states its
+  reason, a node that has not appeared yet is reported as exactly that, and the
+  daemon polls until the node is ready (`sysfs.block_node_pending`) rather than
+  until sysfs is. Genuinely unreadable media still take the transparent
+  "could not be read" notice. Detection only — no rule, verdict or
+  authorization path changed.
 
 ### Tests
 
@@ -112,6 +130,12 @@ but not groups.
 - `tests/test_partitionless_filesystems.py` covers the raw ISO 9660 regression
   and the acceptance cases around it: UDF, superfloppy FAT32/exFAT, MBR and GPT
   unchanged, a blank medium, and media too short to hold a descriptor.
+- `tests/test_whole_disk_guard.py` covers the whole-disk guard on a synthetic
+  `/dev` and `/sys/dev/block`: a whole disk on any device number is accepted
+  and opened, partitions are refused with the same notice, a late node is
+  reported as late and waited for, both halves of the privilege split give the
+  same verdicts, and stage 4 reaches the medium end to end. The earlier suite
+  only ever asserted refusals, so a guard that refused everything passed it.
 
 ## [0.9.0] — the audit
 

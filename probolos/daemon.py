@@ -686,15 +686,31 @@ class Probolos:
             # no block node is ever created for udisks2 to see. Until then the
             # window is kept as short as possible and the device is re-blocked
             # in the finally below the instant the read returns.
+            #
+            # The wait is for the NODE, not the sysfs entry. `block/sdX`
+            # appears in sysfs before /dev/sdX exists, and opening in that gap
+            # was refused as "not a whole-disk block device" -- a healthy disk
+            # sent down the could-not-read path, stage 4 skipped. So the loop
+            # keeps polling while the node is merely late
+            # (sysfs.block_node_pending), and stops the moment waiting would not
+            # help: ready, or refused for a reason open_block_device reports.
             devices = []
+            pending = None
             deadline = time.monotonic() + 1.5
-            while time.monotonic() < deadline and not devices:
+            while time.monotonic() < deadline:
                 devices = storage.find_block_devices(dev.syspath)
-                if not devices:
-                    time.sleep(0.02)
-            if devices:
+                if devices:
+                    pending = sysfs.block_node_pending(devices[0])
+                    if pending is None:
+                        break
+                time.sleep(0.02)
+            if devices and pending is None:
                 medium = storage.inspect_safely(
                     devices[0], open_fn=sysfs.open_block_device)
+            elif devices:
+                medium = storage.MediumReport(
+                    device=devices[0],
+                    error=f"{devices[0]} did not become ready: {pending}")
             else:
                 medium = storage.MediumReport(error="no block device appeared")
         finally:
