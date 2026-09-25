@@ -116,6 +116,23 @@ but not groups.
   "could not be read" notice. Detection only — no rule, verdict or
   authorization path changed.
 
+- **A forged ISO 9660 magic was reported as a filesystem.** Six bytes —
+  `01 "CD001" 01` at 0x8000 on a blank device — made stage 4 show
+  `whole-device ISO 9660 filesystem`, so an attacker-controlled medium chose
+  the label the operator saw. ISO 9660 is now reported only when the volume
+  structure checks out (ECMA-119): the descriptor set from sector 16 carries
+  defined types and versions and ends in a terminator within 16 descriptors; a
+  Primary Volume Descriptor is present and its both-byte-order fields agree
+  with themselves (volume space size, volume set size and sequence, logical
+  block size of 512–2048, path table size); its root directory record is a
+  directory inside the volume; the file structure version is 1; and the volume
+  fits on the device. UDF, the same bug class, now needs a BEA01 → NSR → TEA01
+  recognition sequence rather than a bare NSR identifier. Checked against
+  images from xorriso, genisoimage, pycdlib and mkudffs, all still recognised.
+  A signature with nothing behind it is not dropped silently: it raises the
+  new `filesystem-signature-without-structure` NOTICE. FAT, exFAT, NTFS, ext
+  and btrfs are unchanged and remain magic-only.
+
 ### Tests
 
 - `tests/test_payload.py` now exists. SECURITY.md said the three keystroke
@@ -136,6 +153,12 @@ but not groups.
   reported as late and waited for, both halves of the privilege split give the
   same verdicts, and stage 4 reaches the medium end to end. The earlier suite
   only ever asserted refusals, so a guard that refused everything passed it.
+- `tests/test_forged_signatures.py` covers the forged-magic decoy from the
+  report, one test per structural check, UDF sequence order, partitions, and
+  real images from whichever of xorriso, genisoimage and mkudffs is installed
+  (skipped when none is). Fixtures that meant "a real ISO 9660 / UDF volume"
+  planted the bare magic — the forgery itself — and now build a valid header
+  with `tests/_media.py`.
 
 ## [0.9.0] — the audit
 

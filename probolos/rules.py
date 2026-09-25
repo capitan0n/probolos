@@ -842,6 +842,21 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
             "instruction rather than a description. Honest media do not "
             "produce this.")
 
+    # -- 0b. A filesystem signature with nothing behind it ------------------
+    # The signature is not reported as a filesystem (storage.identify_
+    # filesystem refuses it), but silently dropping it would repeat the
+    # mistake above: a check that ran and told nobody. Bytes that name a
+    # filesystem which is not there are the medium disagreeing with itself.
+    hollow = getattr(report, "hollow_signatures", None)
+    if hollow:
+        add("filesystem-signature-without-structure", Severity.NOTICE,
+            "A filesystem signature is present without the filesystem",
+            f"{'; '.join(hollow[:4])}. The identifying bytes are there but "
+            "the volume structure they introduce is not, so the medium is not "
+            "reported as that filesystem. Ordinary formatting does not produce "
+            "this. Corruption can, and so can bytes planted to make the medium "
+            "look like something it is not.")
+
     partitions = [p for p in report.partitions
                   if p.type_byte != storage_mod.PROTECTIVE_MBR_TYPE]
     size = report.size_sectors

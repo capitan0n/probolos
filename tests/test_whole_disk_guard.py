@@ -30,6 +30,7 @@ from unittest import mock
 
 from probolos import daemon as daemon_mod
 from probolos import gate_server, report, rules, session, storage, sysfs
+from tests import _media
 
 SCSI_DEVICE = "devices/pci0000:00/0000:00:14.0/usb3/3-9/3-9:1.0/host1/" \
               "target1:0:0/1:0:0:0"
@@ -228,8 +229,7 @@ class Stage4ReachesTheMedium(_TreeCase):
                                           open_fn=sysfs.open_block_device)
 
     def test_whole_device_iso9660_is_reported(self):
-        data = bytearray(self.SECTORS * 512)
-        data[0x8000:0x8006] = b"\x01CD001"
+        data = _media.iso9660_image(self.SECTORS * 512)
         medium = self._inspect(bytes(data))
         self.assertIsNone(medium.error)
         self.assertIn("whole-device ISO 9660 filesystem (no partition table)",

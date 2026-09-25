@@ -15,6 +15,7 @@ from unittest import mock
 
 from probolos import report as report_mod
 from probolos import rules, storage
+from tests import _media
 
 IMAGE_BYTES = 128 * 1024
 
@@ -44,47 +45,38 @@ class PartitionlessMedia(unittest.TestCase):
     # -- 1. the regression ---------------------------------------------------
 
     def test_raw_iso9660_image_is_recognised(self):
-        """LBA 0 all zeros, PVD "CD001" at 0x8000: the Slax stick."""
-        data = bytearray(IMAGE_BYTES)
-        data[0x8000:0x8010] = b"\x01CD001\x01\x00LINUX   "
+        """LBA 0 all zeros, a real PVD set from 0x8000: the Slax stick."""
+        data = _media.iso9660_image(IMAGE_BYTES)
         report = self._inspect(data)
         self.assertIsNone(report.error)
         self.assertEqual(report.scheme, "none")
         self.assertEqual(report.signatures.get(-1), "ISO 9660")
 
     def test_rendered_report_no_longer_says_no_known_filesystem(self):
-        data = bytearray(IMAGE_BYTES)
-        data[0x8000:0x8006] = b"\x01CD001"
+        data = _media.iso9660_image(IMAGE_BYTES)
         text = report_mod.render_medium(self._inspect(data), [])
         self.assertIn("whole-device ISO 9660 filesystem", text)
         self.assertNotIn("no known", text)
 
     def test_isohybrid_with_mbr_boot_code_but_no_partitions(self):
         """Boot code and 0x55AA in the system area, empty partition table."""
-        data = bytearray(IMAGE_BYTES)
+        data = _media.iso9660_image(IMAGE_BYTES)
         data[0:4] = b"\xeb\x63\x90\x00"
         data[510:512] = b"\x55\xaa"
-        data[0x8000:0x8006] = b"\x01CD001"
         self.assertEqual(self._inspect(data).signatures.get(-1), "ISO 9660")
 
     def test_udf_is_recognised(self):
-        data = bytearray(IMAGE_BYTES)
-        data[0x8000:0x8006] = b"\x00BEA01"
-        data[0x8800:0x8806] = b"\x00NSR02"
-        data[0x9000:0x9006] = b"\x00TEA01"
+        data = _media.image(IMAGE_BYTES, 0x8000, _media.udf_vrs())
         self.assertEqual(self._inspect(data).signatures.get(-1), "UDF")
 
     def test_udf_with_4k_blocks_is_recognised(self):
-        data = bytearray(IMAGE_BYTES)
-        data[0x8000:0x8006] = b"\x00BEA01"
-        data[0x9000:0x9006] = b"\x00NSR03"
+        data = _media.image(IMAGE_BYTES, 0x8000,
+                            _media.udf_vrs(stride=0x1000, nsr=b"NSR03"))
         self.assertEqual(self._inspect(data).signatures.get(-1), "UDF")
 
     def test_udf_iso_bridge_is_reported_as_both(self):
-        data = bytearray(IMAGE_BYTES)
-        data[0x8000:0x8006] = b"\x01CD001"
-        data[0x8800:0x8806] = b"\x00BEA01"
-        data[0x9000:0x9006] = b"\x00NSR02"
+        data = _media.image(IMAGE_BYTES, 0x8000,
+                            _media.iso9660_descriptors(), _media.udf_vrs())
         self.assertEqual(self._inspect(data).signatures.get(-1),
                          "UDF (ISO 9660 bridge)")
 
@@ -143,8 +135,7 @@ class PartitionlessMedia(unittest.TestCase):
         self.assertIn("contains no known filesystem", text)
 
     def test_raw_iso_raises_no_storage_findings(self):
-        data = bytearray(IMAGE_BYTES)
-        data[0x8000:0x8006] = b"\x01CD001"
+        data = _media.iso9660_image(IMAGE_BYTES)
         self.assertEqual(rules.storage_findings(self._inspect(data)), [])
 
     # -- 7. short media and the read path ------------------------------------
@@ -163,8 +154,7 @@ class PartitionlessMedia(unittest.TestCase):
 
     def test_second_read_uses_the_same_descriptor(self):
         """Under --privsep there is exactly one fd; nothing may reopen."""
-        data = bytearray(IMAGE_BYTES)
-        data[0x8000:0x8006] = b"\x01CD001"
+        data = _media.iso9660_image(IMAGE_BYTES)
         path = os.path.join(self.tmp, "disk.img")
         with open(path, "wb") as fh:
             fh.write(bytes(data))
@@ -182,8 +172,7 @@ class PartitionlessMedia(unittest.TestCase):
         self.assertEqual(report.signatures.get(-1), "ISO 9660")
 
     def test_inspect_safely_path(self):
-        data = bytearray(IMAGE_BYTES)
-        data[0x8000:0x8006] = b"\x01CD001"
+        data = _media.iso9660_image(IMAGE_BYTES)
         path = os.path.join(self.tmp, "disk.img")
         with open(path, "wb") as fh:
             fh.write(bytes(data))
@@ -194,8 +183,7 @@ class PartitionlessMedia(unittest.TestCase):
 class SniffOptical(unittest.TestCase):
 
     def test_iso_signature(self):
-        data = bytearray(0x8800)
-        data[0x8000:0x8006] = b"\x01CD001"
+        data = _media.iso9660_image(storage.PARTITION_SNIFF_READ)
         self.assertEqual(storage.sniff_filesystem(bytes(data)), "ISO 9660")
 
     def test_header_sized_buffer_cannot_see_iso(self):

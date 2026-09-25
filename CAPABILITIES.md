@@ -97,12 +97,16 @@ payload analyzer.
 
 Read-only inspection of the first sectors of a USB block device (`storage.py`):
 MBR entries and GPT header/protective-MBR detection, with limited filesystem
-signatures. GPT entries are not parsed. Probolos does not mount or write the
+signatures. ISO 9660 and UDF are reported only when their volume structure
+checks out (ISO 9660: descriptor set, PVD both-byte-order fields, root
+directory record, size; UDF: the recognition sequence), not on the magic
+alone; the other signatures are still magic-only. GPT entries are not parsed. Probolos does not mount or write the
 medium; other services can still mount it during activation.
 
 - `partition-beyond-end-of-device` (WARNING)
 - `overlapping-partitions` (WARNING)
 - `filesystem-type-mismatch` (NOTICE)
+- `filesystem-signature-without-structure` (NOTICE)
 - `large-unallocated-gap` (NOTICE)
 - `gpt-without-protective-mbr` (NOTICE)
 

@@ -22,6 +22,7 @@ where the medium disagrees with itself.
     * a partition that extends past the end of the device
     * partitions that overlap each other
     * a filesystem signature that does not match the declared partition type
+    * a filesystem signature with no filesystem behind it (ISO 9660, UDF)
     * a GPT that disagrees with its own protective MBR
     * an unusually large unallocated gap before the first partition
 
@@ -44,7 +45,7 @@ import re as _re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import storage_hardening
 
@@ -75,6 +76,23 @@ OPTICAL_VD_STRIDE = 0x800
 ISO9660_ID = b"CD001"
 UDF_NSR_IDS = (b"NSR02", b"NSR03")
 
+# A signature is five bytes anyone can write. ISO 9660 and UDF are only
+# reported when the structure those bytes introduce is actually there, walked
+# within a fixed bound: 16 descriptors of 2 KiB end at 0x10000, inside
+# PARTITION_SNIFF_READ, so the check never reads further than the sniff did.
+OPTICAL_MAX_DESCRIPTORS = 16
+ISO_VD_BOOT, ISO_VD_PRIMARY, ISO_VD_SUPPLEMENTARY, ISO_VD_PARTITION = 0, 1, 2, 3
+ISO_VD_TERMINATOR = 0xFF
+# ECMA-119 6.2.2: a logical block is 2^(n+9) bytes and no larger than the
+# 2048-byte logical sector, so 512, 1024 or 2048 -- never 4096.
+ISO_BLOCK_SIZES = (512, 1024, 2048)
+# ECMA-167 2/9.1: every descriptor in the Volume Recognition Sequence is
+# structure type 0, version 1, and occupies max(2048, block size) bytes, so the
+# sequence is walked at a 2 KiB and at a 4 KiB stride.
+UDF_VRS_IDS = (ISO9660_ID, b"CDW02", b"BEA01", b"NSR02", b"NSR03",
+               b"TEA01", b"BOOT2")
+UDF_VRS_STRIDES = (0x800, 0x1000)
+
 # Partition type bytes seen on ordinary removable media.
 FAT_TYPES = {0x01, 0x04, 0x06, 0x0B, 0x0C, 0x0E}
 NTFS_EXFAT_TYPES = {0x07}
@@ -104,6 +122,10 @@ class MediumReport:
     partitions: List[Partition] = field(default_factory=list)
     signatures: dict = field(default_factory=dict)  # partition index -> fs name
     suspicious: List[str] = field(default_factory=list)  # impossible/hostile partitions
+    # A filesystem signature found WITHOUT the structure it introduces: where,
+    # and why the structure was rejected. Such a signature is not reported as a
+    # filesystem; rules.storage_findings turns these into a finding instead.
+    hollow_signatures: List[str] = field(default_factory=list)
     error: Optional[str] = None
 
     @property
@@ -217,30 +239,43 @@ def parse_gpt_header(data: bytes) -> Optional[dict]:
     }
 
 
-def sniff_filesystem(data: bytes) -> Optional[str]:
+def sniff_filesystem(data: bytes,
+                     limit_bytes: Optional[int] = None) -> Optional[str]:
+    """The filesystem identify_filesystem() finds, without its note."""
+    return identify_filesystem(data, limit_bytes)[0]
+
+
+def identify_filesystem(data: bytes, limit_bytes: Optional[int] = None
+                        ) -> Tuple[Optional[str], Optional[str]]:
     """
-    Identify a filesystem from its signature bytes alone.
+    Identify a filesystem: (name, note).
+
+    `name` is None when nothing is recognised. `note` is set when a signature
+    WAS present but the structure behind it is not -- the case a planted magic
+    produces -- and says why; the signature is then not reported as a
+    filesystem. `limit_bytes` is how much device there is from `data`'s start,
+    when known: a volume claiming more space than that does not fit on it.
 
     Signature matching only -- no structure is followed, no length inside the
     image is trusted. The point is to compare what the medium CLAIMS in its
     partition table against what is actually written there.
     """
     if len(data) < 512:
-        return None
+        return None, None
     if data[3:11] in (b"NTFS    ",):
-        return "NTFS"
+        return "NTFS", None
     if data[3:11] == b"EXFAT   ":
-        return "exFAT"
+        return "exFAT", None
     if data[54:59] == b"FAT12":
-        return "FAT12"
+        return "FAT12", None
     if data[54:59] == b"FAT16":
-        return "FAT16"
+        return "FAT16", None
     if data[82:87] == b"FAT32":
-        return "FAT32"
+        return "FAT32", None
     if len(data) > 0x438 + 2:
         magic = struct.unpack_from("<H", data, 0x438)[0]
         if magic == 0xEF53:
-            return "ext2/3/4"
+            return "ext2/3/4", None
     # btrfs: the magic is 8 bytes at 0x10040 (superblock offset 0x10000 + 0x40).
     #
     # Two dead comparisons used to sit here. One sliced FOUR bytes and compared
@@ -253,34 +288,180 @@ def sniff_filesystem(data: bytes) -> Optional[str]:
     # Only reachable with a buffer that contains the btrfs superblock, which is
     # why inspect() reads PARTITION_SNIFF_READ bytes per partition.
     if len(data) >= 0x10048 and data[0x10040:0x10048] == b"_BHRfS_M":
-        return "btrfs"
+        return "btrfs", None
     # Optical images: ISO 9660 and UDF, from sector 16 (0x8000). Checked after
     # every LBA-0 signature, because the 32 KiB system area in front of the
     # descriptors is the medium's to use: an isohybrid image keeps an MBR in
     # it, and a FAT boot sector there is what the medium is actually booted as.
-    return _sniff_optical(data)
+    return _identify_optical(data, limit_bytes)
 
 
-def _sniff_optical(data: bytes) -> Optional[str]:
+def _identify_optical(data: bytes, limit_bytes: Optional[int]
+                      ) -> Tuple[Optional[str], Optional[str]]:
     """
-    ISO 9660 / UDF volume descriptors, matched by identifier only.
+    ISO 9660 / UDF, reported only when the volume structure checks out.
 
-    Nothing inside a descriptor is followed. UDF is judged by an NSR
-    descriptor anywhere in the recognition area (2 KiB stride covers both
-    2 KiB and 4 KiB block sizes); BEA01 alone only opens the sequence and does
-    not name a filesystem. A UDF/ISO 9660 bridge image carries both and is
-    reported as UDF, the structure a modern reader actually uses -- the same
-    choice blkid makes.
+    THE MAGIC IS NOT THE FILESYSTEM
+    -------------------------------
+    This used to answer "ISO 9660" for the five bytes CD001 at 0x8001, and
+    "UDF" for NSR02 anywhere in the area. Six bytes written to a blank stick
+    made stage 4 show the operator a "whole-device ISO 9660 filesystem" -- the
+    medium dictating its own label, in a tool whose premise is that the medium
+    is hostile. Both are now walked as structures (see _iso9660_problem and
+    _udf_vrs_problem). Nothing is followed outside the bytes already read, and
+    no length the medium states is used to index anything.
+
+    A UDF/ISO 9660 bridge image carries both and is reported as UDF, the
+    structure a modern reader actually uses -- the same choice blkid makes.
     """
     if len(data) < OPTICAL_VD_START + 6:
-        return None
-    iso = data[OPTICAL_VD_START + 1:OPTICAL_VD_START + 6] == ISO9660_ID
-    for off in range(OPTICAL_VD_START, len(data) - 5, OPTICAL_VD_STRIDE):
-        if data[off] == 0 and data[off + 1:off + 6] in UDF_NSR_IDS:
-            return "UDF (ISO 9660 bridge)" if iso else "UDF"
-    if iso:
-        return "ISO 9660"
+        return None, None
+    notes = []
+
+    iso_ok = False
+    if data[OPTICAL_VD_START + 1:OPTICAL_VD_START + 6] == ISO9660_ID:
+        problem = _iso9660_problem(data, limit_bytes)
+        iso_ok = problem is None
+        if problem:
+            notes.append(f"ISO 9660 signature at sector 16, but {problem}")
+
+    udf_ok = False
+    if _udf_nsr_present(data):
+        problem = _udf_vrs_problem(data)
+        udf_ok = problem is None
+        if problem:
+            notes.append(f"UDF signature present, but {problem}")
+
+    if udf_ok:
+        name = "UDF (ISO 9660 bridge)" if iso_ok else "UDF"
+    elif iso_ok:
+        name = "ISO 9660"
+    else:
+        name = None
+    return name, ("; ".join(notes) or None)
+
+
+def _both_endian(vd: bytes, offset: int, width: int) -> Optional[int]:
+    """
+    An ECMA-119 both-byte-order field: `width` bytes little-endian, then the
+    same value big-endian. None when the two halves disagree -- which no
+    mastering tool writes and a forger has to get right on purpose.
+    """
+    le = int.from_bytes(vd[offset:offset + width], "little")
+    be = int.from_bytes(vd[offset + width:offset + 2 * width], "big")
+    return le if le == be else None
+
+
+def _iso9660_problem(data: bytes, limit_bytes: Optional[int]) -> Optional[str]:
+    """
+    Why this is not an ISO 9660 volume, or None if it is one (ECMA-119).
+
+    1. The Volume Descriptor Set, walked from sector 16: every descriptor
+       carries CD001 and a defined type and version, and the set ends in a
+       Terminator within OPTICAL_MAX_DESCRIPTORS.
+    2. A Primary Volume Descriptor is in it, and its both-byte-order fields
+       agree with themselves: volume space size, volume set size and sequence
+       number, logical block size, path table size.
+    3. The PVD's root directory record is a directory record: 34 bytes, the
+       directory flag set, an extent inside the volume.
+    4. The volume fits on the device it is on.
+    """
+    pvd = None
+    for index in range(OPTICAL_MAX_DESCRIPTORS):
+        start = OPTICAL_VD_START + index * OPTICAL_VD_STRIDE
+        vd = data[start:start + OPTICAL_VD_STRIDE]
+        sector = 16 + index
+        if len(vd) < OPTICAL_VD_STRIDE:
+            return (f"the descriptor set is cut off at sector {sector} "
+                    f"(end of device)")
+        if vd[1:6] != ISO9660_ID:
+            return f"sector {sector} ends the descriptor set without a terminator"
+        vtype, version = vd[0], vd[6]
+        if vtype == ISO_VD_TERMINATOR:
+            if version != 1:
+                return f"the terminator at sector {sector} has version {version}"
+            break
+        if vtype == ISO_VD_SUPPLEMENTARY:
+            # 2 is the ISO 9660:1999 Enhanced Volume Descriptor.
+            if version not in (1, 2):
+                return f"descriptor at sector {sector} has version {version}"
+        elif vtype in (ISO_VD_BOOT, ISO_VD_PRIMARY, ISO_VD_PARTITION):
+            if version != 1:
+                return f"descriptor at sector {sector} has version {version}"
+            if vtype == ISO_VD_PRIMARY and pvd is None:
+                pvd = vd
+        else:
+            return f"descriptor at sector {sector} has undefined type {vtype}"
+    else:
+        return (f"no set terminator within {OPTICAL_MAX_DESCRIPTORS} "
+                f"descriptors")
+    if pvd is None:
+        return "the descriptor set has no primary volume descriptor"
+
+    blocks = _both_endian(pvd, 80, 4)
+    if not blocks:
+        return "the volume space size is zero or its two encodings disagree"
+    set_size = _both_endian(pvd, 120, 2)
+    sequence = _both_endian(pvd, 124, 2)
+    if not set_size or not sequence or sequence > set_size:
+        return "the volume set size and sequence number are inconsistent"
+    block_size = _both_endian(pvd, 128, 2)
+    if block_size not in ISO_BLOCK_SIZES:
+        return "the logical block size is invalid or its encodings disagree"
+    if not _both_endian(pvd, 132, 4):
+        return "the path table size is zero or its encodings disagree"
+
+    root = pvd[156:190]
+    extent = _both_endian(root, 2, 4)
+    length = _both_endian(root, 10, 4)
+    if (root[0] != 34 or not (root[25] & 0x02) or root[32] != 1
+            or not extent or not length or extent >= blocks):
+        return "the root directory record is not a valid directory record"
+    if pvd[881] != 1:
+        return "the file structure version is not 1"
+
+    if limit_bytes is not None and blocks * block_size > limit_bytes:
+        return (f"the volume claims {blocks * block_size} bytes where the "
+                f"device has {limit_bytes}")
     return None
+
+
+def _udf_nsr_present(data: bytes) -> bool:
+    """An NSR02/NSR03 identifier anywhere in the recognition area."""
+    end = min(len(data) - 5,
+              OPTICAL_VD_START + OPTICAL_MAX_DESCRIPTORS * OPTICAL_VD_STRIDE)
+    return any(data[off + 1:off + 6] in UDF_NSR_IDS
+               for off in range(OPTICAL_VD_START, end, OPTICAL_VD_STRIDE))
+
+
+def _udf_vrs_problem(data: bytes) -> Optional[str]:
+    """
+    Why this is not a UDF Volume Recognition Sequence, or None (ECMA-167).
+
+    The sequence is consecutive descriptors from 0x8000, each structure type 0
+    and version 1 (ISO 9660 descriptors excepted, which a bridge image puts
+    first), ending at the first slot that is not a recognition descriptor. UDF
+    requires BEA01, then NSR02 or NSR03, then TEA01, in that order. This is the
+    check the kernel's udf_check_vsd() makes before looking any further; the
+    anchor at sector 256 lies beyond what stage 4 reads and is not checked.
+    """
+    for stride in UDF_VRS_STRIDES:
+        state = "start"
+        for index in range(OPTICAL_MAX_DESCRIPTORS):
+            off = OPTICAL_VD_START + index * stride
+            ident = data[off + 1:off + 6]
+            if len(ident) < 5 or ident not in UDF_VRS_IDS:
+                break
+            if ident != ISO9660_ID and (data[off] != 0 or data[off + 6] != 1):
+                break
+            if ident == b"BEA01" and state == "start":
+                state = "extended"
+            elif ident in UDF_NSR_IDS and state == "extended":
+                state = "nsr"
+            elif ident == b"TEA01" and state == "nsr":
+                return None
+        # fall through to the next stride
+    return "no BEA01, NSR, TEA01 recognition sequence surrounds it"
 
 
 def _inspect_worker(device: str, conn, fd=None) -> None:
@@ -465,9 +646,14 @@ def inspect(device: str, open_fn=None) -> MediumReport:
             # A short or failed read simply means "signature absent".
             report.scheme = "none"
             chunk = _read_at(fd, 0, PARTITION_SNIFF_READ)
-            fs = sniff_filesystem(chunk if len(chunk) > len(data) else data)
+            limit = (report.size_sectors * SECTOR
+                     if report.size_sectors else None)
+            fs, note = identify_filesystem(
+                chunk if len(chunk) > len(data) else data, limit)
             if fs:
                 report.signatures[-1] = fs
+            if note:
+                report.hollow_signatures.append(f"whole device: {note}")
             return report
 
         # HARDENING (2/3): split the table into partitions that can be read and
@@ -501,9 +687,17 @@ def inspect(device: str, open_fn=None) -> MediumReport:
                 continue
             chunk = _read_at(fd, offset, PARTITION_SNIFF_READ)
             if chunk:
-                fs = sniff_filesystem(chunk)
+                # Bounded by the end of the DEVICE, not of the partition: the
+                # partition length is the medium's own claim, the device size
+                # is not.
+                limit = ((report.size_sectors - part.start_lba) * SECTOR
+                         if report.size_sectors else None)
+                fs, note = identify_filesystem(chunk, limit)
                 if fs:
                     report.signatures[part.index] = fs
+                if note:
+                    report.hollow_signatures.append(
+                        f"partition {part.index + 1}: {note}")
 
         return report
     finally:
