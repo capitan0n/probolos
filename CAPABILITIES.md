@@ -103,6 +103,20 @@ directory record, size; UDF: the recognition sequence), not on the magic
 alone; the other signatures are still magic-only. GPT entries are not parsed. Probolos does not mount or write the
 medium; other services can still mount it during activation.
 
+Recognised filesystems are a fixed internal set (NTFS, exFAT, FAT12/16/32,
+ext2/3/4, btrfs, ISO 9660, UDF); detection does not delegate to libblkid.
+f2fs, minix and squashfs, among others, read as "no known filesystem" — the
+same string a medium with no structure at all produces. The stage 4 result is
+**contextual, not a gate criterion**: a device can also force the
+identity-only path by delaying its block node past the poll window. Admission
+rests on stages 1–2.
+
+Every inspection failure (switch-on refused, no block node, node never ready,
+unreadable or stalled read, removal mid-scan, re-block refused) is reported the
+same way: `not inspected: <reason>` in the MEDIUM block plus the
+`storage-unreadable` notice. The reason shown is from a fixed vocabulary; the
+raw error text and paths go to the JSON audit log (`medium.detail`) only.
+
 - `partition-beyond-end-of-device` (WARNING)
 - `overlapping-partitions` (WARNING)
 - `filesystem-type-mismatch` (NOTICE)

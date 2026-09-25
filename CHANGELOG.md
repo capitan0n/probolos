@@ -16,6 +16,17 @@ but not groups.
 
 ### Fixed — security
 
+- **A medium that could not be switched on was never reported as unexamined.**
+  If the sysfs write that activates a storage device for stage 4 failed —
+  typically a device re-enumerating or pulled mid-inspection — the raw
+  exception, errno text and full sysfs path included, was printed at the
+  decision prompt and the stage returned nothing: no MEDIUM block, no
+  "judged on its declared identity alone" notice. The same root cause arriving
+  one step later (no block node) produced the correct notice. Every stage 4
+  failure now goes through one handler (`Probolos._medium_not_examined`): the
+  operator sees a fixed-vocabulary reason and the identity-only warning, a
+  device that has vanished is reported as removed whichever step noticed, and
+  the raw detail is written to the JSON audit log only.
 - **The direct backend opened any device node it was handed.** `gate_server`
   refuses anything that is not `/dev/input/eventN` or a whole `/dev/sdX`,
   proves the node is the right kind of special file, and opens it

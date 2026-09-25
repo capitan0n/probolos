@@ -30,6 +30,21 @@ None of these are proof of anything. All of them are things a person formatting
 a USB stick normally does not produce, and the first two are impossible on
 honestly-made media.
 
+WHAT IT RECOGNISES, AND WHAT THAT IS WORTH
+------------------------------------------
+Filesystem detection is a fixed, hand-written set of magics -- NTFS, exFAT,
+FAT12/16/32, ext2/3/4, btrfs, ISO 9660, UDF -- not a libblkid passthrough.
+Anything else (f2fs, minix, squashfs, ...) is reported as "no known
+filesystem", which libblkid on the same host may well identify. That verdict
+therefore collapses a legitimate but unlisted format and a medium carrying no
+structure at all into one string, and must not carry policy weight.
+
+The whole stage is also skippable by the device: the medium is read only if the
+block node appears within the poll window, and how long that takes is partly up
+to the device (a slow READ CAPACITY, medium-not-ready). A hostile device can
+force the "judged on declared identity alone" path at will. The medium result
+is context for the operator; the admission decision rests on stages 1-2.
+
 WHAT IT DELIBERATELY DOES NOT DO
 --------------------------------
 It does not walk directories, read files, or look for autorun.inf and friends.
@@ -126,7 +141,13 @@ class MediumReport:
     # and why the structure was rejected. Such a signature is not reported as a
     # filesystem; rules.storage_findings turns these into a finding instead.
     hollow_signatures: List[str] = field(default_factory=list)
+    # `error` is operator-facing: a short reason from a fixed vocabulary, shown
+    # in the MEDIUM block and the "could not be read" finding. `detail` is the
+    # raw diagnostic behind it (exception text, device paths) and goes to the
+    # JSON audit log ONLY -- it is never rendered at the decision prompt.
     error: Optional[str] = None
+    detail: Optional[str] = None
+    timed_out: bool = False
 
     @property
     def inspected(self) -> bool:
@@ -539,7 +560,8 @@ def inspect_safely(device: str, timeout: float = 10.0,
             return MediumReport(
                 device=device,
                 error=f"device did not respond within {timeout:.0f}s -- "
-                      f"inspection abandoned")
+                      f"inspection abandoned",
+                timed_out=True)
         if parent_conn.poll():
             kind, payload = parent_conn.recv()
             return payload if kind == "ok" else MediumReport(device=device,

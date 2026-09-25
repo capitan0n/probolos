@@ -285,6 +285,24 @@ verdict this tool never wrote, next to the Allow button. The terminal and
 tkinter backends deliberately do **not** escape: `<` and `&` are ordinary
 characters there, and a legitimate name like `A<B & C>D` must display as typed.
 
+## What the stage 4 verdict can and cannot carry
+
+The medium verdict is context, not a gate input. Two measured reasons:
+
+- **Coverage is a fixed known-set.** Filesystems outside it (f2fs, minix,
+  squashfs, ...) read as "no known filesystem", indistinguishable from a
+  medium with no recognisable structure.
+- **The device controls whether it is read at all.** The block node must
+  appear within the poll window, and the time to get there depends on the
+  device (a slow READ CAPACITY, medium-not-ready). In testing a replug fell
+  back to "judged on declared identity alone" at a 1 s interval and succeeded
+  at 3 s. A hostile device can force that fallback deterministically.
+
+The load-bearing checks are stages 1–2 (identity and consistency). Whether
+fs detection should grow (f2fs is the obvious candidate, being a mainstream
+flash filesystem) depends on whether it is ever meant to inform policy; as
+long as it is not, the known-set above is the documented boundary.
+
 ## Storage read deadlines and remaining limits
 
 Stage 4 reads the raw medium, and a device can stall a read indefinitely —

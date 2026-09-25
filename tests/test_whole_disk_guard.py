@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import io
+import json
 import os
 import stat
 import tempfile
@@ -287,7 +288,102 @@ class DaemonWaitsForTheNode(unittest.TestCase):
             lambda _p: "device node does not exist yet")
         scan.assert_not_called()
         self.assertIn("did not become ready", medium.error)
-        self.assertIn("does not exist yet", medium.error)
+        # The node path and the pending reason are audit detail, not prompt text.
+        self.assertNotIn("/dev/sda", medium.error)
+        self.assertIn("does not exist yet", medium.detail)
+
+
+class EveryMediumFailureTakesOnePath(unittest.TestCase):
+    """
+    Removal during inspection reached the operator two ways. When the switch-on
+    write failed, the raw FileNotFoundError -- with the full sysfs path -- was
+    printed at the prompt and no MEDIUM block or identity-only notice followed.
+    When the block node never appeared, both were shown. Every failure now
+    converges on the second behaviour, with the raw detail kept for the log.
+    """
+
+    SYSPATH_LEAK = "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-9"
+
+    def setUp(self):
+        self.engine = daemon_mod.Probolos(
+            monitor=session.AlwaysUnlocked(), observe=0, inspect_storage=True)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dev = types.SimpleNamespace(syspath=Path(tmp.name), name="3-9")
+
+    def _switch_on_fails(self):
+        def refuse(_path, value):
+            if value == 1:
+                raise FileNotFoundError(2, "No such file or directory",
+                                        self.SYSPATH_LEAK)
+        out = io.StringIO()
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized", refuse), \
+             contextlib.redirect_stdout(out):
+            medium = self.engine._inspect_medium(self.dev)
+        return medium, out.getvalue()
+
+    def _assert_unexamined_and_clean(self, medium, printed):
+        self.assertIsNotNone(medium)
+        rendered = " ".join(
+            report.render_medium(medium, rules.storage_findings(medium)).split())
+        shown = printed + rendered
+        self.assertIn("not inspected", rendered)
+        self.assertIn("judged on its declared identity alone", rendered)
+        self.assertNotIn(self.SYSPATH_LEAK, shown)
+        self.assertNotIn("Errno", shown)
+
+    def test_a_refused_switch_on_is_reported_as_unexamined(self):
+        medium, printed = self._switch_on_fails()
+        self._assert_unexamined_and_clean(medium, printed)
+        self.assertIn("switched on", medium.error)
+        self.assertIn(self.SYSPATH_LEAK, medium.detail)
+
+    def test_a_device_gone_by_then_is_reported_as_removed(self):
+        self.dev.syspath = Path(self.dev.syspath) / "gone"
+        medium, printed = self._switch_on_fails()
+        self._assert_unexamined_and_clean(medium, printed)
+        self.assertEqual(medium.error,
+                         "the device was removed during inspection")
+
+    def test_a_raw_read_error_stays_out_of_the_prompt(self):
+        raw = storage.MediumReport(
+            device="/dev/sda",
+            error="[Errno 5] Input/output error: '/dev/sda'")
+        out = io.StringIO()
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(daemon_mod.storage, "find_block_devices",
+                               return_value=["/dev/sda"]), \
+             mock.patch.object(daemon_mod.sysfs, "block_node_pending",
+                               return_value=None), \
+             mock.patch.object(daemon_mod.storage, "inspect_safely",
+                               return_value=raw), \
+             contextlib.redirect_stdout(out):
+            medium = self.engine._inspect_medium(self.dev)
+        self._assert_unexamined_and_clean(medium, out.getvalue())
+        self.assertNotIn("/dev/sda", medium.error)
+        self.assertIn("Input/output error", medium.detail)
+
+    def test_the_warning_survives_the_rule_being_disabled(self):
+        medium, _printed = self._switch_on_fails()
+        rendered = " ".join(report.render_medium(medium, []).split())
+        self.assertIn("judged on declared identity alone", rendered)
+
+    def test_the_detail_reaches_the_audit_log(self):
+        medium, _printed = self._switch_on_fails()
+        dev = mock.Mock(name="dev", vendor_id="058f", product_id="6387",
+                        manufacturer="m", product="p", serial="s",
+                        claims=[], kinds=[])
+        dev.name = "3-9"
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "audit.jsonl"
+            self.engine.json_log = log
+            self.engine.ledger = None
+            self.engine._record(
+                daemon_mod.Decision(dev, False, "user rejected", 0.0),
+                rules.storage_findings(medium), medium)
+            entry = json.loads(log.read_text().splitlines()[-1])
+        self.assertFalse(entry["medium"]["examined"])
+        self.assertIn(self.SYSPATH_LEAK, entry["medium"]["detail"])
 
 
 if __name__ == "__main__":

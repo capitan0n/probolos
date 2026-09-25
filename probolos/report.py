@@ -218,6 +218,12 @@ def render_medium(medium, findings: Sequence[rules.Finding]) -> str:
 
     if medium.error:
         out.append(INDENT + _dim(f"not inspected: {medium.error}"))
+        # The "could not be read" finding carries this warning. If that rule
+        # is disabled in the config, the block itself still has to say that
+        # the contents were never looked at.
+        if not any(f.rule_id == "storage-unreadable" for f in findings):
+            out.append(INDENT + _dim("contents not examined; judged on "
+                                     "declared identity alone"))
     else:
         size = medium.size_sectors
         if size:

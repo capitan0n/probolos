@@ -424,6 +424,7 @@ class Probolos:
         # timeout. Long enough for NetworkManager to DHCP a hostile gateway.
         # The medium is read only when storage is ALL the device declares.
         storage_only = set(dev.kinds) == {usbclass.KIND_STORAGE}
+        medium = None
         if (complete and self.inspect_storage and storage_only
                 and not has_input):
             # BOTH guards are needed and they do different jobs. The timeout
@@ -484,10 +485,11 @@ class Probolos:
             except OSError as exc:
                 print(f"[!] failed to authorize: {exc}\n")
                 self._record(Decision(dev, False, "admission failed", time.time()),
-                             findings)
+                             findings, medium)
                 return
             self.known.add(dev.name)
-            self._record(Decision(dev, True, "user approved", time.time()), findings)
+            self._record(Decision(dev, True, "user approved", time.time()),
+                         findings, medium)
             if getattr(self, "_remember", False) and self.trust is not None:
                 entry = self.trust.trust(dev)
                 if entry is not None:
@@ -501,7 +503,7 @@ class Probolos:
             # switched on for the observation and is alive right now. For every
             # other device it is a no-op that makes the state explicit.
             self._record(Decision(dev, False, "user rejected", time.time()),
-                         findings)
+                         findings, medium)
             try:
                 sysfs.set_authorized(dev.syspath, 0)
             except OSError as exc:
@@ -666,8 +668,15 @@ class Probolos:
         try:
             sysfs.set_authorized(dev.syspath, 1)
         except OSError as exc:
-            print(f"  (could not switch it on to look: {exc})")
-            return None
+            # This used to print the raw exception -- errno text and the full
+            # sysfs path -- at the decision prompt and return None, so no
+            # MEDIUM block and no "judged on identity alone" notice followed:
+            # the operator was asked to authorize with nothing saying the
+            # medium had never been looked at. It now takes the same path as
+            # every other failure below.
+            return self._medium_not_examined(
+                dev, "it could not be switched on to look",
+                detail=f"{type(exc).__name__}: {exc}")
 
         medium = None
         try:
@@ -707,12 +716,20 @@ class Probolos:
             if devices and pending is None:
                 medium = storage.inspect_safely(
                     devices[0], open_fn=sysfs.open_block_device)
+                if medium.error:
+                    medium = self._medium_not_examined(
+                        dev,
+                        medium.error if medium.timed_out
+                        else "its block device could not be read",
+                        detail=f"{devices[0]}: {medium.error}",
+                        device=devices[0])
             elif devices:
-                medium = storage.MediumReport(
-                    device=devices[0],
-                    error=f"{devices[0]} did not become ready: {pending}")
+                medium = self._medium_not_examined(
+                    dev, "its block device did not become ready",
+                    detail=f"{devices[0]}: {pending}", device=devices[0])
             else:
-                medium = storage.MediumReport(error="no block device appeared")
+                medium = self._medium_not_examined(
+                    dev, "no block device appeared")
         finally:
             # REPORTED, never raised. Raising here -- and raising from a
             # `finally`, which also swallows whatever went wrong inside the
@@ -731,17 +748,51 @@ class Probolos:
                     print(f"  ({dev.name} was removed during inspection)")
                 else:
                     print(f"\n[!!] COULD NOT RE-BLOCK {dev.name} after "
-                          f"inspection: {exc}\n"
+                          f"inspection.\n"
                           f"[!!] It is still switched on. Unplug it now; do "
                           f"not rely on the prompt below.\n")
-                    if medium is None:
-                        medium = storage.MediumReport(
-                            device=str(dev.syspath),
-                            error=f"device left authorized: {exc}")
+                    left_on = "it could not be switched back off afterwards"
+                    why = f"re-block: {type(exc).__name__}: {exc}"
+                    if medium is None or not medium.error:
+                        medium = self._medium_not_examined(
+                            dev, left_on, detail=why,
+                            device=medium.device if medium else "")
                     else:
-                        medium.error = (f"{medium.error + '; ' if medium.error else ''}"
-                                        f"device left authorized: {exc}")
+                        medium.error = f"{medium.error}; and {left_on}"
+                        medium.detail = "; ".join(
+                            filter(None, (medium.detail, why)))
         return medium
+
+    @staticmethod
+    def _medium_not_examined(dev: sysfs.UsbDevice, reason: str,
+                             detail: Optional[str] = None,
+                             device: str = "") -> "storage.MediumReport":
+        """
+        The one way a medium inspection fails.
+
+        Every failure -- the switch-on write, a node that never appears or is
+        never ready, an unreadable or stalled block device, a removal mid-scan
+        -- converges here, so every one of them reaches the operator the same
+        way: a MEDIUM block saying "not inspected", followed by the notice that
+        the device was judged on its declared identity alone.
+
+        `reason` comes from a fixed vocabulary and is all the operator sees.
+        `detail` (exception text, sysfs and /dev paths) is kept for the audit
+        log and never printed at the prompt: raw errno strings and internal
+        paths are noise at a security decision, and a device that can shape
+        them should not get to write into it.
+
+        A device that has disappeared is reported as removed whatever step
+        noticed it first: the same root cause used to surface as two different
+        messages depending on which branch lost the race.
+        """
+        try:
+            gone = not dev.syspath.exists()
+        except OSError:
+            gone = False
+        if gone:
+            reason = "the device was removed during inspection"
+        return storage.MediumReport(device=device, error=reason, detail=detail)
 
     def _quarantine(self, dev: sysfs.UsbDevice):
         """
@@ -923,7 +974,8 @@ class Probolos:
             return True
         return answer in ("y", "yes")
 
-    def _record(self, decision: Decision, findings=()) -> None:
+    def _record(self, decision: Decision, findings=(),
+                medium: Optional["storage.MediumReport"] = None) -> None:
         """
         Persist one decision: to the ledger, then to the JSON audit log.
 
@@ -969,6 +1021,14 @@ class Probolos:
                 for f in findings
             ],
         }
+        if medium is not None:
+            # The raw failure detail lives here and only here; the prompt got
+            # the fixed-vocabulary reason (see _medium_not_examined).
+            entry["medium"] = {
+                "examined": medium.error is None,
+                "reason": medium.error,
+                "detail": medium.detail,
+            }
         try:
             from .securefs import append_json_line
             append_json_line(self.json_log, entry)
