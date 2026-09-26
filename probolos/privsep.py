@@ -189,7 +189,7 @@ def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
 
 
 def start(analyzer_main, drop_to: str = "nobody", log=print,
-          state_paths=()) -> int:
+          state_paths=(), watch_media: bool = False) -> int:
     """
     Fork the gate and the analyzer.
 
@@ -197,6 +197,10 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     connected GateClient and runs the whole existing daemon on top of it. The
     parent never returns from here until the analyzer exits: it serves the gate
     and then propagates the child's exit status.
+
+    `watch_media` is the operator's --watch-media, handed to the gate from
+    the root side. The analyzer cannot turn it on: it widens what the gate
+    will open, so it must come from the command line, not the socket.
     """
     if os.getuid() != 0:
         raise PrivsepError(
@@ -269,7 +273,7 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     # crash rather than as the ordinary shutdown it was.
     gate_error = None
     try:
-        gate_server.run_gate(parent_sock, log=log)
+        gate_server.run_gate(parent_sock, log=log, watch_media=watch_media)
     except Exception as exc:   # noqa: BLE001 -- reap first, re-raise never
         gate_error = exc
     finally:

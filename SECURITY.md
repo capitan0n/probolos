@@ -303,6 +303,64 @@ fs detection should grow (f2fs is the obvious candidate, being a mainstream
 flash filesystem) depends on whether it is ever meant to inform policy; as
 long as it is not, the known-set above is the documented boundary.
 
+## Card readers: the medium below the device
+
+The gate acts on USB devices. A card reader is one; the card is a SCSI medium
+inside it, one layer below. Inserting, removing or swapping a card produces a
+medium-change (unit attention) in the already-bound `usb-storage`/`uas`
+driver: no USB re-enumeration, no USB uevent, no `authorized` decision point.
+Trust a reader once and every later card enters unexamined. A USB stick is
+safer in this one respect: it re-enumerates on every connect and is asked
+about again.
+
+This matters when the attacker inserts a card into the victim's trusted
+reader (including a built-in USB reader present at boot). An attacker who
+brings their own reader brings a USB device, and that is gated normally.
+
+**The quarantine claim does not extend to cards.** There is no authorization
+step to delay and no per-medium `authorized` knob. What `--watch-media` adds
+is detection: the block-layer `change` is observed for admitted storage hosts,
+the medium is read exactly as stage 4 reads it, and the operator is told its
+layout, whether it carries an EFI system partition or a hidden partition, and
+whether it differs from what that slot has held before. Say "Probolos gates
+the device; for trusted storage hosts it inspects and alerts on media changes
+— read-only, no mount — but does not gate the medium." Do not say it gates
+cards.
+
+What that reading cannot give:
+
+- **Admission control.** The only lever is `--media-policy deauthorize`,
+  which switches the whole reader off on a CRITICAL media finding. There is
+  nothing in between.
+- **Malice detection.** A crafted exFAT that exploits the kernel exFAT driver
+  on mount looks like ordinary exFAT in a partition table. The layout check
+  catches structural anomalies, not parser exploits, and parser exploits are
+  kernel fs-driver bugs — out of scope, like USB-stack bugs.
+
+Two constraints, each reported on every media event rather than assumed:
+
+- **The automounter consumes the same event.** udisks2 mounts on the very
+  `change` the watcher reads. Unless automount is inhibited for the disk (the
+  udev rule in the README), the medium may be mounted, and parsed by the
+  kernel, before or while it is read. The report says whether automount was
+  inhibited (`UDISKS_IGNORE`/`UDISKS_AUTO`) or the medium was already mounted;
+  in the second case it is post-hoc alerting.
+- **Latency.** Medium detection relies on the kernel's disk-event polling:
+  about 1–2 s, and some readers never report a media change. Such a slot is
+  flagged when first seen.
+
+**Under `--privsep` this widens the gate, and only when asked.** Final
+admission normally leaves the analyzer no read or deauthorization permission,
+which would make the watcher silently dead in the recommended mode. With
+`--watch-media`, the root gate itself records storage hosts it admitted, plus
+storage hosts already live when it started, and for those allows whole-disk
+read-only opens and switching them **off** (never on), while the kernel
+directory instance is unchanged and every interface is still mass storage.
+The flag reaches the gate from the root side of the fork, never from the
+analyzer. The cost: a compromised analyzer can read the raw contents of cards
+and disks in those readers, and switch them off. Without the flag nothing
+changes.
+
 ## Storage read deadlines and remaining limits
 
 Stage 4 reads the raw medium, and a device can stall a read indefinitely —

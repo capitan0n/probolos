@@ -100,7 +100,10 @@ MBR entries and GPT header/protective-MBR detection, with limited filesystem
 signatures. ISO 9660 and UDF are reported only when their volume structure
 checks out (ISO 9660: descriptor set, PVD both-byte-order fields, root
 directory record, size; UDF: the recognition sequence), not on the magic
-alone; the other signatures are still magic-only. GPT entries are not parsed. Probolos does not mount or write the
+alone; the other signatures are still magic-only. GPT entries are read only
+for their type GUID and attributes, only from the standard location inside
+the header read (LBA 2, 128-byte entries), and only the media-change rules
+(§1.13) use them; the geometry rules still judge the protective MBR. Probolos does not mount or write the
 medium; other services can still mount it during activation.
 
 Recognised filesystems are a fixed internal set (NTFS, exFAT, FAT12/16/32,
@@ -203,6 +206,39 @@ recognising rather than just repairing:
 This audit adds regression scenarios and records the actual run in
 `AUDIT_REPORT_EL.md`; hardware claims are not inferred from mock tests.
 
+### 1.13 Media changes in admitted card readers (`--watch-media`, off by default)
+
+**A separate detection layer, not part of the admission gate.** A card is a
+SCSI medium inside a reader, not a USB device: inserting one is a unit
+attention in the bound `usb-storage`/`uas` driver, with no re-enumeration and
+no `authorized` decision point. The pre-authorization quarantine therefore
+does not extend to cards, and nothing here claims it does.
+
+| Piece | Mechanism |
+|---|---|
+| Which hosts | storage-only devices admitted by this run (prompt, trust, safety exemption) and storage-only devices present at startup (`mediawatch.MediaWatch.register`) |
+| Event | udev `block`/`disk` `change` (and `add`) on a disk whose sysfs path is under a watched host, same kernel directory instance (`daemon._dispatch`) |
+| Read | stage 4's own `storage.inspect_safely` on `/dev/sdX`: raw, read-only, never mounted, bounded, watchdog paused |
+| Drift | ledger `media` section keyed on reader identity + SCSI LUN; the first layout is the baseline and never moves |
+| Privsep | the gate, started with the same flag, records admitted/baseline storage-only hosts and allows whole-disk read-only opens and switch-**off** for them (`gate_server._media_host`) |
+| Enforcement | `--media-policy log` (default) or `deauthorize`: drop the **whole reader** on a CRITICAL finding; nothing finer exists |
+
+Rules (`rules.media_findings`), added to the stage 4 structural findings:
+
+- `media-efi-system-partition` (CRITICAL) — MBR type `0xEF` or the GPT ESP GUID
+- `media-hidden-partition` (CRITICAL) — hidden MBR types, or GPT attribute bit 62
+- `media-inserted-while-locked` (WARNING)
+- `media-layout-drift` (WARNING for a layout never seen in the slot, NOTICE for one seen before)
+
+Every report states whether automount was inhibited for the disk
+(`UDISKS_IGNORE`/`UDISKS_AUTO` from udev) or the medium was already mounted
+when read, in which case it is post-hoc alerting. Latency follows the kernel's
+disk-event polling (typically 1–2 s); a slot whose `events` does not include
+`media_change`, or that nobody polls, is flagged when first seen.
+
+Not covered: SD/MMC readers that are not USB mass storage (`mmcblk`, e.g.
+SDHCI or `rtsx`), composite readers, and filesystem-parser exploits (§2.1).
+
 ### 1.11 Non-product tooling
 
 - `testbed/` — `dummy_hcd` / `raw_gadget` software emulation and a HID attack fixture
@@ -235,7 +271,15 @@ subsystem or threat model.
   stages 3 and 4 exist.
 - **Malicious hub or controller silicon.** Trust in the bus topology is assumed.
 - **Post-authorization monitoring.** Once a device is approved, Probolos stops
-  watching it.
+  watching it. The one exception is `--watch-media` (§1.13), which watches
+  the *media* of admitted storage hosts and still does not gate them.
+- **Admission control for removable media.** A card has no `authorized`
+  switch of its own. `--watch-media` observes and alerts; at most it drops the
+  whole reader.
+- **Filesystem-parser exploits.** A crafted exFAT/NTFS/FAT that attacks the
+  kernel's filesystem driver on mount looks like an ordinary filesystem in a
+  partition table. Kernel fs-driver bugs are the same class as kernel USB-stack
+  bugs above.
 - **Content scanning.** No file inspection, no signatures, no anti-malware. The
   storage stage reads partition metadata, nothing else.
 - **Non-Linux platforms.** The entire mechanism is Linux sysfs USB authorization.

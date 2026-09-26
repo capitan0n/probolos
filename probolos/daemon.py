@@ -71,7 +71,8 @@ class Probolos:
                  monitor=None,
                  lock_policy: str = session_mod.POLICY_QUEUE,
                  agent=None,
-                 close_race_window: bool = False):
+                 close_race_window: bool = False,
+                 media_watch=None):
         self.dry_run = dry_run
         self.timeout = timeout          # 0 == wait forever
         self.json_log = json_log
@@ -89,6 +90,9 @@ class Probolos:
         self.agent = agent
         # Experimental bus-wide binding control, not race-free isolation.
         self.close_race_window = close_race_window
+        # Media changes inside admitted storage hosts (mediawatch.py). None
+        # unless --watch-media: a separate detection layer, not the gate.
+        self.media_watch = media_watch
         # Devices attached while the screen was locked. They are held blocked
         # and asked about when someone returns, so nobody has to unplug and
         # replug hardware just because they stepped away.
@@ -137,6 +141,10 @@ class Probolos:
                 stranded.append(dev)
                 continue
             self.known.add(dev.name)
+            # Left untouched does not mean unwatched: a card reader present at
+            # startup is the slot most likely to be used by someone else.
+            if self.media_watch is not None:
+                self.media_watch.register(dev, "present at startup")
 
         print(f"[*] Baseline: {len(self.known)} USB device(s) already attached, "
               f"all left untouched")
@@ -165,6 +173,11 @@ class Probolos:
         # sends a lot of uevents, and 'usb_device' excludes the per-interface
         # nodes (1-4:1.0) which would otherwise duplicate every attachment.
         monitor.filter_by(subsystem="usb", device_type="usb_device")
+        # A card inserted into an admitted reader produces no USB event at
+        # all; its only trace is a `change` on the reader's whole disk. The
+        # filters are OR'd, so one loop still serves both.
+        if self.media_watch is not None:
+            monitor.filter_by(subsystem="block", device_type="disk")
         monitor.start()
 
         print("[*] Listening. Plug in a device. Ctrl-C to stop.\n")
@@ -229,16 +242,46 @@ class Probolos:
             # KeyboardInterrupt and SystemExit are deliberately NOT caught:
             # shutdown must stay immediate.
             try:
-                if device.action == "add":
-                    self._on_add(device.sys_path)
-                elif device.action == "remove":
-                    self._on_remove(device.sys_path)
+                self._dispatch(device)
             except Exception as exc:   # noqa: BLE001 -- see above
                 import traceback
                 print(f"[!] {Path(device.sys_path).name}: unhandled error "
                       f"while gating this device: {exc!r}")
                 print(f"[!] It stays BLOCKED. The gate is still running.")
                 traceback.print_exc()
+
+    def _dispatch(self, device) -> None:
+        """Route one uevent: USB devices to the gate, disks to the watcher."""
+        if getattr(device, "subsystem", "usb") == "block":
+            if self.media_watch is None or self.dry_run:
+                return
+            properties = dict(getattr(device, "properties", {}) or {})
+            # Bounded like stage 4 at admission; the watchdog must not count
+            # a card that stalls its reads as the daemon wedging.
+            if self.watchdog:
+                with self.watchdog.paused():
+                    self.media_watch.handle(device.action, device.sys_path,
+                                            properties)
+            else:
+                self.media_watch.handle(device.action, device.sys_path,
+                                        properties)
+            return
+        if device.action == "add":
+            self._on_add(device.sys_path)
+        elif device.action == "remove":
+            self._on_remove(device.sys_path)
+
+    def _watch_if_storage(self, dev: sysfs.UsbDevice, why: str) -> None:
+        """An admitted pure storage host: keep watching what is put in it."""
+        if self.media_watch is not None and not self.dry_run:
+            self.media_watch.register(dev, why)
+
+    def _media_policy_deauthorized(self, dev: sysfs.UsbDevice,
+                                   findings) -> None:
+        """The watcher switched a reader off: it is no longer past the gate."""
+        self.known.discard(dev.name)
+        self._record(Decision(dev, False, "media policy: reader deauthorized",
+                              time.time()), findings)
 
     def _recover_event_stream(self, monitor, exc: OSError) -> bool:
         """
@@ -341,6 +384,7 @@ class Probolos:
             self.known.add(dev.name)
             self._record(Decision(dev, True, f"protected: {protection}",
                                   time.time()))
+            self._watch_if_storage(dev, "admitted without prompt")
             return
 
         findings = analyzers.run(analyzers.Context(
@@ -364,6 +408,7 @@ class Probolos:
                 self.known.add(dev.name)
                 self._record(Decision(dev, True, "trusted", time.time()),
                              findings)
+                self._watch_if_storage(dev, "trusted")
             except OSError as exc:
                 print(f"[!] failed to authorize trusted device: {exc}")
             return
@@ -498,6 +543,7 @@ class Probolos:
                     print(f"  trust could not be saved: {error}" if error
                           else "  remembered for future admissions")
             print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
+            self._watch_if_storage(dev, "approved")
         else:
             # For a quarantined device this write genuinely matters: it was
             # switched on for the observation and is alive right now. For every
@@ -845,6 +891,8 @@ class Probolos:
             del self.pending[name]
             print(f"[*] {name} removed while held; question withdrawn")
         self.known.discard(name)
+        if self.media_watch is not None:
+            self.media_watch.unregister(name)
         print(f"[*] removed: {name}")
 
     # ------------------------------------------------------------------
@@ -1051,7 +1099,9 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
           agent_socket: Optional[Path] = None,
           agent_uid: Optional[int] = None,
           agent_gid: Optional[int] = None,
-          close_race_window: bool = False) -> None:
+          close_race_window: bool = False,
+          watch_media: bool = False,
+          media_policy: str = "log") -> None:
     """Wire the gate, the safety net and the loop together."""
     policy = policy or safety.SafetyPolicy()
     link = None
@@ -1144,6 +1194,17 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
                           inspect_storage=inspect_storage, monitor=monitor,
                           lock_policy=lock_policy, agent=link,
                           close_race_window=close_race_window)
+        if watch_media and not dry_run:
+            from . import mediawatch
+            engine.media_watch = mediawatch.MediaWatch(
+                policy=media_policy, ledger=store, json_log=json_log,
+                rule_config=rule_config, is_locked=monitor.is_locked,
+                on_deauthorized=engine._media_policy_deauthorized)
+            print(f"  - media watch: cards in admitted readers are inspected "
+                  f"read-only and alerted on (policy: {media_policy}); they "
+                  f"are NOT gated")
+        elif watch_media:
+            print("  - media watch: off in --dry-run")
         engine.snapshot()
         try:
             engine.run()

@@ -928,3 +928,93 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
                 "absence is unusual, though some tools produce it.")
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Media changes in an already-admitted storage host (mediawatch.py)
+# ---------------------------------------------------------------------------
+
+# MBR type bytes that exist to be skipped by ordinary tools: the "hidden"
+# variants of FAT and NTFS (the 0x10 bit set on the visible type), plus 0x27,
+# the hidden NTFS recovery partition.
+_HIDDEN_MBR_TYPES = {0x11, 0x14, 0x16, 0x17, 0x1B, 0x1C, 0x1E, 0x27}
+_MBR_ESP_TYPE = 0xEF
+
+
+def media_findings(medium, *, drift: Optional[str] = None,
+                   drift_known: bool = False, locked: bool = False,
+                   config: Optional[RuleConfig] = None) -> List[Finding]:
+    """
+    Findings about a medium inserted into a reader that was already admitted.
+
+    These are ADDED to storage_findings, never instead of them. They exist
+    only on the media-change path: a card has no admission step, so nothing
+    here decides whether it is let in. They decide what the operator is told
+    and, under --media-policy deauthorize, whether the READER is switched off.
+
+    `drift` is the baseline layout this medium differs from (None when it
+    matches or is the first seen); `drift_known` says the new layout has been
+    seen in this slot before.
+    """
+    cfg = config or DEFAULT_CONFIG
+    out: List[Finding] = []
+
+    def add(rule_id, severity, title, explanation):
+        if cfg.enabled(rule_id):
+            out.append(Finding(rule_id, cfg.severity(rule_id, severity),
+                               title, explanation))
+
+    if locked:
+        add("media-inserted-while-locked", Severity.WARNING,
+            "A medium was inserted while the session was locked",
+            "Nobody was at the machine to insert it. A card slot in a reader "
+            "that was already trusted has no admission step of its own, so "
+            "this is the moment it would be used by someone with brief "
+            "physical access.")
+
+    if medium is None or medium.error:
+        return out
+
+    from . import storage as storage_mod
+
+    esp = [f"partition {p.index + 1}" for p in medium.partitions
+           if p.type_byte == _MBR_ESP_TYPE]
+    esp += [f"GPT entry {e.index + 1}" for e in medium.gpt_entries
+            if e.type_guid == storage_mod.GPT_ESP_GUID]
+    if esp:
+        add("media-efi-system-partition", Severity.CRITICAL,
+            "The inserted medium carries an EFI system partition",
+            f"{', '.join(esp[:4])}. An EFI system partition holds boot "
+            "loaders: it is what makes a card a boot payload rather than "
+            "storage. Firmware can be set to boot from it, and nothing about "
+            "photos or documents needs one.")
+
+    hidden = [f"partition {p.index + 1} "
+              f"({storage_mod.type_name(p.type_byte)})"
+              for p in medium.partitions if p.type_byte in _HIDDEN_MBR_TYPES]
+    hidden += [f"GPT entry {e.index + 1}" for e in medium.gpt_entries
+               if e.attributes & storage_mod.GPT_ATTR_HIDDEN]
+    if hidden:
+        add("media-hidden-partition", Severity.CRITICAL,
+            "The inserted medium carries a hidden partition",
+            f"{', '.join(hidden[:4])}. The type or attribute exists so that "
+            "file managers and operating systems skip the partition. Data "
+            "on a card that is meant not to be seen by the person using it "
+            "is the case this rule is for.")
+
+    if drift is not None:
+        if drift_known:
+            add("media-layout-drift", Severity.NOTICE,
+                "This slot has seen a different medium before",
+                "The layout differs from the first medium recorded in this "
+                "slot of this reader, but matches one seen here since. "
+                "Usually several cards in rotation.")
+        else:
+            add("media-layout-drift", Severity.WARNING,
+                "A medium this slot has never seen",
+                "The layout (partition table, sizes, filesystem signatures) "
+                "differs from every medium recorded in this slot of this "
+                "reader. A new card is often just a new card; it is reported "
+                "because the reader was trusted on the strength of a "
+                "different one.")
+    return out

@@ -129,12 +129,31 @@ class Partition:
 
 
 @dataclass
+class GptEntry:
+    """
+    One used GPT partition entry: its type and attributes, nothing more.
+
+    Read only for the media-change rules (EFI system partition, hidden
+    partition). The geometry rules still judge the protective MBR entries, so
+    what an entry claims about its own extent is not trusted here.
+    """
+    index: int
+    type_guid: str
+    attributes: int
+
+
+@dataclass
 class MediumReport:
     """What the raw medium says about itself."""
     device: str = ""
     size_sectors: Optional[int] = None
     scheme: str = "unknown"          # mbr / gpt / none
     partitions: List[Partition] = field(default_factory=list)
+    # GPT partition entries found inside HEADER_READ. `gpt_entries_parsed` is
+    # False when the header points its entry array anywhere else, so a rule
+    # that found no EFI system partition can say it did not look.
+    gpt_entries: List[GptEntry] = field(default_factory=list)
+    gpt_entries_parsed: bool = False
     signatures: dict = field(default_factory=dict)  # partition index -> fs name
     suspicious: List[str] = field(default_factory=list)  # impossible/hostile partitions
     # A filesystem signature found WITHOUT the structure it introduces: where,
@@ -258,6 +277,46 @@ def parse_gpt_header(data: bytes) -> Optional[dict]:
         "first_usable": first_usable,
         "last_usable": last_usable,
     }
+
+
+# UEFI 2.x 5.3: the entry array normally starts at LBA 2 with 128-byte entries.
+# Only that layout is read, and only as far as HEADER_READ already reaches (32
+# sectors, 128 entries): no further read is issued at an offset the medium
+# chose.
+GPT_ENTRY_SIZE = 128
+GPT_ENTRIES_LBA = 2
+GPT_ESP_GUID = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+# Bit 62 of a basic-data entry's attributes: "hidden" to Windows.
+GPT_ATTR_HIDDEN = 1 << 62
+
+
+def parse_gpt_entries(data: bytes) -> Optional[List[GptEntry]]:
+    """
+    Used GPT entries from the header read, or None if they are not in it.
+
+    Bounded by the bytes given, never by the header's own entry count: a count
+    of 2^32 costs nothing here.
+    """
+    import uuid
+
+    if len(data) < SECTOR * 2 or data[SECTOR:SECTOR + 8] != GPT_SIGNATURE:
+        return None
+    entries_lba, count, size = struct.unpack_from("<QII", data, SECTOR + 72)
+    if entries_lba != GPT_ENTRIES_LBA or size != GPT_ENTRY_SIZE:
+        return None
+    start = GPT_ENTRIES_LBA * SECTOR
+    available = max(0, (len(data) - start) // GPT_ENTRY_SIZE)
+    found = []
+    for i in range(min(count, available)):
+        raw = data[start + i * GPT_ENTRY_SIZE:start + (i + 1) * GPT_ENTRY_SIZE]
+        type_bytes = raw[:16]
+        if type_bytes == bytes(16):
+            continue                    # unused slot
+        attributes = struct.unpack_from("<Q", raw, 48)[0]
+        found.append(GptEntry(index=i,
+                              type_guid=str(uuid.UUID(bytes_le=type_bytes)),
+                              attributes=attributes))
+    return found
 
 
 def sniff_filesystem(data: bytes,
@@ -649,6 +708,10 @@ def inspect(device: str, open_fn=None) -> MediumReport:
         if gpt is not None:
             report.scheme = "gpt"
             report.partitions = partitions      # the protective MBR entries
+            entries = parse_gpt_entries(data)
+            if entries is not None:
+                report.gpt_entries = entries
+                report.gpt_entries_parsed = True
         elif partitions:
             report.scheme = "mbr"
             report.partitions = partitions

@@ -117,6 +117,35 @@ It also only constrains **udisks**. Any other automounter on the machine is
 unaffected, so verify the behaviour on your own system rather than assuming the
 window is closed.
 
+### Card readers: the card is not gated
+
+A card reader is the USB device; the card is a medium inside it. Inserting,
+removing or swapping a card causes no USB re-enumeration, so once a reader is
+admitted every later card enters without passing the gate. Stage 4 only sees a
+card that was already in the reader when it was plugged in.
+
+`--watch-media` adds a separate detection layer for that: it listens for the
+block-layer `change` on admitted storage hosts (and ones present at startup),
+reads each new medium the same way stage 4 does — raw, read-only, never
+mounted — and reports its layout, EFI system or hidden partitions, and drift
+from the first medium seen in that slot. It **does not gate the card**: there
+is no per-medium `authorized` switch. The only enforcement is
+`--media-policy deauthorize`, which switches the **whole reader** off on a
+CRITICAL finding.
+
+Two things decide how much a report is worth, and each one says which case
+applied:
+
+- **Automount.** udisks2 mounts on the same event. Without the udev rule
+  above, the card may already be mounted when it is read, and the report is
+  post-hoc alerting, not prevention.
+- **Latency.** Media detection rides on the kernel's disk-event polling,
+  typically 1–2 s. Some readers do not report media changes at all; such a
+  slot is flagged when first seen.
+
+Under `--privsep` this widens the gate: the analyzer may open the whole disks
+of watched readers read-only and switch those readers off. See `SECURITY.md`.
+
 ---
 
 ## Common options
@@ -130,6 +159,8 @@ window is closed.
 | `--list` | read-only inventory of attached devices; never closes the gate |
 | `--trusted` / `--forget N` | list and revoke remembered devices |
 | `--no-storage-scan` | skip stage 4 entirely |
+| `--watch-media` | inspect and alert on cards inserted into admitted readers (detection only) |
+| `--media-policy log\|deauthorize` | with `--watch-media`: on a CRITICAL media finding, log (default) or drop the whole reader |
 | `--allow-port PORT` | keep a rescue port always open |
 | `--capture-payload` | reconstruct what a quarantined device typed (opt-in) |
 | `--release` | reopen the gate after a crash |
@@ -225,6 +256,8 @@ Short version:
   separation with kernel-derived scope, lockout safety.
 - **Does not** — anything before the kernel finishes enumerating, anything after
   you approve the device, Thunderbolt/DMA, USB-PD, wireless, or file contents.
+  A card inserted into an admitted reader is not gated; `--watch-media` only
+  inspects and alerts on it.
 - **Off by default** — `--close-race-window` experiments with deferred binding
   using a bus-wide switch. It does not remove the input race. See `SECURITY.md`.
 - **No early activation** — use `--observe 0 --no-storage-scan` when holding

@@ -328,6 +328,16 @@ def main(argv=None) -> None:
     parser.add_argument("--no-storage-scan", action="store_true",
                         help="skip reading the partition table of storage "
                              "devices (stage 4)")
+    parser.add_argument("--watch-media", action="store_true",
+                        help="inspect (read-only, never mounted) and alert "
+                             "on cards inserted into card readers that are "
+                             "already admitted. Detection only: a card is "
+                             "a medium, not a device, and is NOT gated")
+    parser.add_argument("--media-policy", default="log",
+                        choices=["log", "deauthorize"],
+                        help="with --watch-media, on a CRITICAL media finding: "
+                             "log it (default), or deauthorize the WHOLE "
+                             "reader -- the only enforcement that exists")
     parser.add_argument("--lock-policy", default=session_mod.POLICY_QUEUE,
                         choices=[session_mod.POLICY_QUEUE,
                                  session_mod.POLICY_DENY,
@@ -358,6 +368,8 @@ def main(argv=None) -> None:
     parser.add_argument("--privsep-user", default="nobody", metavar="USER",
                         help="user the analyzer drops to under --privsep")
     args = parser.parse_args(argv)
+    if args.media_policy != "log" and not args.watch_media:
+        parser.error("--media-policy needs --watch-media")
 
     require_usb()
 
@@ -466,7 +478,9 @@ def main(argv=None) -> None:
                      agent_socket=args.agent_socket if args.agent else None,
                      agent_uid=agent_uid,
                      agent_gid=agent_gid,
-                     close_race_window=args.close_race_window)
+                     close_race_window=args.close_race_window,
+                     watch_media=args.watch_media,
+                     media_policy=args.media_policy)
 
     if args.privsep:
         if args.close_race_window:
@@ -523,8 +537,12 @@ def main(argv=None) -> None:
             # directory. Done before the drop, while we still can.
             if not args.no_trust and trust_path:
                 privsep.prepare_trust_readable(trust_path)
+            # --watch-media widens what the gate will open (whole disks of
+            # admitted storage hosts), so the gate learns it from the root
+            # side here and never from the analyzer.
             rc = privsep.start(analyzer_main, drop_to=args.privsep_user,
-                               state_paths=[p for p in (ledger_path,) if p])
+                               state_paths=[p for p in (ledger_path,) if p],
+                               watch_media=args.watch_media and not args.dry_run)
         except privsep.PrivsepError as exc:
             sys.exit(f"privsep: {exc}")
         sys.exit(rc)

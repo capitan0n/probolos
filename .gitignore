@@ -41,3 +41,4 @@ htmlcov/
 
 fuzzing/
 experiments/
+.hypothesis/

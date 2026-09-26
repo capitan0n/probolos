@@ -85,6 +85,10 @@ SCHEMA_VERSION = 1
 MAX_DECISIONS = 20
 MAX_KNOWN_HASHES = 32     # 32 distinct descriptor sets is already an alarm
 MAX_PORTS = 32            # more ports than any machine has
+# Media layouts per reader slot (see record_media). Same shape of bound as
+# known_hashes, and the first element is kept for the same reason: it is the
+# baseline, and a slot fed enough different cards must not wash it out.
+MAX_MEDIA_LAYOUTS = 32
 
 
 @dataclass
@@ -353,6 +357,13 @@ def raw_descriptor_hash(dev) -> Optional[str]:
     return hashlib.sha256(raw).hexdigest() if raw else None
 
 
+def _bounded(items: List[str], limit: int) -> List[str]:
+    """Keep the first element and the newest rest, `limit` in all."""
+    if len(items) <= limit:
+        return list(items)
+    return items[:1] + items[-(limit - 1):]
+
+
 def identity_of(dev) -> str:
     """
     The identity a device CLAIMS. Not proof of anything; just what it said.
@@ -372,6 +383,11 @@ class Ledger:
     def __init__(self, path: Path = DEFAULT_PATH):
         self.path = Path(path)
         self.entries: Dict[str, Entry] = {}
+        # "<identity>#lun<N>" -> layout fingerprints seen in that slot, the
+        # first being the baseline. Kept beside `entries`, not inside Entry:
+        # a reader present before startup has no Entry, and a card is not the
+        # device the Entry describes.
+        self.media: Dict[str, List[str]] = {}
         self.load_error: Optional[str] = None
         self._last_save_error: Optional[str] = None
         self.load()
@@ -380,6 +396,7 @@ class Ledger:
 
     def load(self) -> None:
         self.entries.clear()
+        self.media.clear()
         self.load_error = None
         if not self.path.exists():
             return
@@ -398,8 +415,10 @@ class Ledger:
         if data.get("schema") != SCHEMA_VERSION:
             self.load_error = f"unsupported ledger schema {data.get('schema')}"
             return
+        media_error = self._load_media(data.get("media"))
         entries = data.get("entries")
         if entries is None:
+            self.load_error = media_error
             return
         if not isinstance(entries, dict):
             # `"entries": []` is valid JSON of the right schema version and
@@ -439,6 +458,33 @@ class Ledger:
                 f"{skipped} malformed ledger "
                 f"{'entry' if skipped == 1 else 'entries'} ignored -- "
                 f"drift detection for those devices is lost")
+        if media_error:
+            self.load_error = "; ".join(filter(None, (self.load_error,
+                                                     media_error)))
+
+    def _load_media(self, raw) -> Optional[str]:
+        """
+        Read the media section, dropping what is malformed and saying so.
+
+        Same discipline as the entries: untrusted input, loud about losses,
+        never able to stop the gate from starting.
+        """
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            return "ledger 'media' is not an object -- media baselines lost"
+        skipped = 0
+        for key, layouts in raw.items():
+            if (not isinstance(key, str) or not isinstance(layouts, list)
+                    or not layouts
+                    or not all(isinstance(h, str) for h in layouts)):
+                skipped += 1
+                continue
+            self.media[key] = _bounded(layouts, MAX_MEDIA_LAYOUTS)
+        if skipped:
+            return (f"{skipped} malformed media "
+                    f"{'baseline' if skipped == 1 else 'baselines'} ignored")
+        return None
 
     def save(self) -> Optional[str]:
         """
@@ -461,6 +507,7 @@ class Ledger:
                 # raw-blob scheme -- see Entry.from_raw for the migration.
                 "fingerprint_scheme": "normalized-v1",
                 "entries": {k: asdict(v) for k, v in self.entries.items()},
+                "media": self.media,
             }
             # Symlink-safe atomic write: the state dir is nobody-owned under
             # --privsep, so the staging path must not be followable. See
@@ -478,6 +525,27 @@ class Ledger:
 
     def lookup(self, dev) -> Optional[Entry]:
         return self.entries.get(identity_of(dev))
+
+    def record_media(self, dev, lun: str, layout: str):
+        """
+        Remember a medium seen in one slot of a reader: (baseline, seen).
+
+        `baseline` is the first layout ever recorded for this reader and LUN,
+        or None if this is that first one. `seen` says whether `layout` was
+        recorded in the slot before (at any position). The baseline never
+        moves: there is no approval step for a card, so there is nothing that
+        could legitimately move it.
+        """
+        key = f"{identity_of(dev)}#lun{lun}"
+        layouts = self.media.get(key)
+        if not layouts:
+            self.media[key] = [layout]
+            return None, False
+        seen = layout in layouts
+        if not seen:
+            layouts.append(layout)
+            self.media[key] = _bounded(layouts, MAX_MEDIA_LAYOUTS)
+        return layouts[0], seen
 
     def record(self, dev, decision: str, approved: bool = False) -> None:
         """

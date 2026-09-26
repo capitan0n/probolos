@@ -14,6 +14,39 @@ chown was pinned to a directory descriptor and the chmod beside it was not, the
 gate restored devices and hubs but not interfaces, the drop verified uid and gid
 but not groups.
 
+### Added — media changes in admitted card readers
+
+- **`--watch-media`: a detection layer for the card-reader gap.** A card is
+  a SCSI medium inside a reader, not a USB device; inserting one causes no
+  re-enumeration, so a trusted reader admitted every later card unexamined.
+  The watcher listens for block-layer `change` events on admitted storage
+  hosts (and ones present at startup), reads the new medium with stage 4's
+  own inspection (raw, read-only, never mounted, bounded), and reports
+  EFI system partitions and hidden partitions (CRITICAL), insertion while the
+  session is locked (WARNING), and layout drift against the first medium seen
+  in that reader's slot (ledger `media` section, keyed on reader identity +
+  LUN). It does **not** gate the card. `--media-policy deauthorize` switches
+  the whole reader off on a CRITICAL finding; the default only logs.
+- **Every media report says how much it is worth**: whether udisks automount
+  was inhibited for the disk or the medium was already mounted when read
+  (post-hoc alerting), and, when a slot is first seen, whether it reports
+  media changes to the kernel at all.
+- **Wired under `--privsep`, where it would otherwise have been dead.** Final
+  admission grants the analyzer no further read or deauthorization
+  permission, so the watcher's reads and its one enforcement action would
+  both have been refused. The gate now takes `watch_media` from the root side
+  and scopes it to storage-only hosts it admitted or found live at start,
+  same kernel directory instance, read-only opens and switch-off only.
+- **GPT entry types are read** from the standard location inside the header
+  read, for the ESP and hidden-partition rules only.
+
+### Fixed — tests
+
+- `tests/_media.py` had been committed as `probolos/_media.py`, so three test
+  modules (`test_forged_signatures`, `test_partitionless_filesystems`,
+  `test_whole_disk_guard`) failed to import and none of their tests ran. Moved
+  back; the suite collects them again.
+
 ### Fixed — security
 
 - **A medium that could not be switched on was never reported as unexamined.**

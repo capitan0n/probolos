@@ -5,6 +5,13 @@ separate. Temporary authorization records the kernel directory instance and a
 bounded permission to open its input/block nodes. Final admission records no
 such permission. Input scope climbs past USB interface nodes to the peripheral.
 
+With media watching enabled (--watch-media), one more scope exists: a storage
+host this gate admitted, or found admitted when it started, whose interfaces
+are all mass storage. Its whole disks may be opened read-only and it may be
+switched OFF, never on, for as long as the same kernel directory instance is
+there. That is what lets the analyzer inspect a card inserted into an already
+trusted reader, and drop the reader on a policy hit.
+
 This module plus its protocol and privileged startup/cleanup dependencies form
 the userspace privilege boundary. It is not an independent human-approval
 service: the analyzer still controls admission policy for unknown devices.
@@ -55,6 +62,9 @@ SYS_DEV_BLOCK = "/sys/dev/block"
 # authorized_default. Anything else asking for it is either confused or
 # probing, and neither deserves a write.
 _ROOT_HUB_NAME = _re.compile(r"^usb\d+$")
+# USB interface directories under a device: <device>:<config>.<interface>.
+_INTERFACE_NAME = _re.compile(r"^[0-9]+-[0-9.]+:[0-9]+\.[0-9]+$")
+_MASS_STORAGE_CLASS = "08"
 
 
 class GateServer:
@@ -71,9 +81,15 @@ class GateServer:
     with no accumulated permission.
     """
 
-    def __init__(self, sock: socket.socket, log=print):
+    def __init__(self, sock: socket.socket, log=print,
+                 watch_media: bool = False):
         self.sock = sock
         self.log = log
+        # Storage hosts whose media the analyzer may watch: resolved path ->
+        # kernel directory instance. Filled only from sysfs, by this process,
+        # and only when the operator started it with --watch-media.
+        self.watch_media = watch_media
+        self._media_hosts: dict = {}
         # Resolved paths of USB devices/interfaces this gate switched ON out of
         # quarantine. Only these may be switched off again.
         self._authorized_here: set = set()
@@ -96,6 +112,8 @@ class GateServer:
         # leave behind, and the lockout-safety argument the rest of this
         # project is built on applies to it exactly as written.
         self._interfaces_off: dict = {}
+        if watch_media:
+            self._snapshot_media_hosts()
 
 
     # ---- path validation: the heart of the security boundary ----
@@ -309,6 +327,83 @@ class GateServer:
             return parent
         return None
 
+    # ---- media watching: admitted storage hosts ----
+
+    @staticmethod
+    def _read_attr_pinned(directory: Path, name: str) -> Optional[str]:
+        """One short sysfs read through a pinned directory, never following."""
+        directory_fd = None
+        try:
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY |
+                                   os.O_NOFOLLOW | os.O_CLOEXEC)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=directory_fd)
+            with os.fdopen(fd) as fh:
+                return fh.read(64).strip()
+        except OSError:
+            return None
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    @classmethod
+    def _storage_only(cls, usb_path: Path) -> bool:
+        """
+        Every interface the kernel created is mass storage, and there is one.
+
+        Read from the live interface directories, not from anything the
+        analyzer said. A reader that is also a keyboard, a network adapter or
+        a vendor function is not a storage host, and reading or dropping it
+        on the strength of its storage half is not what this scope is for.
+        """
+        classes = []
+        try:
+            names = os.listdir(usb_path)
+        except OSError:
+            return False
+        for name in names:
+            if not _INTERFACE_NAME.match(name):
+                continue
+            classes.append(cls._read_attr_pinned(usb_path / name,
+                                                 "bInterfaceClass"))
+        return bool(classes) and all(c == _MASS_STORAGE_CLASS for c in classes)
+
+    def _snapshot_media_hosts(self) -> None:
+        """Storage hosts already live when the gate starts (the baseline)."""
+        try:
+            names = os.listdir(USB_LINK_PREFIX)
+        except OSError:
+            return
+        for name in names:
+            if ":" in name or _ROOT_HUB_NAME.fullmatch(name):
+                continue
+            path = self._safe_usb_path(USB_LINK_PREFIX + name)
+            if path is None:
+                continue
+            if (self._read_attr_pinned(path, "authorized") == "1"
+                    and self._storage_only(path)):
+                try:
+                    self._media_hosts[str(path)] = self._instance(path)
+                except OSError:
+                    continue
+
+    def _media_host(self, path: Path) -> bool:
+        """A recorded storage host, same instance, still storage only."""
+        if not self.watch_media:
+            return False
+        try:
+            if self._media_hosts.get(str(path)) != self._instance(path):
+                return False
+        except OSError:
+            return False
+        return self._storage_only(path)
+
+    def _media_scope_parent_of(self, node):
+        parent = self._usb_parent_of(node)
+        if parent is not None and self._media_host(parent):
+            return parent
+        return None
+
     # ---- request handlers ----
 
     def _do_authorize(self, req: protocol.Request) -> protocol.Response:
@@ -341,7 +436,11 @@ class GateServer:
                 blocked = fh.read(8).strip() == "0"
             owned = (str(devpath) in self._authorized_here
                      and self._instances.get(str(devpath)) == instance)
-            if not blocked and (req.value == 1 or not owned):
+            # A watched storage host may be switched OFF (a media-policy hit),
+            # never on. Same instance as recorded, or the port was recycled.
+            media_off = (req.value == 0 and temporary
+                         and self._media_host(devpath))
+            if not blocked and (req.value == 1 or not (owned or media_off)):
                 return protocol.Response(protocol.DENIED, "device is outside quarantine")
             fd = os.open("authorized", os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
                          dir_fd=directory_fd)
@@ -355,6 +454,12 @@ class GateServer:
                 self._authorized_here.discard(str(devpath))
                 self._instances.pop(str(devpath), None)
                 self._open_leases.pop(str(devpath), None)
+            if req.value == 1 and not temporary and self.watch_media:
+                # Admitted by a decision. Whether it is a storage host is
+                # judged from its interfaces at every use, not here.
+                self._media_hosts[str(devpath)] = instance
+            elif req.value == 0:
+                self._media_hosts.pop(str(devpath), None)
             return protocol.Response(protocol.OK)
         except OSError as exc:
             return protocol.Response(protocol.ERROR, str(exc))
@@ -625,7 +730,16 @@ class GateServer:
         # internal SATA/NVMe disk has no USB parent and is refused, so a
         # compromised analyzer cannot read /dev/sda (your system disk) even
         # though it is a valid whole-disk node.
-        if self._open_scope_parent_of(node) is None:
+        #
+        # Or, with --watch-media, to a storage host being watched: a card
+        # inserted into a reader that is already admitted. Read-only still,
+        # whole disk still, and only while the reader is storage and nothing
+        # else.
+        def in_scope():
+            return (self._open_scope_parent_of(node) is not None
+                    or self._media_scope_parent_of(node) is not None)
+
+        if not in_scope():
             return protocol.Response(
                 protocol.DENIED,
                 "disk is not backed by a USB device under quarantine: "
@@ -634,7 +748,7 @@ class GateServer:
         try:
             fd = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
             if (os.fstat(fd).st_rdev != node.stat().st_rdev
-                    or self._open_scope_parent_of(node) is None):
+                    or not in_scope()):
                 os.close(fd)
                 return protocol.Response(protocol.DENIED, "device changed during open"), None
             return protocol.Response(protocol.OK, has_fd=True), fd
@@ -787,6 +901,6 @@ class _PeerGone(Exception):
     """The analyzer is no longer reachable. Ends the serve loop, quietly."""
 
 
-def run_gate(sock: socket.socket, log=print) -> None:
+def run_gate(sock: socket.socket, log=print, watch_media: bool = False) -> None:
     """Entry point for the privileged child. Serves until the analyzer exits."""
-    GateServer(sock, log=log).serve_forever()
+    GateServer(sock, log=log, watch_media=watch_media).serve_forever()
