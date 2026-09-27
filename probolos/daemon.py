@@ -26,6 +26,7 @@ question that is about itself.
 from __future__ import annotations
 
 import json
+import os
 import select
 import threading
 from collections import OrderedDict
@@ -917,6 +918,29 @@ class Probolos:
             time.sleep(delay)
         return sysfs.load_device(path)
 
+    @staticmethod
+    def _discard_typeahead() -> int:
+        """
+        Throw away terminal input queued before the prompt was shown.
+
+        Returns how many bytes of complete lines were waiting (FIONREAD counts
+        only those in canonical mode; a partial line is discarded too, just
+        not counted). Not a terminal, or not one that answers: nothing to do.
+        """
+        try:
+            fd = sys.stdin.fileno()
+            if not os.isatty(fd):
+                return 0
+            import fcntl
+            import struct
+            import termios
+            waiting = struct.unpack(
+                "i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0]
+            termios.tcflush(fd, termios.TCIFLUSH)
+            return max(0, waiting)
+        except (AttributeError, ValueError, OSError):
+            return 0
+
     def _ask(self, dev: sysfs.UsbDevice,
              findings=()) -> bool:
         """
@@ -994,6 +1018,18 @@ class Probolos:
         # The timeout applies to critical prompts too. It expires into DENIAL,
         # which is the safe direction, and it stops one suspicious device from
         # blocking the event loop indefinitely.
+
+        # Only what is typed AFTER the question may answer it. Stage 3 switches
+        # the device on before EVIOCGRAB can take it, and keystrokes sent in
+        # that window go to the focused window -- usually this terminal, which
+        # has just told the operator not to touch anything. "y<Enter>" queued
+        # there was read below as the operator's answer, so a keyboard could
+        # approve itself ("authorize<Enter>" on a CRITICAL prompt).
+        discarded = self._discard_typeahead()
+        if discarded:
+            print(f"  [!] Discarded {discarded} byte(s) of input that reached "
+                  f"this terminal before the question was asked.")
+            print("  [!] If you did not type them, this device probably did.")
 
         sys.stdout.write(prompt)
         sys.stdout.flush()

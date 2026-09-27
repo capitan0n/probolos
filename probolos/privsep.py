@@ -228,6 +228,22 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     if pid == 0:
         # ---- child: becomes the unprivileged analyzer ----
         parent_sock.close()
+        # A session of its own, so the terminal is no longer its CONTROLLING
+        # terminal. The analyzer keeps the inherited stdin/stdout -- the
+        # terminal prompt needs them -- and on its controlling tty any
+        # process may ioctl(TIOCSTI) bytes into the input queue as though
+        # they were typed. Those bytes are read by whatever reads the
+        # terminal next: the shell that started `sudo probolos`, as root or
+        # with a cached sudo ticket, the moment the tool exits. An analyzer
+        # compromised by a hostile device would type its own root command.
+        # Off the controlling tty, TIOCSTI fails with EPERM for an account
+        # without CAP_SYS_ADMIN; reading and writing the terminal still work.
+        try:
+            os.setsid()
+        except OSError as exc:
+            print(f"[privsep] child could not leave the terminal's session: "
+                  f"{exc}", file=sys.stderr)
+            os._exit(70)
         try:
             drop_privileges(uid, gid)
         except PrivsepError as exc:
@@ -255,10 +271,32 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     # through it -- producing the "Broken pipe / FAILED to restore" cascade.
     # The gate instead keeps serving until the analyzer finishes its cleanup
     # and closes the connection, which is what ends serve_forever() cleanly.
+    #
+    # The analyzer is in a session of its own now (see above), so the
+    # terminal's Ctrl-C, Ctrl-\ and hangup no longer reach it directly. The
+    # gate passes those on instead: the analyzer still sees exactly the signal
+    # it used to, and its exit is what ends the gate. SIGTERM is still only
+    # ignored -- systemd delivers it to every process in the unit, and
+    # forwarding it would deliver it twice.
+    #
+    # Ctrl-Z is ignored. Off the controlling tty the analyzer is also outside
+    # job control, so suspending the gate alone would hand the terminal back
+    # to the shell while the analyzer went on reading it.
     import signal
-    for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+
+    def _forward(signum, _frame):
         try:
-            signal.signal(_sig, signal.SIG_IGN)
+            os.kill(pid, signum)
+        except OSError:
+            pass
+
+    for _sig, _handler in ((signal.SIGINT, _forward),
+                           (signal.SIGHUP, _forward),
+                           (signal.SIGQUIT, _forward),
+                           (signal.SIGTERM, signal.SIG_IGN),
+                           (signal.SIGTSTP, signal.SIG_IGN)):
+        try:
+            signal.signal(_sig, _handler)
         except (ValueError, OSError):
             pass
 

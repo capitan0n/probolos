@@ -70,6 +70,39 @@ class NotificationError(Exception):
     pass
 
 
+def _gvariant_string(text: str) -> str:
+    """
+    `text` as a GVariant text-format string literal, for a gdbus argument.
+
+    gdbus does not pass its arguments through as strings: it PARSES each one
+    as GVariant text, and one that does not parse is wrapped in quotes with
+    only `"` escaped and parsed again. Either way backslash sequences are
+    decoded, so a device name holding the plain ASCII text \\u003c reached the
+    notification server as '<' -- after html.escape had already run, and
+    after textsafe had turned a real U+202E into the visible text \\u202e,
+    which gdbus then turned straight back into U+202E. The two sanitisers in
+    front of this call were being undone by the call itself.
+
+    A literal that gdbus parses on its first attempt decodes to exactly the
+    text given: backslash and quote are escaped, and control characters are
+    written as escapes rather than relied on to survive the tokenizer.
+    """
+    out = ['"']
+    for char in text:
+        if char == "\\":
+            out.append("\\\\")
+        elif char == '"':
+            out.append('\\"')
+        elif char == "\n":
+            out.append("\\n")
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            out.append(f"\\u{ord(char):04x}")
+        else:
+            out.append(char)
+    out.append('"')
+    return "".join(out)
+
+
 class Notifier:
     """
     Sends notifications and waits for the body to be clicked, via gdbus.
@@ -143,12 +176,15 @@ class Notifier:
         # links and images from it) and carries device-supplied strings, so it
         # gets the same escaping as the dialogs. The summary is plain text.
         body = dialogs._markup_safe(body)
+        # Every string goes in as a quoted GVariant literal, never bare: gdbus
+        # decodes backslash escapes in bare arguments. See _gvariant_string.
         args = [
             self._gdbus, "call", "--session",
             "--dest", "org.freedesktop.Notifications",
             "--object-path", "/org/freedesktop/Notifications",
             "--method", "org.freedesktop.Notifications.Notify",
-            APP_NAME, "0", ICON, summary, body, actions,
+            _gvariant_string(APP_NAME), "0", _gvariant_string(ICON),
+            _gvariant_string(summary), _gvariant_string(body), actions,
             f"{{'urgency': <byte {urgency}>}}", str(timeout_ms),
         ]
         try:

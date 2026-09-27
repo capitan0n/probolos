@@ -193,7 +193,9 @@ class NotificationBodyIsNotMarkup(unittest.TestCase):
             notifier.notify("New USB device",
                             '<a href="https://evil.example/">approve</a>')
         argv = run.call_args[0][0]
-        body = argv[argv.index("New USB device") + 1]
+        # String arguments are GVariant literals now; JSON reads that subset.
+        import json
+        body = json.loads(argv[argv.index('"New USB device"') + 1])
         self.assertNotIn("<a", body)
         self.assertIn("&lt;a href=", body)
 

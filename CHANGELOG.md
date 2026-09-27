@@ -2,6 +2,37 @@
 
 All notable changes to Probolos. Versioning is semantic.
 
+## [Unreleased] — input that crossed a boundary
+
+Four findings, each reproduced against the unpatched tree before it was fixed.
+Regression tests are in `tests/test_escape_and_terminal_boundaries.py`.
+
+### Security
+
+- **A keyboard could answer the terminal prompt about itself.** Stage 3 turns
+  the device on before `EVIOCGRAB` takes it, and keystrokes sent in that
+  window reach the focused window, usually the terminal running Probolos.
+  `y⏎` queued there, or `authorize⏎` on a CRITICAL prompt, was then read as
+  the operator's answer. The prompt now flushes the terminal's input queue
+  first and says how many bytes it discarded.
+- **The `--privsep` analyzer could type into the shell that started it.** It
+  kept the terminal as its controlling tty, so `ioctl(TIOCSTI)` could queue a
+  command for the root shell (or one with a cached sudo ticket) to run when
+  Probolos exited. The analyzer now calls `setsid()` before dropping
+  privilege; the gate forwards Ctrl-C, Ctrl-\ and hangup to it, and ignores
+  Ctrl-Z, since suspending the gate alone would leave the analyzer reading
+  the terminal alongside the shell.
+- **gdbus undid the sanitising of the notification body.** gdbus parses its
+  arguments as GVariant text and decodes backslash escapes, so plain ASCII in
+  a device string reached the notification server as live markup, and the
+  visible `\u202e` that textsafe writes came out as a real bidi override.
+  Every string argument is now passed as a quoted GVariant literal.
+- **zenity and kdialog did the same to the decision dialog.** zenity
+  `g_strcompress()`es the text before rendering it as Pango markup, so octal
+  escapes became tags after `_markup_safe` had run. kdialog decodes `\n`,
+  which let a device add lines to the prompt. Backslashes in the dialog text
+  are now doubled, which both tools decode back to one.
+
 ## [Unreleased] — the sixth review
 
 A pass over the privilege boundary, the agent socket and the parsers. Every

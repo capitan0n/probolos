@@ -65,6 +65,23 @@ def _markup_safe(text: str) -> str:
     return html.escape(text, quote=True)
 
 
+def _backslash_safe(text: str) -> str:
+    """
+    Protect a dialog's TEXT argument from the backend's own unescaping.
+
+    Neither tool displays --text as given. zenity runs it through
+    g_strcompress() before gtk_label_set_markup(), which decodes \\n, \\t and
+    octal \\NNN -- so the plain ASCII a device can put in its product string,
+    \\074a href=\\042...\\042\\076, came out as a live <a href="..."> link,
+    AFTER _markup_safe had checked it and found no '<' to escape. kdialog's
+    Utils::parseString() decodes \\n, which forges extra lines in the prompt,
+    the thing textsafe escapes U+2028 and every real control character to
+    prevent. Both decode a doubled backslash to one, so doubling every
+    backslash makes the text they display exactly the text given.
+    """
+    return text.replace("\\", "\\\\")
+
+
 # Three-way answers, matching the terminal prompt's [y]es once / [a]lways / [N]o.
 CHOICE_ONCE = "once"
 CHOICE_ALWAYS = "always"
@@ -124,7 +141,7 @@ class KDialogBackend(DialogBackend):
         # uniformity and in case a device name is ever folded into it.
         args = [self._binary, "--title", _markup_safe(title),
                 "--yes-label", yes_label, "--no-label", no_label,
-                "--warningyesno", _markup_safe(text)]
+                "--warningyesno", _backslash_safe(_markup_safe(text))]
         try:
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
@@ -146,7 +163,7 @@ class KDialogBackend(DialogBackend):
                 "--yes-label", once_label,
                 "--no-label", always_label,
                 "--cancel-label", no_label,
-                "--warningyesnocancel", _markup_safe(text)]
+                "--warningyesnocancel", _backslash_safe(_markup_safe(text))]
         try:
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
@@ -179,7 +196,7 @@ class ZenityBackend(DialogBackend):
         # zenity builds and would make the call fail outright; html.escape
         # neutralises the same five characters Pango uses and works everywhere.
         args = [self._binary, "--question", "--title", _markup_safe(title),
-                "--text", _markup_safe(text),
+                "--text", _backslash_safe(_markup_safe(text)),
                 "--ok-label", yes_label, "--cancel-label", no_label,
                 "--default-cancel"]
         try:
@@ -198,7 +215,7 @@ class ZenityBackend(DialogBackend):
         # its own label on stdout and exits non-zero. So: OK means once, the
         # extra button means always, and anything else is a refusal.
         args = [self._binary, "--question", "--title", _markup_safe(title),
-                "--text", _markup_safe(text),
+                "--text", _backslash_safe(_markup_safe(text)),
                 "--ok-label", once_label, "--cancel-label", no_label,
                 "--extra-button", always_label, "--default-cancel"]
         try:
