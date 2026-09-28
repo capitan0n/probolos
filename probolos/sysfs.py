@@ -457,7 +457,6 @@ def _check_block_node(path):
     refused with a reason that was false, and the real one (the node was not
     there yet) discarded. stage 4 was skipped for every medium that hit it.
     """
-    import stat as _stat
     try:
         resolved = Path(os.path.realpath(str(path)))
     except (OSError, ValueError):
@@ -472,9 +471,25 @@ def _check_block_node(path):
         return None, "device node does not exist yet", True
     except (OSError, ValueError) as exc:
         return None, f"cannot stat the node: {exc}", False
-    if not _stat.S_ISBLK(st.st_mode):
-        return None, "not a block device", False
+    reason, transient = _whole_disk_reason(st, resolved.name)
+    if reason:
+        return None, reason, transient
+    return resolved, "", False
 
+
+def _whole_disk_reason(st, name: str):
+    """
+    Why the inode `st` describes is not the whole disk `name`: (reason,
+    transient), or ("", False) when it is.
+
+    Takes a stat result rather than a path so the SAME test runs on the path
+    before the open and on the opened descriptor after it (os.fstat). The
+    second run is the one that counts: it is about the inode the parser will
+    actually read.
+    """
+    import stat as _stat
+    if not _stat.S_ISBLK(st.st_mode):
+        return "not a block device", False
     number = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
     try:
         kernel = Path(os.path.realpath(f"{SYS_DEV_BLOCK}/{number}"))
@@ -483,13 +498,13 @@ def _check_block_node(path):
     except (OSError, ValueError):
         registered, is_partition = False, False
     if not registered:
-        return None, f"the kernel has no block device {number} yet", True
+        return f"the kernel has no block device {number} yet", True
     if is_partition:
-        return None, f"the kernel reports {number} is a partition", False
-    if kernel.name != resolved.name:
-        return None, (f"device {number} is {kernel.name} to the kernel, "
-                      f"not {resolved.name}"), False
-    return resolved, "", False
+        return f"the kernel reports {number} is a partition", False
+    if kernel.name != name:
+        return (f"device {number} is {kernel.name} to the kernel, "
+                f"not {name}"), False
+    return "", False
 
 
 def _safe_block_node(path: str) -> Optional[Path]:
@@ -512,19 +527,30 @@ def block_node_pending(path) -> Optional[str]:
     return reason if transient else None
 
 
-def _open_device_node(path, validator, what: str) -> int:
+def _open_device_node(path, validator, what: str, fd_reason) -> int:
     """
     Open a validated device node read-only, refusing a swapped inode.
 
-    O_NOFOLLOW on the final component, and the st_rdev of the opened
-    descriptor is compared against the node that was validated -- the same
-    pair of checks gate_server._do_open_input makes, for the same reason: the
-    validation and the open are two separate syscalls, and /dev is populated
-    by udev while this runs.
+    O_NOFOLLOW on the final component, and the opened DESCRIPTOR is validated
+    again (`fd_reason`, on os.fstat) -- the same pair of checks
+    gate_server._do_open_input makes, for the same reason: the validation and
+    the open are two separate syscalls, and /dev is populated by udev while
+    this runs.
+
+    THE DESCRIPTOR, NOT THE PATH (bug fix)
+    --------------------------------------
+    The post-open check used to compare fstat(fd).st_rdev with a FRESH stat of
+    the path. A node replaced between validation and open is replaced for both
+    calls, so they agreed: a regular file swapped in for /dev/sda reported
+    st_rdev 0 twice, passed, and its bytes went to the partition parser as if
+    they were the disk. Only the descriptor says what will be read, so the
+    kind of file and (for a disk) the kernel's record of its number are
+    checked on it.
 
     `validator` returns (node, reason, transient). A transient failure is
     reported as what it is -- the node is not there yet -- and never as "not a
     <what>", which would be a false statement about a healthy device.
+    `fd_reason(st, node)` returns why the opened inode is refused, or "".
     """
     node, reason, transient = validator(path)
     if node is None:
@@ -535,12 +561,31 @@ def _open_device_node(path, validator, what: str) -> int:
     fd = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW |
                  os.O_CLOEXEC)
     try:
-        if os.fstat(fd).st_rdev != node.stat().st_rdev:
-            raise OSError(f"{node} changed during open; refusing it")
+        problem = fd_reason(os.fstat(fd), node)
+        if problem:
+            raise OSError(f"{node} changed during open; refusing it: "
+                          f"not a {what} ({problem})")
     except BaseException:
         os.close(fd)
         raise
     return fd
+
+
+def _input_fd_reason(st, node) -> str:
+    """The opened inode is still the character device that was validated."""
+    import stat as _stat
+    if not _stat.S_ISCHR(st.st_mode):
+        return "not a character device"
+    try:
+        if st.st_rdev != node.stat().st_rdev:
+            return "device number differs from the node"
+    except OSError as exc:
+        return f"cannot stat the node: {exc}"
+    return ""
+
+
+def _block_fd_reason(st, node) -> str:
+    return _whole_disk_reason(st, node.name)[0]
 
 
 class _DirectBackend:
@@ -607,11 +652,11 @@ class _DirectBackend:
     def open_input(self, node_path) -> int:
         return _open_device_node(
             node_path, lambda p: (_safe_input_node(p), "", False),
-            "input node")
+            "input node", _input_fd_reason)
 
     def open_block(self, device_path) -> int:
         return _open_device_node(device_path, _check_block_node,
-                                 "whole-disk block device")
+                                 "whole-disk block device", _block_fd_reason)
 
     def set_drivers_autoprobe(self, value: int) -> None:
         # Bus-wide, and the single most dangerous write in the codebase: left

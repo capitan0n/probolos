@@ -193,7 +193,6 @@ class GateServer:
         check. Mirrors sysfs._check_block_node; the reason travels back in the
         DENIED detail so a refusal says why instead of only that it happened.
         """
-        import stat as _stat
         try:
             resolved = os.path.realpath(path)
         except (OSError, ValueError):
@@ -210,8 +209,23 @@ class GateServer:
             return None, "device node does not exist yet"
         except (OSError, ValueError) as exc:
             return None, f"cannot stat the node: {exc}"
+        reason = GateServer._whole_disk_reason(st, p.name)
+        if reason:
+            return None, reason
+        return p, ""
+
+    @staticmethod
+    def _whole_disk_reason(st, name: str) -> str:
+        """
+        Why the inode `st` describes is not the whole disk `name`, or "".
+
+        A stat result rather than a path, so _do_open_block can put the opened
+        DESCRIPTOR through the same test (os.fstat): that is the inode the
+        analyzer will read. Mirrors sysfs._whole_disk_reason.
+        """
+        import stat as _stat
         if not _stat.S_ISBLK(st.st_mode):
-            return None, "not a block device"
+            return "not a block device"
         number = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
         try:
             kernel = Path(os.path.realpath(f"{SYS_DEV_BLOCK}/{number}"))
@@ -220,13 +234,13 @@ class GateServer:
         except (OSError, ValueError):
             registered, is_partition = False, False
         if not registered:
-            return None, f"the kernel has no block device {number} yet"
+            return f"the kernel has no block device {number} yet"
         if is_partition:
-            return None, f"the kernel reports {number} is a partition"
-        if kernel.name != p.name:
-            return None, (f"device {number} is {kernel.name} to the kernel, "
-                          f"not {p.name}")
-        return p, ""
+            return f"the kernel reports {number} is a partition"
+        if kernel.name != name:
+            return (f"device {number} is {kernel.name} to the kernel, "
+                    f"not {name}")
+        return ""
 
     @classmethod
     def _safe_block_path(cls, path: str) -> Optional[Path]:
@@ -709,7 +723,12 @@ class GateServer:
         fd = None
         try:
             fd = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-            if (os.fstat(fd).st_rdev != node.stat().st_rdev
+            # The descriptor's own kind, not only its number: a node swapped
+            # for a regular file between the check and the open has st_rdev 0
+            # both through the fd and through the path, so the numbers agree.
+            st = os.fstat(fd)
+            if (not stat.S_ISCHR(st.st_mode)
+                    or st.st_rdev != node.stat().st_rdev
                     or self._open_scope_parent_of(node) is None):
                 os.close(fd)
                 return protocol.Response(protocol.DENIED, "device changed during open"), None
@@ -747,10 +766,17 @@ class GateServer:
         fd = None
         try:
             fd = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-            if (os.fstat(fd).st_rdev != node.stat().st_rdev
-                    or not in_scope()):
+            # The whole-disk test again, on the DESCRIPTOR. Comparing its
+            # st_rdev with a fresh stat of the path proved nothing: a node
+            # replaced between the check and the open is replaced for both, so
+            # a regular file (st_rdev 0 twice) was passed back as the disk.
+            problem = self._whole_disk_reason(os.fstat(fd), node.name)
+            if problem or not in_scope():
                 os.close(fd)
-                return protocol.Response(protocol.DENIED, "device changed during open"), None
+                detail = "device changed during open"
+                if problem:
+                    detail += f": {problem}"
+                return protocol.Response(protocol.DENIED, detail), None
             return protocol.Response(protocol.OK, has_fd=True), fd
         except OSError as exc:
             if fd is not None:

@@ -560,8 +560,13 @@ class GateMediaScope(unittest.TestCase):
     def test_open_block_consults_the_media_scope(self):
         gate = self.gate()
         node = self.dev / "sdz"
+        # The node here is a regular file, so the descriptor-level whole-disk
+        # check is stubbed along with the path-level one: this test is about
+        # scope, and the descriptor check has its own tests in test_sysfs.
         with mock.patch.object(gate_server.GateServer, "_check_block_path",
-                               staticmethod(lambda _p: (node, ""))):
+                               staticmethod(lambda _p: (node, ""))), \
+                mock.patch.object(gate_server.GateServer, "_whole_disk_reason",
+                                  staticmethod(lambda _st, _name: "")):
             resp, fd = gate._do_open_block(protocol.Request(
                 protocol.REQ_OPEN_BLOCK, path=str(node)))
         self.assertTrue(resp.ok, resp.detail)

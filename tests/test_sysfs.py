@@ -420,6 +420,77 @@ class ALateNodeIsNotMisreported(_TreeCase):
                       sysfs.block_node_pending(node))
 
 
+class TheOpenedDescriptorIsChecked(_TreeCase):
+    """
+    /dev/sda replaced between validation and open.
+
+    The post-open check compared fstat(fd) with a fresh stat of the PATH, and
+    a swapped path is swapped for both: a regular file read st_rdev 0 twice
+    and went to the partition parser as the disk. The checks are now made on
+    the descriptor, in both halves.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tree.disk("sda", 8, 0)
+        self.tree.disk("sda1", 8, 1, partition_of="sda")
+        self.node = self.tree.node("sda", 8, 0)
+
+    def _swap_on_open(self, replacement):
+        """Patch os.open to rename `replacement` over the node, then open."""
+        real_open = os.open
+
+        def swapping_open(path, flags, *a, **kw):
+            if str(path) == self.node:
+                os.rename(replacement, self.node)
+            return real_open(path, flags, *a, **kw)
+
+        return mock.patch("os.open", swapping_open)
+
+    def _payload(self):
+        path = self.tree.dev / "payload"
+        path.write_bytes(b"\x55\xaa" * 256)
+        return path
+
+    def test_direct_refuses_a_regular_file_swapped_in(self):
+        with self._swap_on_open(self._payload()):
+            message = self.refusal(self.node)
+        self.assertIn("changed during open", message)
+        self.assertIn("not a block device", message)
+
+    def test_direct_refuses_a_partition_swapped_in(self):
+        """The same number check the path passed, re-run on what was opened."""
+        partition = self.tree.node("staged", 8, 1)
+        with self._swap_on_open(partition):
+            message = self.refusal(self.node)
+        self.assertIn("partition", message)
+
+    def test_gate_refuses_a_regular_file_swapped_in(self):
+        from probolos import protocol
+        server = gate_server.GateServer(sock=None, log=lambda *_a: None)
+        with mock.patch.object(server, "_open_scope_parent_of",
+                               lambda _n: Path("/sys/devices/usb1/1-1")), \
+                self._swap_on_open(self._payload()):
+            resp, fd = server._do_open_block(protocol.Request(
+                protocol.REQ_OPEN_BLOCK, path=self.node))
+        self.assertIsNone(fd)
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertIn("not a block device", resp.detail)
+
+    def test_a_symlink_to_a_regular_file_is_refused(self):
+        os.unlink(self.node)
+        os.symlink(self._payload(), self.node)
+        self.assertIn("not a", self.refusal(self.node))
+
+    def test_input_descriptor_must_be_a_character_device(self):
+        import stat
+        import types
+        node = Path(self.node)
+        regular = types.SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_rdev=0)
+        self.assertIn("not a character device",
+                      sysfs._input_fd_reason(regular, node))
+
+
 class TheTwoHalvesAgree(_TreeCase):
     """gate_server duplicates the check; pin it to the same answers."""
 
