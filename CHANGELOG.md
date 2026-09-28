@@ -47,6 +47,14 @@ All notable changes to Probolos. Versioning is semantic.
   re-imports left over from merging test modules, unused imports and dead
   locals are removed.
 - `.github/workflows/tests.yml` runs ruff and the suite on 3.10 and 3.12.
+- **The test suite is organised by module: 28 files became 13.** Half the
+  files were named after the security review that produced them, so the
+  tests for one module were spread over up to eleven files. Each file now
+  covers named modules (see the table in README.md); the review regressions
+  are classes named after the defect they pin. Builders shared between files
+  moved to `tests/_support.py`, and seven helpers that shared a name with a
+  different one elsewhere were renamed for what they build. Same 798 tests,
+  same class and method names, and each file also passes on its own.
 - README: the install step for `pyudev`, PyYAML as an optional requirement,
   and `tests/audit/` references corrected — that directory no longer exists.
 

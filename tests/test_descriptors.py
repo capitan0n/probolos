@@ -1,58 +1,95 @@
 """
-Descriptor parsing: the well-formed path and the hostile one.
+USB descriptor parsing: the well-formed path, the hardened walker, and
+declared power.
 
-The sysfs `descriptors` blob is the only thing Probolos can read while
-a device is still blocked, so every claim the rules judge comes through
-here. Both halves live together because they are the same question
-asked twice: what does this device say, and what happens when it lies
-about how much it is saying.
-
-Merged from: test_descriptors.py, test_descriptors_malformed.py
+Covers probolos.descriptors, probolos.descriptors_safe and probolos.usbclass.
 """
-from __future__ import annotations
 
-# =========================================================================
-# test_descriptors.py
-#
-# Tests for the descriptor parser.
-# =========================================================================
+from __future__ import annotations
 
 import struct
 import unittest
 
-from probolos import descriptors, usbclass
+from probolos import descriptors, descriptors_safe, rules, usbclass
+from probolos.descriptors_safe import (
+    DescriptorParsingError,
+    effective_total_length,
+    safe_parse,
+    take,
+    walk_descriptors,
+    walk_hid_items,
+    wtotallength_mismatch,
+)
+from tests._support import (
+    config_desc,
+    device_desc,
+    endpoint_desc,
+    iface_desc,
+    power_config_desc,
+    power_device_desc,
+)
 
 
-# ---------------------------------------------------------------------------
-# Builders: synthesise the same bytes the kernel would hand us
-# ---------------------------------------------------------------------------
+def _expect_error(fn, *args, **kwargs):
+    try:
+        result = fn(*args, **kwargs)
+        # Οι generators δεν εκτελούνται μέχρι να καταναλωθούν.
+        if hasattr(result, "__iter__") and not isinstance(result, (bytes, str)):
+            list(result)
+    except DescriptorParsingError:
+        return True
+    raise AssertionError(f"περίμενα DescriptorParsingError από {fn.__name__}")
 
-def device_desc(vid, pid, dev_class=0x00, num_configs=1):
+
+def _device_descriptor() -> bytes:
+    return bytes([18, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
+                  0xd2, 0x04, 0x2b, 0xc5, 0x00, 0x01, 1, 2, 3, 1])
+
+
+def hid_device_desc(vid=0x1234, pid=0x5678, bcd_usb=0x0200, num_configs=1):
     return struct.pack(
         "<BBHBBBBHHHBBBB",
-        18, 0x01,          # bLength, DEVICE
-        0x0200,            # bcdUSB 2.0
-        dev_class, 0, 0,   # class/subclass/protocol
-        64,                # bMaxPacketSize0
-        vid, pid,
-        0x0100,            # bcdDevice
-        1, 2, 3,           # string indices
-        num_configs,
-    )
+        18, 0x01, bcd_usb, 0x00, 0, 0, 64,
+        vid, pid, 0x0100, 0, 0, 0, num_configs)
 
 
-def config_desc(total_len, num_ifaces, value=1):
-    return struct.pack("<BBHBBBBB",
-                       9, 0x02, total_len, num_ifaces, value, 0, 0x80, 50)
+def hid_config_desc(total, n_ifaces=1, max_power=50):
+    return struct.pack("<BBHBBBBB", 9, 0x02, total, n_ifaces, 1, 0, 0x80,
+                       max_power)
 
 
-def iface_desc(num, cls, subcls=0, proto=0, alt=0, n_eps=1):
-    return struct.pack("<BBBBBBBBB",
-                       9, 0x04, num, alt, n_eps, cls, subcls, proto, 0)
+def hid_iface_desc(cls=0x03, num=0):
+    return struct.pack("<BBBBBBBBB", 9, 0x04, num, 0, 1, cls, 0, 0, 0)
 
 
-def endpoint_desc():
-    return struct.pack("<BBBBHB", 7, 0x05, 0x81, 0x02, 512, 0)
+class _Stub:
+    """Duck-typed device, matching tests/test_rules.py's FakeDevice.
+
+    interfaces and interface_classes must be properties derived from the
+    descriptor set, not empty lists: the rule engine reads them, and a stub
+    that hands back [] silently disables half the rules under test.
+    """
+
+    def __init__(self, ds):
+        self.descriptor_set = ds
+        self.vendor_id = "1234"
+        self.product_id = "5678"
+        self.manufacturer = None
+        self.product = None
+        self.serial = None
+        self.speed = "12"
+        self.parse_error = None
+
+    @property
+    def interfaces(self):
+        return self.descriptor_set.primary_interfaces()
+
+    @property
+    def interface_classes(self):
+        return self.descriptor_set.interface_classes()
+
+    def label(self):
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -157,51 +194,9 @@ class TestParser(unittest.TestCase):
             descriptors.parse(bytes(blob))
 
 
-# =========================================================================
-# test_descriptors_malformed.py
-#
-# test_descriptors_malformed.py — Regression tests για το αμυντικό parsing.
-# =========================================================================
-
-
-# Δουλεύει και ως μέρος του πακέτου (pytest από τη ρίζα του repo)
-# και σκέτο (python test_descriptors_malformed.py μέσα στον φάκελο).
-try:
-    from probolos.descriptors_safe import (        # type: ignore
-        DescriptorParsingError,
-        effective_total_length,
-        safe_parse,
-        take,
-        walk_descriptors,
-        walk_hid_items,
-        wtotallength_mismatch,
-    )
-except ImportError:
-    from descriptors_safe import (                 # type: ignore
-        DescriptorParsingError,
-        effective_total_length,
-        safe_parse,
-        take,
-        walk_descriptors,
-        walk_hid_items,
-        wtotallength_mismatch,
-    )
-
-def _expect_error(fn, *args, **kwargs):
-    try:
-        result = fn(*args, **kwargs)
-        # Οι generators δεν εκτελούνται μέχρι να καταναλωθούν.
-        if hasattr(result, "__iter__") and not isinstance(result, (bytes, str)):
-            list(result)
-    except DescriptorParsingError:
-        return True
-    raise AssertionError(f"περίμενα DescriptorParsingError από {fn.__name__}")
-
-
 # --------------------------------------------------------------------------
 # take() — το σιωπηλό slicing της Python
 # --------------------------------------------------------------------------
-
 
 class DefensiveParsing(unittest.TestCase):
     """
@@ -391,4 +386,147 @@ class DefensiveParsing(unittest.TestCase):
         assert result == 42 and err is None
 
 
-    # --------------------------------------------------------------------------
+class FloodGuardSitsAboveRealHardware(unittest.TestCase):
+
+    def test_a_webcams_worth_of_descriptors_is_accepted(self):
+        iface = bytes([0x09, 0x04, 0x00, 0x00, 0x01, 0x0E, 0x02, 0x00, 0x00])
+        config = bytes([0x09, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0x80, 0x32])
+        parsed = descriptors.parse(_device_descriptor() + config + iface * 400)
+        self.assertIsNone(parsed.truncated)
+        self.assertEqual(len(parsed.configs[0].interfaces), 400)
+
+    def test_the_guard_still_exists(self):
+        blob = _device_descriptor() + b"\x02\x02" * (
+            descriptors_safe.MAX_DESCRIPTOR_ITEMS + 1)
+        with self.assertRaises(descriptors.DescriptorParseError):
+            descriptors.parse(blob)
+
+    def test_a_zero_length_descriptor_is_still_refused(self):
+        """
+        The termination guarantee, which is the reason the walker exists at
+        all: bLength=0 would never advance the offset.
+        """
+        with self.assertRaises(descriptors_safe.DescriptorParsingError):
+            list(descriptors_safe.walk_descriptors(b"\x00\x02\x00\x00"))
+
+
+class TestPowerUnits(unittest.TestCase):
+    """The shipped bug. One byte, two meanings, depending on bcdUSB."""
+
+    def test_usb2_uses_2ma_units(self):
+        ds = descriptors.parse(power_device_desc(0x0200) + power_config_desc(50))
+        self.assertEqual(ds.configs[0].max_power_ma, 100)
+        self.assertEqual(ds.configs[0].power_unit_ma, 2)
+
+    def test_superspeed_uses_8ma_units(self):
+        """The same byte means four times as much on USB 3.x."""
+        ds = descriptors.parse(power_device_desc(0x0300) + power_config_desc(50))
+        self.assertEqual(ds.configs[0].max_power_ma, 400)
+        self.assertEqual(ds.configs[0].power_unit_ma, 8)
+
+    def test_usb31_and_32_also_use_8ma_units(self):
+        for bcd in (0x0310, 0x0320):
+            ds = descriptors.parse(power_device_desc(bcd) + power_config_desc(50))
+            self.assertEqual(ds.configs[0].max_power_ma, 400)
+
+    def test_raw_byte_is_preserved_for_audit(self):
+        ds = descriptors.parse(power_device_desc(0x0300) + power_config_desc(50))
+        self.assertEqual(ds.configs[0].max_power_raw, 50)
+
+    def test_bus_limits_follow_the_specification(self):
+        self.assertEqual(descriptors.bus_power_limit_ma(0x0200), 500)
+        self.assertEqual(descriptors.bus_power_limit_ma(0x0300), 900)
+
+    def test_attribute_bits_are_decoded(self):
+        bus = descriptors.parse(power_device_desc() + power_config_desc(50, attrs=0x80))
+        self.assertFalse(bus.configs[0].self_powered)
+
+        selfp = descriptors.parse(power_device_desc() + power_config_desc(0, attrs=0xC0))
+        self.assertTrue(selfp.configs[0].self_powered)
+
+        wake = descriptors.parse(power_device_desc() + power_config_desc(50, attrs=0xA0))
+        self.assertTrue(wake.configs[0].remote_wakeup)
+
+
+# ==========================================================================
+# descriptors.parse() now walks through descriptors_safe
+# ==========================================================================
+
+class ParserUsesTheHardenedWalker(unittest.TestCase):
+
+    def test_a_flood_of_tiny_descriptors_is_refused(self):
+        """The protection that only descriptors_safe had, and nothing used.
+
+        The loop this replaced bounded every descriptor's SIZE but never their
+        COUNT, so 200_000 two-byte items were walked one at a time. Not fatal
+        on its own -- which is exactly how a bound goes missing.
+        """
+        from probolos.descriptors_safe import MAX_DESCRIPTOR_ITEMS
+        blob = hid_device_desc() + b"\x02\x02" * (MAX_DESCRIPTOR_ITEMS + 1)
+        with self.assertRaises(descriptors.DescriptorParseError):
+            descriptors.parse(blob)
+
+    def test_an_ordinary_composite_device_is_not_refused_as_a_flood(self):
+        """The ceiling must sit above real hardware, not through it.
+
+        At 256 descriptors for the whole blob, a UVC webcam with its usual
+        run of alternate settings tripped the flood guard, and the flood
+        guard is non-recoverable -- so the device was refused outright:
+        parse_error set, inspection_safe False, no behavioural or storage
+        stage, and a WARNING on somebody's own camera.
+        """
+        body = hid_config_desc(total=9 + 9 * 300) + hid_iface_desc() * 300
+        ds = descriptors.parse(hid_device_desc() + body)
+        self.assertIsNone(ds.truncated)
+        self.assertEqual(len(ds.configs), 1)
+        self.assertEqual(len(ds.configs[0].interfaces), 300)
+
+    def test_a_truncated_tail_is_still_kept_and_now_reported(self):
+        """The behaviour that had to survive the rewrite.
+
+        A tail that stops early is common on merely buggy hardware, so it must
+        not become a refusal. What changed is that it is no longer discarded in
+        silence.
+        """
+        body = hid_config_desc(total=27) + hid_iface_desc() + b"\x09\x04\x00"
+        ds = descriptors.parse(hid_device_desc() + body)
+        self.assertEqual(len(ds.primary_interfaces()), 1)
+        self.assertIsNotNone(ds.truncated)
+
+    def test_the_truncation_reaches_the_operator_as_a_finding(self):
+        body = hid_config_desc(total=27) + hid_iface_desc() + b"\x09\x04\x00"
+        ds = descriptors.parse(hid_device_desc() + body)
+        found = rules.evaluate(_Stub(ds))
+        self.assertIn("descriptor-chain-truncated", {f.rule_id for f in found})
+
+    def test_overstated_wtotallength_is_reported(self):
+        """The fingerprint of a hand-edited descriptor set: vendor toolchains
+        compute this field, so a mismatch is not a typo."""
+        body = hid_config_desc(total=0xFFFF) + hid_iface_desc()
+        ds = descriptors.parse(hid_device_desc() + body)
+        self.assertGreater(ds.length_overstated, 0)
+        found = rules.evaluate(_Stub(ds))
+        self.assertIn("descriptor-length-overstated",
+                      {f.rule_id for f in found})
+
+    def test_an_honest_device_produces_neither_finding(self):
+        """The false-positive guard. A rule that fires on ordinary hardware is
+        worse than no rule, because it teaches the operator to click through."""
+        body = hid_config_desc(total=18) + hid_iface_desc()
+        ds = descriptors.parse(hid_device_desc() + body)
+        self.assertIsNone(ds.truncated)
+        self.assertEqual(ds.length_overstated, 0)
+        ids = {f.rule_id for f in rules.evaluate(_Stub(ds))}
+        self.assertNotIn("descriptor-chain-truncated", ids)
+        self.assertNotIn("descriptor-length-overstated", ids)
+
+    def test_zero_blength_is_still_fatal(self):
+        """Not recoverable, and must not be softened into a warning: the walk
+        cannot advance past it by any amount."""
+        blob = hid_device_desc() + b"\x00\x02\xff\xff"
+        with self.assertRaises(descriptors.DescriptorParseError):
+            descriptors.parse(blob)
+
+
+if __name__ == "__main__":
+    unittest.main()

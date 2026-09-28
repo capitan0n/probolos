@@ -236,12 +236,29 @@ The suite needs only the standard library: no root, no USB hardware and no
 `pyudev` (a few tests skip themselves when an optional piece such as PyYAML
 is missing).
 
-`tests/` holds one module per subject — `test_gate.py`, `test_ledger.py`,
-`test_rules.py` and so on — alongside the regression tests from each security
-review, named by what that review found rather than by its number (for
-example `test_forged_signatures.py`, `test_escape_and_terminal_boundaries.py`):
-a round number stops meaning anything past the third one, while a theme keeps
-working however many passes the project accumulates.
+`tests/` holds one module per area of the code, and each file's docstring
+names the modules it covers: a bug in `probolos/trust.py` gets its regression
+test in `tests/test_trust.py`, `probolos/storage.py` in `test_storage.py`, and
+so on. The regression tests from the security reviews live there too, as
+classes named after the defect they pin (`AnalyzerHasNoControllingTerminal`,
+`TheDecoyFromTheReport`) rather than after the review that found it.
+Builders and fixtures used by more than one file are in `tests/_support.py`.
+
+| File | Covers |
+|---|---|
+| `test_agent.py` | `agent`, `agentlink`, `dialogs` |
+| `test_cli.py` | `__main__` |
+| `test_daemon.py` | `daemon`, `session` |
+| `test_descriptors.py` | `descriptors`, `descriptors_safe`, `usbclass` |
+| `test_gate.py` | `gate`, `safety` |
+| `test_ledger.py` | `ledger`, `history` |
+| `test_privsep.py` | `privsep`, `gate_server`, `gate_client`, `protocol` |
+| `test_quarantine.py` | `quarantine`, `payload`, `deferred_bind` |
+| `test_rules.py` | `rules`, `analyzers`, `report` |
+| `test_storage.py` | `storage`, `storage_hardening`, `mediawatch` |
+| `test_sysfs.py` | `sysfs` |
+| `test_textsafe.py` | `textsafe` |
+| `test_trust.py` | `trust`, `atomicio` |
 
 `testbed/` emulates USB devices in software via `dummy_hcd` + `raw_gadget`,
 with presets for BadUSB, descriptor drift and overpowered devices — so the

@@ -1,23 +1,42 @@
 """
-The daemon loop: screen-lock policy, the held queue, and the order the
-inspection stages run in.
+The daemon loop: screen-lock policy, the held queue, stage ordering, the
+terminal prompt, and recovery when the event stream or a medium fails.
 
-Merged from: test_session.py, test_stage_ordering.py
+Covers probolos.daemon and probolos.session.
 """
+
 from __future__ import annotations
 
-# =========================================================================
-# test_session.py
-#
-# Tests for the screen-lock policy.
-# =========================================================================
-
+import contextlib
+import errno
+import io
+import json
+import os
+import pty
+import select
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from probolos import __main__ as cli
+from probolos import (
+    daemon,
+    mediawatch,
+    report,
+    rules,
+    session,
+    storage,
+    sysfs,
+    usbclass,
+)
 from probolos import daemon as daemon_mod
-from probolos import session, sysfs, usbclass
 
 
 def make_device(name="3-9", kinds=None):
@@ -51,6 +70,75 @@ def make_device(name="3-9", kinds=None):
     dev.speed = "480"
     dev.instance_id = (1, 1000 + abs(hash(name)) % 1000)
     dev.inspection_safe = True
+    return dev
+
+
+def make_stage_device(name="3-9", kinds=None):
+    dev = mock.Mock(spec=sysfs.UsbDevice)
+    dev.name = name
+    dev.syspath = Path(f"/sys/bus/usb/devices/{name}")
+    dev.kinds = kinds or [usbclass.KIND_STORAGE]
+    dev.is_root_hub = False
+    dev.claims = ["Mass Storage (SCSI)"]
+    dev.vendor_id, dev.product_id = "0951", "1665"
+    dev.serial = "ABC"
+    dev.raw_descriptors = b"\x12\x01test"
+    dev.removable = "removable"
+    dev.label.return_value = "Kingston DataTraveler"
+    return dev
+
+
+# --------------------------------------------------------------------------
+# 1. The event stream
+# --------------------------------------------------------------------------
+
+class _FakeMonitor:
+    """Stands in for pyudev.Monitor: raises `errors` in order, then stops."""
+
+    def __init__(self, errors, stop_event, fd):
+        self._errors = list(errors)
+        self._stop = stop_event
+        self._fd = fd
+        self.polls = 0
+
+    def filter_by(self, **_kw):
+        pass
+
+    def start(self):
+        pass
+
+    def fileno(self):
+        return self._fd
+
+    def poll(self, timeout=None):
+        self.polls += 1
+        if self._errors:
+            raise self._errors.pop(0)
+        self._stop.set()
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 7. Port is not device
+# ---------------------------------------------------------------------------
+
+def _device(name="3-9", instance=(7, 4242)):
+    dev = mock.Mock(spec=sysfs.UsbDevice)
+    dev.name = name
+    dev.syspath = Path(f"/sys/bus/usb/devices/{name}")
+    dev.instance_id = instance
+    dev.is_root_hub = False
+    dev.kinds = ["storage"]
+    dev.claims = []
+    dev.vendor_id, dev.product_id, dev.serial = "0951", "1665", "A"
+    dev.raw_descriptors = b"\x12\x01"
+    dev.removable = "removable"
+    dev.interfaces, dev.interface_classes = [], []
+    dev.manufacturer, dev.product = "K", "DT"
+    dev.parse_error = dev.descriptor_set = None
+    dev.string_notes, dev.string_note_fields = [], {}
+    dev.speed, dev.inspection_safe = "480", True
+    dev.label.return_value = "K DT"
     return dev
 
 
@@ -216,7 +304,6 @@ class TestUnlockDrainsTheQueue(unittest.TestCase):
         self.assertEqual(engine.pending, {})
 
 
-
 class TestStrandedDevicesAtStartup(unittest.TestCase):
     """
     Found in use: after Ctrl-C with a device still held, restarting Probolos
@@ -339,31 +426,6 @@ class TestHeldDevicesBypassTrust(unittest.TestCase):
         self.assertEqual(seen, [True])
 
 
-# =========================================================================
-# test_stage_ordering.py
-#
-# Regression tests for the stage-3-before-stage-4 ordering (audit finding C1).
-# =========================================================================
-
-import unittest
-
-
-
-def make_stage_device(name="3-9", kinds=None):
-    dev = mock.Mock(spec=sysfs.UsbDevice)
-    dev.name = name
-    dev.syspath = Path(f"/sys/bus/usb/devices/{name}")
-    dev.kinds = kinds or [usbclass.KIND_STORAGE]
-    dev.is_root_hub = False
-    dev.claims = ["Mass Storage (SCSI)"]
-    dev.vendor_id, dev.product_id = "0951", "1665"
-    dev.serial = "ABC"
-    dev.raw_descriptors = b"\x12\x01test"
-    dev.removable = "removable"
-    dev.label.return_value = "Kingston DataTraveler"
-    return dev
-
-
 class StageOrdering(unittest.TestCase):
 
     def setUp(self):
@@ -436,6 +498,7 @@ class StageOrdering(unittest.TestCase):
         """End to end from a real blob: a Pi Zero g_multi-style composite."""
         import struct
         import tempfile
+
         from probolos import storage
 
         def intf(num, cls, sub, proto):
@@ -463,6 +526,676 @@ class StageOrdering(unittest.TestCase):
         self.assertNotIn(1, self.writes,
                          "a storage+network composite was switched on before "
                          "the human decided")
+
+
+class LockMonitorIsNotDecidedBeforeLogin(unittest.TestCase):
+    """
+    detect() fell back to AlwaysUnlocked whenever no graphical session existed
+    yet -- which is always the case for a service started at boot -- and the
+    lock policy then stayed off for the whole run.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.flag = os.path.join(self.tmp, "logged-in")
+        self.loginctl = os.path.join(self.tmp, "loginctl")
+        with open(self.loginctl, "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = list-sessions ]; then\n'
+                f'  [ -f {self.flag} ] && echo "2 1000 alice seat0 tty2"\n'
+                "  exit 0\n"
+                "fi\n"
+                'case "$*" in *LockedHint*) echo LockedHint=yes ;;\n'
+                "  *) echo Type=wayland; echo Remote=no ;; esac\n")
+        os.chmod(self.loginctl, 0o755)
+
+    def test_lock_is_seen_after_a_login_that_followed_startup(self):
+        with mock.patch.object(session, "_LOGINCTL_CANDIDATES",
+                               (self.loginctl,)):
+            monitor = session.detect()
+            self.assertIsNone(monitor.is_locked())      # nobody logged in yet
+            open(self.flag, "w").close()                 # login, then lock
+            self.assertTrue(monitor.is_locked())
+
+    def test_no_logind_still_falls_back(self):
+        with mock.patch.object(session, "_LOGINCTL_CANDIDATES",
+                               (os.path.join(self.tmp, "absent"),)):
+            self.assertIsInstance(session.detect(), session.AlwaysUnlocked)
+
+
+class GreeterSessionIsNotSomeonePresent(unittest.TestCase):
+    """
+    GDM keeps its greeter (user `gdm`, Class=greeter, Type=wayland) running
+    beside the real session and never sets LockedHint. It counted as an
+    unlocked graphical session, so a locked screen read as "someone present"
+    and the greeter account could be chosen to answer the agent.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.loginctl = os.path.join(self.tmp, "loginctl")
+        with open(self.loginctl, "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = list-sessions ]; then\n'
+                '  echo "c1 120 gdm seat0 tty1"; echo "2 1000 alice seat0 tty2"\n'
+                "  exit 0\n"
+                "fi\n"
+                'sid="$2"; shift 2\n'
+                'for p in "$@"; do case "$sid:$p" in\n'
+                "  c1:Class) echo Class=greeter;; 2:Class) echo Class=user;;\n"
+                "  c1:LockedHint) echo LockedHint=no;; 2:LockedHint) echo LockedHint=yes;;\n"
+                "  c1:Name) echo Name=gdm;; 2:Name) echo Name=alice;;\n"
+                "  c1:Active) echo Active=no;; 2:Active) echo Active=yes;;\n"
+                "  *:Type) echo Type=wayland;; *:Remote) echo Remote=no;;\n"
+                "esac; done\n")
+        os.chmod(self.loginctl, 0o755)
+
+    def test_locked_user_session_is_locked_despite_greeter(self):
+        with mock.patch.object(session, "_LOGINCTL_CANDIDATES",
+                               (self.loginctl,)):
+            self.assertTrue(session.detect().is_locked())
+
+    def test_agent_user_is_the_active_person_not_the_greeter(self):
+        with mock.patch.object(session, "_LOGINCTL_CANDIDATES",
+                               (self.loginctl,)), \
+                mock.patch.dict(os.environ, {"SUDO_USER": ""}):
+            self.assertEqual(cli._active_session_user(), "alice")
+
+
+class MissingPyudevIsRefusedBeforeTheGateCloses(unittest.TestCase):
+
+    def test_the_gate_is_never_entered(self):
+        with mock.patch.object(daemon_mod, "pyudev", None), \
+                mock.patch.object(daemon_mod.gate, "AuthorizationGate") as gate, \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                daemon_mod.serve(dry_run=True)
+        self.assertIn("pyudev", str(caught.exception))
+        gate.assert_not_called()
+
+
+class PromptIgnoresTypeAhead(unittest.TestCase):
+    """A line queued before the question was asked answered it."""
+
+    def setUp(self):
+        try:
+            self.master, self.slave = pty.openpty()
+        except OSError as exc:
+            self.skipTest(f"no pseudo-terminal: {exc}")
+        self.stdin = os.fdopen(os.dup(self.slave), "r")
+
+    def tearDown(self):
+        self.stdin.close()
+        os.close(self.master)
+        os.close(self.slave)
+
+    def _type_early(self, data: bytes) -> None:
+        """What a device sends before the grab, landing in this terminal."""
+        os.write(self.master, data)
+        ready, _, _ = select.select([self.slave], [], [], 2.0)
+        self.assertTrue(ready, "the pty never delivered the input")
+
+    def _ask(self, findings=()):
+        engine = daemon.Probolos(timeout=0.3)
+        out = io.StringIO()
+        with mock.patch("sys.stdin", self.stdin), mock.patch("sys.stdout", out):
+            approved = engine._ask(types.SimpleNamespace(name="1-4"),
+                                   list(findings))
+        return approved, out.getvalue()
+
+    def test_a_queued_yes_does_not_approve(self):
+        self._type_early(b"y\n")
+        approved, out = self._ask()
+        self.assertFalse(approved)
+        self.assertIn("Discarded 2 byte(s)", out)
+
+    def test_a_queued_authorize_does_not_pass_a_critical_prompt(self):
+        from probolos import rules
+        critical = rules.Finding(rule_id="t", severity=rules.Severity.CRITICAL,
+                                 title="t", explanation="t")
+        self._type_early(b"authorize\n")
+        approved, out = self._ask([critical])
+        self.assertFalse(approved)
+        self.assertIn("Discarded 10 byte(s)", out)
+
+    def test_nothing_is_left_for_the_next_reader(self):
+        self._type_early(b"y\n")
+        with mock.patch("sys.stdin", self.stdin):
+            self.assertEqual(daemon.Probolos._discard_typeahead(), 2)
+        ready, _, _ = select.select([self.slave], [], [], 0.1)
+        self.assertFalse(ready)
+
+    def test_input_that_is_not_a_terminal_is_left_alone(self):
+        """GUARD: piped or scripted input is not a terminal to flush."""
+        with mock.patch("sys.stdin", io.StringIO("y\n")):
+            self.assertEqual(daemon.Probolos._discard_typeahead(), 0)
+            self.assertEqual(daemon.Probolos(timeout=0)._ask(
+                types.SimpleNamespace(name="1-4"), []), True)
+
+
+class EventStreamOverflowDoesNotEndTheGate(unittest.TestCase):
+
+    def _run(self, errors):
+        stop = threading.Event()
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        monitor = _FakeMonitor(errors, stop, a.fileno())
+        fake_pyudev = mock.Mock()
+        fake_pyudev.Monitor.from_netlink.return_value = monitor
+        engine = daemon_mod.Probolos(monitor=session.AlwaysUnlocked(),
+                                     stop_event=stop)
+        with mock.patch.object(daemon_mod, "pyudev", fake_pyudev), \
+                mock.patch("builtins.print"):
+            engine.run()
+        return monitor
+
+    def test_enobufs_from_poll_is_survived(self):
+        """
+        Uncaught, this left run(): the `with AuthorizationGate` block reopened
+        every root hub and the daemon exited, from an overflow a busy loop can
+        produce.
+        """
+        monitor = self._run([OSError(errno.ENOBUFS, "No buffer space")] * 3)
+        self.assertEqual(monitor.polls, 4, "the loop kept polling afterwards")
+
+    def test_other_stream_errors_still_propagate(self):
+        with self.assertRaises(OSError):
+            self._run([OSError(errno.EBADF, "Bad file descriptor")])
+
+
+# ---------------------------------------------------------------------------
+# 6. Wiring: daemon and command line
+# ---------------------------------------------------------------------------
+
+class DaemonWiring(unittest.TestCase):
+
+    def setUp(self):
+        self.watch = mock.Mock(spec=mediawatch.MediaWatch)
+        self.engine = daemon_mod.Probolos(monitor=session.AlwaysUnlocked(),
+                                          observe=0, inspect_storage=False,
+                                          media_watch=self.watch)
+
+    def test_block_events_reach_the_watcher(self):
+        event = mock.Mock(subsystem="block", action="change",
+                          sys_path="/sys/x/block/sdb",
+                          properties={"DISK_MEDIA_CHANGE": "1"})
+        self.engine._dispatch(event)
+        self.watch.handle.assert_called_once_with(
+            "change", "/sys/x/block/sdb", {"DISK_MEDIA_CHANGE": "1"})
+
+    def test_usb_events_still_reach_the_gate(self):
+        event = mock.Mock(subsystem="usb", action="add", sys_path="/sys/x/1-2")
+        with mock.patch.object(self.engine, "_on_add") as on_add:
+            self.engine._dispatch(event)
+        on_add.assert_called_once_with("/sys/x/1-2")
+        self.watch.handle.assert_not_called()
+
+    def test_an_approved_reader_is_registered(self):
+        dev = make_device()
+        with mock.patch.object(daemon_mod.sysfs, "admit_device"), \
+             mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(self.engine, "_load_with_retry",
+                               return_value=dev), \
+             mock.patch.object(self.engine, "_ask", return_value=True), \
+             mock.patch.object(daemon_mod.report, "one_liner",
+                               return_value="x"), \
+             mock.patch.object(daemon_mod.report, "render",
+                               return_value="x"), \
+             redirect_stdout(io.StringIO()):
+            self.engine._on_add(str(dev.syspath))
+        self.watch.register.assert_called_once_with(dev, "approved")
+
+    def test_a_rejected_reader_is_not_registered(self):
+        dev = make_device()
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(self.engine, "_load_with_retry",
+                               return_value=dev), \
+             mock.patch.object(self.engine, "_ask", return_value=False), \
+             mock.patch.object(daemon_mod.report, "one_liner",
+                               return_value="x"), \
+             mock.patch.object(daemon_mod.report, "render",
+                               return_value="x"), \
+             redirect_stdout(io.StringIO()):
+            self.engine._on_add(str(dev.syspath))
+        self.watch.register.assert_not_called()
+
+    def test_baseline_readers_are_registered_at_startup(self):
+        dev = make_device("1-7")
+        dev.authorized = 1
+        dev.is_root_hub = False
+        with mock.patch.object(daemon_mod.sysfs, "list_devices",
+                               return_value=[dev]), \
+             redirect_stdout(io.StringIO()):
+            self.engine.snapshot()
+        self.watch.register.assert_called_once_with(dev, "present at startup")
+
+    def test_removal_unregisters(self):
+        with redirect_stdout(io.StringIO()):
+            self.engine._on_remove("/sys/bus/usb/devices/1-2")
+        self.watch.unregister.assert_called_once_with("1-2")
+
+    def test_a_policy_deauthorization_puts_the_reader_back_behind_the_gate(self):
+        dev = make_device("1-2")
+        self.engine.known.add("1-2")
+        self.engine._media_policy_deauthorized(dev, [])
+        self.assertNotIn("1-2", self.engine.known)
+
+
+# ---------------------------------------------------------------------------
+# 6. loginctl
+# ---------------------------------------------------------------------------
+
+class LoginctlIsNotResolvedThroughPath(unittest.TestCase):
+    """
+    shutil.which() walks $PATH, and this runs as root -- once a second from
+    the daemon's poll loop, and again for every device. sudo preserves PATH
+    under a !secure_path or env_keep configuration and a systemd unit can be
+    given any Environment=PATH at all, so a writable directory earlier in PATH
+    turned "ask logind whether the screen is locked" into "execute whatever is
+    called loginctl", as root.
+
+    In __main__ it is worse than an exec: a fake loginctl that simply PRINTS a
+    chosen Name= hands the agent slot -- who may answer questions about
+    hardware -- to a uid of its choosing.
+    """
+
+    def setUp(self):
+        self.fake = Path(tempfile.mkdtemp())
+        impostor = self.fake / "loginctl"
+        impostor.write_text("#!/bin/sh\necho owned\n")
+        impostor.chmod(0o755)
+        self._path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self.fake}:{self._path}"
+
+    def tearDown(self):
+        os.environ["PATH"] = self._path
+
+    def test_a_planted_loginctl_on_path_is_never_chosen(self):
+        found = session._find_loginctl()
+        self.assertNotEqual(found, str(self.fake / "loginctl"))
+        if found is not None:
+            self.assertIn(found, session._LOGINCTL_CANDIDATES)
+
+    def test_the_monitor_does_not_pick_it_up_either(self):
+        monitor = session.LogindMonitor()
+        self.assertNotEqual(monitor._binary, str(self.fake / "loginctl"))
+
+    def test_only_absolute_candidates_are_considered(self):
+        for candidate in session._LOGINCTL_CANDIDATES:
+            self.assertTrue(candidate.startswith("/"),
+                            "a relative candidate would reintroduce the hole")
+
+    def test_a_non_executable_candidate_is_skipped(self):
+        decoy = self.fake / "loginctl-noexec"
+        decoy.write_text("")
+        decoy.chmod(0o644)
+        with mock.patch.object(session, "_LOGINCTL_CANDIDATES", (str(decoy),)):
+            self.assertIsNone(session._find_loginctl())
+
+    def test_a_directory_named_loginctl_is_skipped(self):
+        decoy = self.fake / "as-a-dir"
+        decoy.mkdir()
+        with mock.patch.object(session, "_LOGINCTL_CANDIDATES", (str(decoy),)):
+            self.assertIsNone(session._find_loginctl())
+
+
+class AHeldQuestionBelongsToADeviceNotAPort(unittest.TestCase):
+    """
+    A sysfs name like "1-4" is a PORT. The held queue stored only that name
+    and its path, so an attacker with physical access -- the threat the whole
+    lock policy exists for -- could pull the held device while the screen was
+    locked and insert their own at the same port. Both are named "1-4", and
+    the operator's question, and their expectation of what they were being
+    asked about, transferred silently to the substitute.
+    """
+
+    def test_a_recycled_port_does_not_inherit_the_question(self):
+        engine = daemon_mod.Probolos(observe=0,
+                                     monitor=session.FixedState(False))
+        engine.pending["3-9"] = (Path("/sys/bus/usb/devices/3-9"), (7, 4242))
+
+        asked = []
+        with mock.patch.object(Path, "exists", return_value=True), \
+             mock.patch.object(engine, "_still_same_device", return_value=False), \
+             mock.patch.object(engine, "_on_add",
+                               side_effect=lambda p, was_held=False: asked.append(p)):
+            engine._drain_pending()
+
+        self.assertEqual(asked, [], "a different device at the same port must "
+                                    "not be asked about under the old entry")
+        self.assertEqual(engine.pending, {})
+
+    def test_the_same_device_is_still_asked_about(self):
+        engine = daemon_mod.Probolos(observe=0,
+                                     monitor=session.FixedState(False))
+        engine.pending["3-9"] = (Path("/sys/bus/usb/devices/3-9"), (7, 4242))
+
+        asked = []
+        with mock.patch.object(Path, "exists", return_value=True), \
+             mock.patch.object(engine, "_still_same_device", return_value=True), \
+             mock.patch.object(engine, "_on_add",
+                               side_effect=lambda p, was_held=False: asked.append(p)):
+            engine._drain_pending()
+
+        self.assertEqual(asked, ["/sys/bus/usb/devices/3-9"])
+
+    def test_still_same_device_compares_the_real_inode(self):
+        root = Path(tempfile.mkdtemp())
+        devdir = root / "3-9"
+        devdir.mkdir()
+        st = devdir.stat()
+        self.assertTrue(daemon_mod.Probolos._still_same_device(
+            devdir, (st.st_dev, st.st_ino)))
+        self.assertFalse(daemon_mod.Probolos._still_same_device(
+            devdir, (st.st_dev, st.st_ino + 1)))
+
+    def test_a_vanished_path_is_not_the_same_device(self):
+        self.assertFalse(daemon_mod.Probolos._still_same_device(
+            Path("/nonexistent/3-9"), (1, 2)))
+
+    def test_queueing_records_the_instance(self):
+        engine = daemon_mod.Probolos(observe=0,
+                                     monitor=session.FixedState(True),
+                                     lock_policy=session.POLICY_QUEUE)
+        dev = _device()
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(daemon_mod.report, "one_liner", return_value="x"):
+            engine._hold_until_unlocked(dev)
+        self.assertEqual(engine.pending["3-9"], (dev.syspath, (7, 4242)))
+
+
+class AnAdmittedDeviceIsNotReGated(unittest.TestCase):
+    """
+    `known` only ever held the startup baseline: nothing recorded that a
+    device had been admitted. udev delivers duplicate 'add' events routinely
+    (a `udevadm trigger`, a settle, a subsystem rescan), and each one re-ran
+    the whole gate on hardware that was past it -- including _quarantine(),
+    which writes authorized=0 and back to 1 on a device the user is USING and
+    takes an EVIOCGRAB on input they expect to reach their session.
+    """
+
+    def _engine(self):
+        return daemon_mod.Probolos(observe=0, inspect_storage=False,
+                                   monitor=session.FixedState(False),
+                                   lock_policy=session.POLICY_IGNORE)
+
+    def _add(self, engine, dev, approve=True):
+        with mock.patch.object(daemon_mod.sysfs, "admit_device"), \
+             mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(engine, "_load_with_retry", return_value=dev), \
+             mock.patch.object(engine, "_ask", return_value=approve), \
+             mock.patch.object(daemon_mod.report, "render", return_value=""), \
+             mock.patch.object(daemon_mod.report, "one_liner", return_value="x"):
+            engine._on_add(str(dev.syspath))
+
+    def test_an_approved_device_is_recorded_as_known(self):
+        engine, dev = self._engine(), _device()
+        self._add(engine, dev, approve=True)
+        self.assertIn("3-9", engine.known,
+                      "a device past the gate must not be gated again")
+
+    def test_a_second_add_for_an_approved_device_is_ignored(self):
+        engine, dev = self._engine(), _device()
+        self._add(engine, dev, approve=True)
+
+        asked = []
+        with mock.patch.object(engine, "_load_with_retry",
+                               side_effect=lambda p: asked.append(p)):
+            engine._on_add(str(dev.syspath))
+        self.assertEqual(asked, [], "a duplicate udev 'add' must not re-run "
+                                    "the gate on live hardware")
+
+    def test_a_rejected_device_is_NOT_recorded(self):
+        """
+        The other direction matters just as much: a device the user refused
+        must be asked about again if it comes back, not silently ignored.
+        """
+        engine, dev = self._engine(), _device()
+        self._add(engine, dev, approve=False)
+        self.assertNotIn("3-9", engine.known)
+
+    def test_removal_clears_the_record(self):
+        engine, dev = self._engine(), _device()
+        self._add(engine, dev, approve=True)
+        engine._on_remove(str(dev.syspath))
+        self.assertNotIn("3-9", engine.known,
+                         "the port must be gated again after an unplug")
+
+
+class ThePromptOffersWhatItAccepts(unittest.TestCase):
+    """
+    With --timeout set, the countdown prompt replaced the whole prompt string
+    with "[y/N]" -- dropping [a]lways from the text while the parser below
+    went on accepting it. That is a hidden control on the one prompt in the
+    tool that grants something permanent: a user typing `a` for "abort", which
+    is what a bare [y/N] invites you to assume it is not, created a trust
+    entry that admits that device silently from then on.
+    """
+
+    def _prompt_for(self, *, timeout, has_trust):
+        import io
+        import sys as _sys
+
+        from probolos import daemon as daemon_mod
+
+        engine = daemon_mod.Probolos.__new__(daemon_mod.Probolos)
+        engine.timeout = timeout
+        engine.trust = object() if has_trust else None
+        engine.agent = None
+        engine.observe = 0
+
+        captured = io.StringIO()
+        real_stdout, real_stdin = _sys.stdout, _sys.stdin
+        _sys.stdout = captured
+        _sys.stdin = io.StringIO("")      # EOF -> denied, after the prompt
+        try:
+            daemon_mod.Probolos._ask(engine, dev=None, findings=())
+        except Exception:
+            pass
+        finally:
+            _sys.stdout, _sys.stdin = real_stdout, real_stdin
+        return captured.getvalue()
+
+    def test_always_is_shown_whenever_always_is_accepted(self):
+        text = self._prompt_for(timeout=30.0, has_trust=True)
+        self.assertIn("[a]lways", text.lower(),
+                      "the countdown prompt accepts 'a' but did not offer it")
+
+    def test_no_always_is_offered_without_a_trust_store(self):
+        text = self._prompt_for(timeout=30.0, has_trust=False)
+        self.assertNotIn("[a]lways", text.lower())
+
+
+class LoginctlTimeoutIsContained(unittest.TestCase):
+    """
+    is_locked() is called once a second from the main loop and once per device.
+
+    The handling only ever wrapped _graphical_sessions(). _locked_hint() runs
+    in the loop BELOW that try, so a loginctl call that exceeded its three
+    second timeout raised TimeoutExpired out of is_locked() and killed the
+    daemon -- a lock-state lookup taking the gate down with it.
+    """
+
+    def test_a_hung_loginctl_degrades_to_unknown(self):
+        from probolos import session
+
+        monitor = session.LogindMonitor()
+        monitor._binary = "/bin/true"
+
+        calls = {"n": 0}
+
+        def hang(*args, **kwargs):
+            calls["n"] += 1
+            raise subprocess.TimeoutExpired(cmd="loginctl", timeout=3)
+
+        real_run = subprocess.run
+        subprocess.run = hang
+        try:
+            self.assertIsNone(monitor.is_locked())
+        finally:
+            subprocess.run = real_run
+        self.assertGreater(calls["n"], 0)
+
+    def test_a_hung_hint_lookup_does_not_escape_either(self):
+        """The specific gap: the sessions list succeeds, the hint call hangs."""
+        from probolos import session
+
+        monitor = session.LogindMonitor()
+        monitor._binary = "/bin/true"
+        monitor._graphical_sessions = lambda: ["c1"]
+
+        def hang(session_id):
+            raise subprocess.TimeoutExpired(cmd="loginctl", timeout=3)
+
+        monitor._locked_hint = hang
+        with self.assertRaises(subprocess.TimeoutExpired):
+            monitor._locked_hint("c1")     # the hazard is real...
+        # ...and _run(), which is where the real call lives, contains it.
+        real_run = subprocess.run
+        subprocess.run = lambda *a, **k: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd="loginctl", timeout=3))
+        try:
+            self.assertEqual(session.LogindMonitor._run(monitor, "x"), "")
+        finally:
+            subprocess.run = real_run
+
+
+class DaemonWaitsForTheNode(unittest.TestCase):
+    """The poll waits on the /dev node, not only on the sysfs entry."""
+
+    def setUp(self):
+        self.engine = daemon_mod.Probolos(
+            monitor=session.AlwaysUnlocked(), observe=0, inspect_storage=True)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dev = types.SimpleNamespace(syspath=Path(tmp.name), name="3-9")
+
+    def _run(self, pending):
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(daemon_mod.storage, "find_block_devices",
+                               return_value=["/dev/sda"]), \
+             mock.patch.object(daemon_mod.sysfs, "block_node_pending",
+                               side_effect=pending) as pending_fn, \
+             mock.patch.object(daemon_mod.storage, "inspect_safely",
+                               return_value=storage.MediumReport(
+                                   device="/dev/sda", scheme="none")) as scan, \
+             contextlib.redirect_stdout(io.StringIO()):
+            medium = self.engine._inspect_medium(self.dev)
+        return medium, pending_fn, scan
+
+    def test_a_late_node_is_waited_for_then_inspected(self):
+        late = ["device node does not exist yet"] * 3 + [None]
+        medium, pending_fn, scan = self._run(late)
+        self.assertEqual(pending_fn.call_count, 4)
+        scan.assert_called_once()
+        self.assertIsNone(medium.error)
+
+    def test_a_node_that_never_appears_is_reported_as_such(self):
+        medium, _pending, scan = self._run(
+            lambda _p: "device node does not exist yet")
+        scan.assert_not_called()
+        self.assertIn("did not become ready", medium.error)
+        # The node path and the pending reason are audit detail, not prompt text.
+        self.assertNotIn("/dev/sda", medium.error)
+        self.assertIn("does not exist yet", medium.detail)
+
+
+class EveryMediumFailureTakesOnePath(unittest.TestCase):
+    """
+    Removal during inspection reached the operator two ways. When the switch-on
+    write failed, the raw FileNotFoundError -- with the full sysfs path -- was
+    printed at the prompt and no MEDIUM block or identity-only notice followed.
+    When the block node never appeared, both were shown. Every failure now
+    converges on the second behaviour, with the raw detail kept for the log.
+    """
+
+    SYSPATH_LEAK = "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-9"
+
+    def setUp(self):
+        self.engine = daemon_mod.Probolos(
+            monitor=session.AlwaysUnlocked(), observe=0, inspect_storage=True)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dev = types.SimpleNamespace(syspath=Path(tmp.name), name="3-9")
+
+    def _switch_on_fails(self):
+        def refuse(_path, value):
+            if value == 1:
+                raise FileNotFoundError(2, "No such file or directory",
+                                        self.SYSPATH_LEAK)
+        out = io.StringIO()
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized", refuse), \
+             contextlib.redirect_stdout(out):
+            medium = self.engine._inspect_medium(self.dev)
+        return medium, out.getvalue()
+
+    def _assert_unexamined_and_clean(self, medium, printed):
+        self.assertIsNotNone(medium)
+        rendered = " ".join(
+            report.render_medium(medium, rules.storage_findings(medium)).split())
+        shown = printed + rendered
+        self.assertIn("not inspected", rendered)
+        self.assertIn("judged on its declared identity alone", rendered)
+        self.assertNotIn(self.SYSPATH_LEAK, shown)
+        self.assertNotIn("Errno", shown)
+
+    def test_a_refused_switch_on_is_reported_as_unexamined(self):
+        medium, printed = self._switch_on_fails()
+        self._assert_unexamined_and_clean(medium, printed)
+        self.assertIn("switched on", medium.error)
+        self.assertIn(self.SYSPATH_LEAK, medium.detail)
+
+    def test_a_device_gone_by_then_is_reported_as_removed(self):
+        self.dev.syspath = Path(self.dev.syspath) / "gone"
+        medium, printed = self._switch_on_fails()
+        self._assert_unexamined_and_clean(medium, printed)
+        self.assertEqual(medium.error,
+                         "the device was removed during inspection")
+
+    def test_a_raw_read_error_stays_out_of_the_prompt(self):
+        raw = storage.MediumReport(
+            device="/dev/sda",
+            error="[Errno 5] Input/output error: '/dev/sda'")
+        out = io.StringIO()
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(daemon_mod.storage, "find_block_devices",
+                               return_value=["/dev/sda"]), \
+             mock.patch.object(daemon_mod.sysfs, "block_node_pending",
+                               return_value=None), \
+             mock.patch.object(daemon_mod.storage, "inspect_safely",
+                               return_value=raw), \
+             contextlib.redirect_stdout(out):
+            medium = self.engine._inspect_medium(self.dev)
+        self._assert_unexamined_and_clean(medium, out.getvalue())
+        self.assertNotIn("/dev/sda", medium.error)
+        self.assertIn("Input/output error", medium.detail)
+
+    def test_the_warning_survives_the_rule_being_disabled(self):
+        medium, _printed = self._switch_on_fails()
+        rendered = " ".join(report.render_medium(medium, []).split())
+        self.assertIn("judged on declared identity alone", rendered)
+
+    def test_the_detail_reaches_the_audit_log(self):
+        medium, _printed = self._switch_on_fails()
+        dev = mock.Mock(name="dev", vendor_id="058f", product_id="6387",
+                        manufacturer="m", product="p", serial="s",
+                        claims=[], kinds=[])
+        dev.name = "3-9"
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "audit.jsonl"
+            self.engine.json_log = log
+            self.engine.ledger = None
+            self.engine._record(
+                daemon_mod.Decision(dev, False, "user rejected", 0.0),
+                rules.storage_findings(medium), medium)
+            entry = json.loads(log.read_text().splitlines()[-1])
+        self.assertFalse(entry["medium"]["examined"])
+        self.assertIn(self.SYSPATH_LEAK, entry["medium"]["detail"])
 
 
 if __name__ == "__main__":

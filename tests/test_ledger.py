@@ -1,28 +1,36 @@
 """
-The ledger: history across visits, malformed state files, and the
-normalized descriptor fingerprint that drift is measured against.
+The ledger: device history across visits, descriptor drift, malformed
+state files and the history view.
 
-The fingerprint tests belong beside the ledger tests because the
-fingerprint is only meaningful as the thing the ledger stores and the
-drift rule compares -- tested apart, both halves can pass while
-disagreeing about what a device is.
-
-Merged from: test_ledger.py, test_ledger_malformed.py, test_normalized_fingerprint.py
+Covers probolos.ledger and probolos.history.
 """
+
 from __future__ import annotations
 
-# =========================================================================
-# test_ledger.py
-#
-# Tests for identity across time.
-# =========================================================================
-
+import copy
 import json
+import os
+import shutil
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
+from unittest import mock
 
-from probolos import analyzers, ledger as ledger_mod, rules
+from probolos import analyzers, descriptors, rules
+from probolos import ledger as ledger_mod
+from probolos.ledger import ENTRY_FIELD_NAMES, Entry, Ledger
+from tests._support import (
+    STORAGE_BLOB,
+    descriptor_blob,
+    make_device,
+    make_kingston_device,
+    make_widget_device,
+    storage_config_desc,
+    storage_device_blob,
+    storage_device_desc,
+    storage_iface_desc,
+)
 
 
 class Dev:
@@ -33,6 +41,28 @@ class Dev:
         self.serial = serial
         self.raw_descriptors = raw
         self.name = name
+
+
+# Every field of Entry has to appear here, or test_from_raw_covers_every_field
+# fails on purpose -- that test is the guard that keeps GOOD and Entry in step.
+# When a field is added to Entry, its expected loaded value goes here too. The
+# baseline_hash and raw_hash fields were added in round 5 (normalized
+# descriptor fingerprint); they default to the same digest so that a first
+# sighting has no drift to report and the raw-hash column is populated on
+# ledgers written before the field existed.
+
+GOOD = {
+    "identity": "1234:5678:-",
+    "descriptor_hash": "ab" * 32,
+    "first_seen": 1.0,
+    "last_seen": 2.0,
+    "times_seen": 3,
+    "ports": ["1-1"],
+    "decisions": ["yes"],
+    "known_hashes": ["ab" * 32],
+    "baseline_hash": "ab" * 32,
+    "raw_hash": "ab" * 32,
+}
 
 
 class TestLedgerStore(unittest.TestCase):
@@ -150,12 +180,12 @@ class TestDriftDetection(unittest.TestCase):
         self.assertIn("ledger-unavailable", ids)
 
 
-
 class TestDefaultPath(unittest.TestCase):
     """The path bug: a root-only default broke every non-root --dry-run."""
 
     def test_root_uses_var_lib(self):
         import os
+
         from probolos import ledger as l
         real = os.geteuid
         os.geteuid = lambda: 0
@@ -171,6 +201,7 @@ class TestDefaultPath(unittest.TestCase):
 
     def test_non_root_uses_a_writable_location(self):
         import os
+
         from probolos import ledger as l
         real = os.geteuid
         os.geteuid = lambda: 1000
@@ -180,38 +211,6 @@ class TestDefaultPath(unittest.TestCase):
             self.assertIn("probolos", str(path))
         finally:
             os.geteuid = real
-
-
-# =========================================================================
-# test_ledger_malformed.py
-#
-# Regression tests for a ledger file that is valid JSON but wrong inside.
-# =========================================================================
-
-import unittest
-from dataclasses import asdict
-
-from probolos.ledger import ENTRY_FIELD_NAMES, Entry, Ledger
-
-# Every field of Entry has to appear here, or test_from_raw_covers_every_field
-# fails on purpose -- that test is the guard that keeps GOOD and Entry in step.
-# When a field is added to Entry, its expected loaded value goes here too. The
-# baseline_hash and raw_hash fields were added in round 5 (normalized
-# descriptor fingerprint); they default to the same digest so that a first
-# sighting has no drift to report and the raw-hash column is populated on
-# ledgers written before the field existed.
-GOOD = {
-    "identity": "1234:5678:-",
-    "descriptor_hash": "ab" * 32,
-    "first_seen": 1.0,
-    "last_seen": 2.0,
-    "times_seen": 3,
-    "ports": ["1-1"],
-    "decisions": ["yes"],
-    "known_hashes": ["ab" * 32],
-    "baseline_hash": "ab" * 32,
-    "raw_hash": "ab" * 32,
-}
 
 
 class MalformedLedger(unittest.TestCase):
@@ -315,83 +314,6 @@ class MalformedLedger(unittest.TestCase):
             self.assertIsNone(Entry.from_raw(raw), repr(raw))
 
 
-# =========================================================================
-# test_normalized_fingerprint.py
-#
-# Regression tests for the normalized descriptor fingerprint.
-# =========================================================================
-
-import copy
-import unittest
-
-from probolos import descriptors, sysfs
-
-
-# ---------------------------------------------------------------------------
-# helpers -- descriptor blobs that mirror the real Kingston stick's shape
-# ---------------------------------------------------------------------------
-
-def storage_device_blob(*, bcd_usb=0x0210, bcd_device=0x0110,
-                        max_packet0=64, max_power_raw=150,
-                        include_ss_companion=False,
-                        interfaces=None):
-    """
-    Build a plausible mass-storage descriptor blob.
-
-    Defaults match the USB 2 enumeration of a Kingston DataTraveler 3.0
-    (VID 0x0951, PID 0x1666, bcdDevice 0x0110). include_ss_companion=True
-    adds SuperSpeed endpoint companion descriptors, matching the USB 3
-    enumeration of the same physical stick.
-    """
-    interfaces = interfaces or [(0x08, 0x06, 0x50)]
-
-    # 18-byte device descriptor
-    dev = bytes([
-        18, 0x01,
-        bcd_usb & 0xFF, (bcd_usb >> 8) & 0xFF,
-        0x00, 0x00, 0x00,
-        max_packet0,
-        0x51, 0x09, 0x66, 0x16,
-        bcd_device & 0xFF, (bcd_device >> 8) & 0xFF,
-        1, 2, 3,
-        1,
-    ])
-
-    # per-interface: iface(9) + 2 endpoints(7 each) + optional companions(6 each)
-    per_iface = 9 + 2 * 7 + (2 * 6 if include_ss_companion else 0)
-    total = 9 + per_iface * len(interfaces)
-    cfg = bytes([
-        9, 0x02,
-        total & 0xFF, (total >> 8) & 0xFF,
-        len(interfaces), 1, 0,
-        0x80,
-        max_power_raw,
-    ])
-
-    body = b""
-    for n, (cls, sub, proto) in enumerate(interfaces):
-        body += bytes([9, 0x04, n, 0, 2, cls, sub, proto, 0])
-        body += bytes([7, 0x05, 0x81, 0x02, 0x00, 0x04, 0x00])   # IN bulk
-        if include_ss_companion:
-            body += bytes([6, 0x30, 0x0F, 0x00, 0x00, 0x00])     # SS companion
-        body += bytes([7, 0x05, 0x02, 0x02, 0x00, 0x04, 0x00])   # OUT bulk
-        if include_ss_companion:
-            body += bytes([6, 0x30, 0x0F, 0x00, 0x00, 0x00])
-
-    return dev + cfg + body
-
-
-def make_device(raw, name="1-4", syspath="/sys/devices/pci0000:00/usb1/1-4"):
-    return sysfs.UsbDevice(
-        syspath=Path(syspath), name=name,
-        vendor_id="0951", product_id="1666",
-        manufacturer="Kingston", product="DataTraveler 3.0",
-        serial="E0D55EA58B39E7C058840855",
-        bus=1, device_num=7, speed="480", authorized=0, device_class=0,
-        descriptor_set=descriptors.parse(raw), raw_descriptors=raw,
-        removable="removable", instance_id=(1, 1000))
-
-
 # ---------------------------------------------------------------------------
 # 1. Bus-negotiated fields must NOT change the fingerprint
 # ---------------------------------------------------------------------------
@@ -401,7 +323,7 @@ class FingerprintIgnoresBusNegotiation(unittest.TestCase):
 
     def _fp(self, **kwargs):
         return ledger_mod.descriptor_fingerprint(
-            make_device(storage_device_blob(**kwargs)))
+            make_kingston_device(storage_device_blob(**kwargs)))
 
     def test_usb2_and_usb3_enumeration_agree(self):
         usb2 = self._fp(bcd_usb=0x0210, max_packet0=64,
@@ -439,7 +361,7 @@ class FingerprintCatchesRealChanges(unittest.TestCase):
 
     def _fp(self, **kwargs):
         return ledger_mod.descriptor_fingerprint(
-            make_device(storage_device_blob(**kwargs)))
+            make_kingston_device(storage_device_blob(**kwargs)))
 
     def test_added_keyboard_interface_drifts(self):
         """The BadUSB reflash -- storage + keyboard where there was one."""
@@ -459,8 +381,8 @@ class FingerprintCatchesRealChanges(unittest.TestCase):
 
     def test_vendor_or_product_change_drifts(self):
         """Same identity claim but a different device -- must be caught."""
-        base = make_device(storage_device_blob())
-        variant = make_device(storage_device_blob())
+        base = make_kingston_device(storage_device_blob())
+        variant = make_kingston_device(storage_device_blob())
         variant.descriptor_set.device = descriptors.DeviceDescriptor(
             usb_version=0x0210, device_class=0, device_subclass=0,
             device_protocol=0, vendor_id=0x1234, product_id=0x5678,
@@ -470,7 +392,7 @@ class FingerprintCatchesRealChanges(unittest.TestCase):
             ledger_mod.descriptor_fingerprint(variant))
 
     def test_added_configuration_drifts(self):
-        base = make_device(storage_device_blob())
+        base = make_kingston_device(storage_device_blob())
         two_cfg = copy.deepcopy(base)
         second = copy.deepcopy(base.descriptor_set.configs[0])
         second.value = 2
@@ -495,7 +417,7 @@ class FingerprintCatchesRealChanges(unittest.TestCase):
                             "interface NUMBERS carry meaning, kept in the hash")
 
     def test_alternate_setting_change_drifts(self):
-        base = make_device(storage_device_blob())
+        base = make_kingston_device(storage_device_blob())
         alt = copy.deepcopy(base)
         alt.descriptor_set.configs[0].interfaces[0] = \
             descriptors.InterfaceDescriptor(
@@ -514,8 +436,8 @@ class FingerprintCatchesRealChanges(unittest.TestCase):
 class RawHashKeptSeparately(unittest.TestCase):
 
     def test_raw_hash_captures_every_byte(self):
-        a = make_device(storage_device_blob(bcd_usb=0x0210))
-        b = make_device(storage_device_blob(bcd_usb=0x0320))
+        a = make_kingston_device(storage_device_blob(bcd_usb=0x0210))
+        b = make_kingston_device(storage_device_blob(bcd_usb=0x0320))
         self.assertNotEqual(ledger_mod.raw_descriptor_hash(a),
                             ledger_mod.raw_descriptor_hash(b),
                             "raw hash must still see bus-negotiated changes")
@@ -527,7 +449,7 @@ class RawHashKeptSeparately(unittest.TestCase):
         directory = Path(tempfile.mkdtemp(prefix="probolos-raw-"))
         path = directory / "ledger.json"
         led = ledger_mod.Ledger(path)
-        dev = make_device(storage_device_blob())
+        dev = make_kingston_device(storage_device_blob())
         led.record(dev, "user approved", approved=True)
         led.save()
         entry = ledger_mod.Ledger(path).entries[ledger_mod.identity_of(dev)]
@@ -559,10 +481,10 @@ class DriftRuleOnRealScenarios(unittest.TestCase):
 
     def test_kingston_swap_between_usb2_and_usb3_no_alarm(self):
         """The measured false positive that motivated this change."""
-        on_usb2 = make_device(storage_device_blob(
+        on_usb2 = make_kingston_device(storage_device_blob(
             bcd_usb=0x0210, max_packet0=64, max_power_raw=150),
             name="3-1", syspath="/sys/devices/pci0000:00/usb3/3-1")
-        on_usb3 = make_device(storage_device_blob(
+        on_usb3 = make_kingston_device(storage_device_blob(
             bcd_usb=0x0320, max_packet0=9, max_power_raw=63,
             include_ss_companion=True),
             name="4-1", syspath="/sys/devices/pci0000:00/usb4/4-1")
@@ -572,17 +494,17 @@ class DriftRuleOnRealScenarios(unittest.TestCase):
                          "same stick, different port -> no alarm")
 
     def test_reflash_to_add_keyboard_still_fires(self):
-        genuine = make_device(storage_device_blob(
+        genuine = make_kingston_device(storage_device_blob(
             interfaces=[(0x08, 0x06, 0x50)]))
-        badusb = make_device(storage_device_blob(
+        badusb = make_kingston_device(storage_device_blob(
             interfaces=[(0x08, 0x06, 0x50), (0x03, 0x01, 0x01)]))
         self._record(genuine, "user approved", approved=True)
         self.assertTrue(self._drift(badusb),
                         "the BadUSB reflash must still trip the alarm")
 
     def test_firmware_update_still_fires_first_time(self):
-        v1 = make_device(storage_device_blob(bcd_device=0x0100))
-        v2 = make_device(storage_device_blob(bcd_device=0x0110))
+        v1 = make_kingston_device(storage_device_blob(bcd_device=0x0100))
+        v2 = make_kingston_device(storage_device_blob(bcd_device=0x0110))
         self._record(v1, "user approved", approved=True)
         self.assertTrue(self._drift(v2),
                         "firmware revision change is legitimately alarming")
@@ -654,7 +576,7 @@ class OldLedgerMigration(unittest.TestCase):
                 }
             },
         }))
-        dev = make_device(storage_device_blob())
+        dev = make_kingston_device(storage_device_blob())
         led = ledger_mod.Ledger(path)
         led.record(dev, "held: screen locked", approved=False)
         led.save()
@@ -665,7 +587,7 @@ class OldLedgerMigration(unittest.TestCase):
                          ledger_mod.descriptor_fingerprint(dev),
                          "record() re-anchors the baseline on the next visit")
 
-        replug = make_device(storage_device_blob(
+        replug = make_kingston_device(storage_device_blob(
             bcd_usb=0x0320, max_packet0=9, max_power_raw=63,
             include_ss_companion=True))
         led = ledger_mod.Ledger(path)
@@ -673,32 +595,6 @@ class OldLedgerMigration(unittest.TestCase):
         self.assertFalse(
             any(f.rule_id == "descriptor-drift" for f in findings),
             "same stick, different port -> no alarm even after migration")
-
-
-# ---------------------------------------------------------------------------
-# 6. Trust store is intentionally left on the RAW hash
-# ---------------------------------------------------------------------------
-
-class TrustStoreStillPinsRawBytes(unittest.TestCase):
-    """
-    Trust and drift have different semantics. "I approved this exact blob"
-    is stricter than "the device did not change what it claims to be", and
-    a controller swap that changes the raw bytes SHOULD re-prompt for trust
-    -- because the trusted admission is admission WITHOUT prompting, and
-    conservative is the safe direction there.
-    """
-
-    def test_trust_key_uses_raw_bytes(self):
-        from probolos import trust
-        a = make_device(storage_device_blob(bcd_usb=0x0210))
-        b = make_device(storage_device_blob(bcd_usb=0x0320,
-                                            include_ss_companion=True))
-        self.assertNotEqual(trust.key_for(a), trust.key_for(b),
-                            "trust must not silently span controller swaps")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class HistoryDoesNotReplayLedgerEscapes(unittest.TestCase):
@@ -711,6 +607,7 @@ class HistoryDoesNotReplayLedgerEscapes(unittest.TestCase):
     def test_hash_fields_are_cleaned(self):
         import os
         import time
+
         from probolos import history
 
         now = time.time()
@@ -727,3 +624,211 @@ class HistoryDoesNotReplayLedgerEscapes(unittest.TestCase):
             out = history.show_history(verbose=True, path=path)
         self.assertNotIn("\x1b", out)
         self.assertNotIn("\x07", out)
+
+
+# --------------------------------------------------------------------------
+# 3. The drift baseline
+# --------------------------------------------------------------------------
+
+class DriftBaselineIsNeverAPlaceholder(unittest.TestCase):
+
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp(prefix="probolos-audit-")) / "l.json"
+
+    def _drift(self, dev):
+        led = ledger_mod.Ledger(self.path)
+        findings = analyzers.run(analyzers.Context(device=dev, ledger=led))
+        return any(f.rule_id == "descriptor-drift" for f in findings)
+
+    def test_unreadable_first_sighting_survives_a_reload(self):
+        blind = make_widget_device(STORAGE_BLOB)
+        blind.raw_descriptors = None
+        blind.descriptor_set = None
+        led = ledger_mod.Ledger(self.path)
+        led.record(blind, "user rejected", approved=False)
+        self.assertIsNone(led.save())
+
+        reloaded = ledger_mod.Ledger(self.path)
+        entry = reloaded.entries[ledger_mod.identity_of(blind)]
+        self.assertEqual(entry.baseline_hash, "",
+                         "the placeholder must not become a baseline on load")
+        self.assertFalse(self._drift(make_widget_device(STORAGE_BLOB)),
+                         "our failure to read is not the device's drift")
+
+    def test_a_persisted_placeholder_baseline_is_discarded(self):
+        entry = ledger_mod.Entry.from_raw({
+            "identity": "1234:5678:S1", "descriptor_hash": "-",
+            "first_seen": 1.0, "last_seen": 2.0, "known_hashes": ["-"],
+            "baseline_hash": "-", "fingerprint_scheme": "normalized-v1"})
+        self.assertEqual(entry.baseline_hash, "")
+
+    def test_first_sighting_after_the_fingerprint_migration_is_quiet(self):
+        dev = make_widget_device(STORAGE_BLOB)
+        ident = ledger_mod.identity_of(dev)
+        self.path.write_text(json.dumps({"schema": 1, "entries": {ident: {
+            "identity": ident, "descriptor_hash": "old_raw_hash",
+            "first_seen": 1.0, "last_seen": 2.0, "times_seen": 2,
+            "known_hashes": ["old_raw_hash"],
+            "baseline_hash": "old_raw_hash"}}}))
+        self.assertFalse(self._drift(dev))
+
+    def test_real_drift_is_still_reported(self):
+        led = ledger_mod.Ledger(self.path)
+        led.record(make_widget_device(STORAGE_BLOB), "user approved", approved=True)
+        self.assertIsNone(led.save())
+        changed = make_widget_device(storage_device_desc() + storage_config_desc(27, n_ifaces=2)
+                              + storage_iface_desc()
+                              + storage_iface_desc(0x03, 0x01, 0x01, num=1))
+        self.assertTrue(self._drift(changed))
+
+
+# ---------------------------------------------------------------------------
+# 3. The drift ledger: reader identity + LUN, first layout is the baseline
+# ---------------------------------------------------------------------------
+
+class MediaLedger(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "ledger.json"
+        self.dev = mock.Mock(vendor_id="0bda", product_id="0158",
+                             serial="READER1")
+
+    def test_first_is_baseline_then_drift_then_known(self):
+        led = ledger_mod.Ledger(self.path)
+        self.assertEqual(led.record_media(self.dev, "0", "A"), (None, False))
+        self.assertEqual(led.record_media(self.dev, "0", "A"), ("A", True))
+        self.assertEqual(led.record_media(self.dev, "0", "B"), ("A", False))
+        self.assertEqual(led.record_media(self.dev, "0", "B"), ("A", True))
+
+    def test_luns_are_separate_slots(self):
+        led = ledger_mod.Ledger(self.path)
+        led.record_media(self.dev, "0", "A")
+        self.assertEqual(led.record_media(self.dev, "1", "B"), (None, False))
+
+    def test_survives_a_restart(self):
+        led = ledger_mod.Ledger(self.path)
+        led.record_media(self.dev, "0", "A")
+        self.assertIsNone(led.save())
+        again = ledger_mod.Ledger(self.path)
+        self.assertIsNone(again.load_error)
+        self.assertEqual(again.record_media(self.dev, "0", "B"), ("A", False))
+
+    def test_baseline_survives_the_bound(self):
+        led = ledger_mod.Ledger(self.path)
+        for i in range(ledger_mod.MAX_MEDIA_LAYOUTS * 3):
+            led.record_media(self.dev, "0", f"L{i}")
+        (layouts,) = led.media.values()
+        self.assertEqual(len(layouts), ledger_mod.MAX_MEDIA_LAYOUTS)
+        self.assertEqual(layouts[0], "L0")
+
+    def test_malformed_media_section_is_dropped_loudly(self):
+        self.path.write_text(json.dumps({
+            "schema": ledger_mod.SCHEMA_VERSION,
+            "fingerprint_scheme": "normalized-v1",
+            "entries": {},
+            "media": {"good#lun0": ["A"], "bad#lun0": [1, 2], "x": "y"}}))
+        os.chmod(self.path, 0o600)
+        led = ledger_mod.Ledger(self.path)
+        self.assertEqual(led.media, {"good#lun0": ["A"]})
+        self.assertIn("media", led.load_error)
+
+
+# ---------------------------------------------------------------------------
+# P3 -- a decision recorded is not a decision endorsed
+# ---------------------------------------------------------------------------
+
+class DescriptorDriftSurvivesRecording(unittest.TestCase):
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp(prefix="probolos-ledger-"))
+        self.path = self.directory / "ledger.json"
+        # Same identity, same single storage interface, different firmware
+        # revision: drift is the ONLY signal that separates these two.
+        self.genuine = make_device(descriptor_blob((0x08, 0x06, 0x50),
+                                                   bcd_device=0x0100))
+        self.reflashed = make_device(descriptor_blob((0x08, 0x06, 0x50),
+                                                     bcd_device=0x0110))
+
+    def tearDown(self):
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def _seed(self):
+        led = ledger_mod.Ledger(self.path)
+        led.record(self.genuine, "user approved", approved=True)
+        led.save()
+
+    def _drift(self, device):
+        led = ledger_mod.Ledger(self.path)
+        findings = analyzers.run(analyzers.Context(device=device, ledger=led))
+        return any(f.rule_id == "descriptor-drift" for f in findings)
+
+    def _record(self, device, reason, approved):
+        led = ledger_mod.Ledger(self.path)
+        led.record(device, reason, approved=approved)
+        led.save()
+
+    def test_genuine_device_never_drifts(self):
+        self._seed()
+        self.assertFalse(self._drift(self.genuine))
+
+    def test_drift_is_reported_on_first_appearance(self):
+        self._seed()
+        self.assertTrue(self._drift(self.reflashed))
+
+    def test_drift_survives_a_refusal(self):
+        self._seed()
+        self.assertTrue(self._drift(self.reflashed))
+        self._record(self.reflashed, "user rejected", approved=False)
+        self.assertTrue(self._drift(self.reflashed),
+                        "refusing a drifted device must not adopt its blob")
+
+    def test_drift_survives_being_held_while_the_screen_was_locked(self):
+        """
+        The worst case: _hold_until_unlocked() records before anybody has been
+        asked anything, so the alarm was erased without a human ever seeing it.
+        """
+        self._seed()
+        self._record(self.reflashed, "held: screen locked", approved=False)
+        self.assertTrue(self._drift(self.reflashed))
+
+    def test_approval_is_what_moves_the_baseline(self):
+        self._seed()
+        self._record(self.reflashed, "user approved", approved=True)
+        self.assertFalse(self._drift(self.reflashed),
+                         "a firmware update the user accepted must stop nagging")
+        self.assertTrue(self._drift(self.genuine),
+                        "and the previous revision is now the drifted one")
+
+    def test_old_ledger_carrying_the_new_scheme_marker_is_migrated(self):
+        """
+        A ledger written by round 4 (raw-blob fingerprint, `baseline_hash`
+        already added) carries the entry through `fingerprint_scheme:
+        normalized-v1` via Ledger.load(); from_raw is then free to trust the
+        stored baseline. The wider migration -- pre-round-4 ledgers with the
+        raw-blob baseline -- is covered by
+        tests.test_normalized_fingerprint.OldLedgerMigration.
+        """
+        entry = ledger_mod.Entry.from_raw({
+            "identity": "0951:1666:AABBCCDD",
+            "descriptor_hash": "bbbb",
+            "first_seen": 1.0, "last_seen": 2.0, "times_seen": 2,
+            "known_hashes": ["aaaa", "bbbb"],
+            "fingerprint_scheme": "normalized-v1",
+        })
+        self.assertEqual(entry.baseline_hash, "aaaa",
+                         "known_hashes[0] is the surviving evidence")
+
+    def test_unreadable_descriptors_never_become_a_baseline(self):
+        blind = make_device()
+        blind.raw_descriptors = None
+        blind.descriptor_set = None
+        led = ledger_mod.Ledger(self.path)
+        led.record(blind, "user rejected", approved=False)
+        self.assertEqual(led.entries[ledger_mod.identity_of(blind)].baseline_hash,
+                         "", "a failure to read must not manufacture drift")
+
+
+if __name__ == "__main__":
+    unittest.main()

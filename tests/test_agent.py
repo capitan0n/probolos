@@ -1,28 +1,39 @@
 """
-The desktop agent: the dialog flow, the socket, and who is allowed to
-answer a question about hardware.
+The desktop agent: the socket it answers on, who may reach it, the dialog
+backends, and what the daemon does with its answers.
 
-Merged from: test_agent.py, test_agentlink_hardening.py
+Covers probolos.agent, probolos.agentlink and probolos.dialogs.
 """
+
 from __future__ import annotations
 
-# =========================================================================
-# test_agent.py
-#
-# Tests for the desktop agent.
-# =========================================================================
-
+import ctypes
+import ctypes.util
 import io
 import json
+import os
 import socket
+import stat
+import subprocess
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from probolos import agentlink, daemon as daemon_mod, rules, sysfs, usbclass
+from probolos import agent, agentlink, dialogs, rules, sysfs, usbclass
+from probolos import agent as agent_mod
+from probolos import daemon as daemon_mod
+from probolos.agentlink import (
+    ANSWER_ALWAYS,
+    ANSWER_NO,
+    ANSWER_YES,
+    MSG_ANSWER,
+    AgentLink,
+    peer_credentials,
+)
 
 
 class FakeAgent:
@@ -105,6 +116,29 @@ class LinkTestCase(unittest.TestCase):
                 return
             time.sleep(0.02)
         raise AssertionError("link never registered the agent")
+
+
+SETTLE = 0.15           # let the accept thread run before asserting on it
+
+
+def _quiet(*_args, **_kwargs):
+    pass
+
+
+# One backslash. The hostile strings below are plain printable ASCII -- exactly
+# what textsafe lets through, because nothing in them is a control character.
+
+B = "\\"
+
+
+def _glib():
+    name = ctypes.util.find_library("glib-2.0")
+    if not name:
+        return None
+    try:
+        return ctypes.CDLL(name)
+    except OSError:
+        return None
 
 
 class TestAgentLink(LinkTestCase):
@@ -271,7 +305,6 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
         body = daemon_mod.Probolos._agent_body(self.device(), findings)
         self.assertLessEqual(len(body.splitlines()), 6)
         self.assertIn("more finding", body)
-
 
 
 class TestDialogBackends(unittest.TestCase):
@@ -539,25 +572,6 @@ class TestServePassesAgentUid(unittest.TestCase):
         # None is the documented "any local process" fallback -- but note
         # AgentLink.start() prints a warning in that case so it is not silent.
         self.assertIsNone(captured["allowed_uids"])
-
-
-# =========================================================================
-# test_agentlink_hardening.py
-#
-# Regression tests for the agent socket, one per way it could be abused.
-# =========================================================================
-
-import os
-import unittest
-
-from probolos.agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_YES,
-                                AgentLink, MSG_ANSWER, peer_credentials)
-
-SETTLE = 0.15           # let the accept thread run before asserting on it
-
-
-def _quiet(*_args, **_kwargs):
-    pass
 
 
 class AgentSocketHardening(unittest.TestCase):
@@ -837,6 +851,597 @@ class SocketOwnership(unittest.TestCase):
             self.assertTrue(link.start())
         link.stop()
         chown.assert_not_called()
+
+
+class SocketDirectoryIsNotGroupWritable(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "probolos"
+        patcher = mock.patch.object(agentlink, "DEFAULT_SOCKET",
+                                    self.root / "agent.sock")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_group_cannot_replace_the_socket(self):
+        agentlink.prepare_socket_dir(self.root / "agent.sock",
+                                     os.getuid(), os.getgid())
+        mode = stat.S_IMODE(os.stat(self.root).st_mode)
+        self.assertFalse(mode & stat.S_IWGRP,
+                         f"directory is group-writable (mode {mode:04o}); "
+                         f"anyone in that group can unlink the agent socket "
+                         f"and bind their own listener in its place")
+        self.assertFalse(mode & (stat.S_IRWXO),
+                         f"directory is reachable by others (mode {mode:04o})")
+
+    def test_group_can_still_traverse_to_the_socket(self):
+        """
+        The permission that must survive: without group execute the desktop
+        agent cannot reach the socket at all and the prompt disappears.
+        """
+        agentlink.prepare_socket_dir(self.root / "agent.sock",
+                                     os.getuid(), os.getgid())
+        mode = stat.S_IMODE(os.stat(self.root).st_mode)
+        self.assertTrue(mode & stat.S_IXGRP, "group lost traverse permission")
+        self.assertTrue(mode & stat.S_ISGID,
+                        "setgid dropped; the socket would not inherit the "
+                        "desktop group and the agent could not open it")
+
+    def test_the_directory_must_stay_under_the_runtime_root(self):
+        with self.assertRaises(OSError):
+            agentlink.prepare_socket_dir(Path("/etc/probolos-agent.sock"),
+                                         os.getuid(), os.getgid())
+
+
+class SocketMetadataIsNotChangedByName(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.sock_path = self.dir / "agent.sock"
+
+    def test_the_socket_is_never_group_readable_by_accident(self):
+        link = agentlink.AgentLink(self.sock_path, log=lambda *_a: None,
+                                   allowed_uids={os.getuid()})
+        self.assertTrue(link.start())
+        self.addCleanup(link.stop)
+        mode = stat.S_IMODE(os.lstat(self.sock_path).st_mode)
+        self.assertEqual(mode, 0o660, f"socket mode is {mode:04o}")
+
+    def test_a_non_socket_at_the_path_is_refused_rather_than_replaced(self):
+        self.sock_path.write_text("something else")
+        messages = []
+        link = agentlink.AgentLink(self.sock_path, log=messages.append,
+                                   allowed_uids={os.getuid()})
+        self.assertFalse(link.start())
+        self.assertTrue(any("could not listen" in m for m in messages),
+                        messages)
+        self.assertEqual(self.sock_path.read_text(), "something else")
+
+    def test_chmod_refuses_a_path_that_is_no_longer_a_socket(self):
+        """
+        The guard itself, exercised directly: a symlink swapped in between
+        bind() and the chmod must be an error, not a redirection.
+        """
+        victim = self.dir / "victim"
+        victim.write_text("x")
+        victim.chmod(0o600)
+        os.symlink(victim, self.sock_path)
+        link = agentlink.AgentLink(self.sock_path, log=lambda *_a: None)
+        directory_fd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, directory_fd)
+        with self.assertRaises(OSError):
+            link._chmod_socket(directory_fd, 0o660)
+        self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o600)
+
+    def test_stop_does_not_delete_whatever_sits_at_the_path(self):
+        keep = self.dir / "important"
+        keep.write_text("do not delete me")
+        link = agentlink.AgentLink(keep, log=lambda *_a: None)
+        link.stop()
+        self.assertTrue(keep.exists(),
+                        "stop() unlinked an operator-supplied path that was "
+                        "never a socket we created")
+
+    def test_stop_removes_its_own_socket(self):
+        link = agentlink.AgentLink(self.sock_path, log=lambda *_a: None,
+                                   allowed_uids={os.getuid()})
+        self.assertTrue(link.start())
+        link.stop()
+        self.assertFalse(self.sock_path.exists())
+
+
+class AgentReceiveIsBounded(unittest.TestCase):
+
+    def test_a_peer_that_never_sends_a_newline_is_dropped(self):
+        """
+        MAX_MESSAGE bounded each recv() and not their sum. The agent does not
+        get to choose what it is talking to -- it connects to a path -- so an
+        occupant of that path could grow this without limit.
+        """
+        listener, peer = socket.socketpair()
+        self.addCleanup(listener.close)
+        self.addCleanup(peer.close)
+
+        messages = []
+        agent = agent_mod.Agent(Path("/nonexistent"), log=messages.append)
+        agent.sock = listener
+        agent.sock.settimeout(1.0)
+        agent.dialog = mock.Mock()
+        agent.notifier = mock.Mock(available=lambda: False)
+
+        sent = [0]
+
+        def flood():
+            try:
+                # Far more than MAX_MESSAGE, and never a newline. Bounded so
+                # the test cannot hang if the guard is missing; the assertion
+                # below is what distinguishes "dropped" from "still reading".
+                for _ in range(64):
+                    peer.sendall(b"A" * 4096)
+                    sent[0] += 4096
+            except OSError:
+                pass
+
+        thread = threading.Thread(target=flood)
+        thread.start()
+        self.addCleanup(thread.join)
+
+        # connect() would replace the socket with a real one; the loop is what
+        # is under test, so it is fed the socketpair directly.
+        with mock.patch.object(agent, "connect", return_value=True):
+            agent.run()
+
+        self.assertTrue(any("oversized" in m for m in messages), messages)
+        agent.dialog.confirm.assert_not_called()
+
+
+class AgentTimeoutIsValidated(unittest.TestCase):
+    """
+    `float(message.get("timeout", 60))` raised on a string, a list or a null
+    and took the agent down -- a way to remove the desktop prompt by sending
+    one malformed message.
+    """
+
+    def test_unusable_values_fall_back_to_the_default(self):
+        for value in ("soon", None, [], {}, True, float("nan"),
+                      float("inf"), -5, 0):
+            with self.subTest(value=value):
+                result = agent_mod._dialog_timeout(value)
+                self.assertGreaterEqual(result, agent_mod.MIN_DIALOG_TIMEOUT)
+                self.assertLessEqual(result, agent_mod.MAX_DIALOG_TIMEOUT)
+
+    def test_an_absurd_value_is_clamped_rather_than_honoured(self):
+        self.assertEqual(agent_mod._dialog_timeout(10 ** 9),
+                         agent_mod.MAX_DIALOG_TIMEOUT)
+
+    def test_an_ordinary_value_passes_through(self):
+        self.assertEqual(agent_mod._dialog_timeout(45), 45.0)
+
+    def test_non_string_display_fields_do_not_crash_the_agent(self):
+        agent = agent_mod.Agent(Path("/nonexistent"), log=lambda *_a: None)
+        agent.notifier = mock.Mock(available=lambda: False)
+        agent.dialog = mock.Mock()
+        agent.dialog.confirm.return_value = False
+        agent.sock = None
+        agent._handle(json.dumps({
+            "type": agent_mod.MSG_DECIDE, "id": 1,
+            "title": {"not": "a string"}, "body": ["nor", "this"],
+            "timeout": "whenever",
+        }).encode())
+        agent.dialog.confirm.assert_called_once()
+        text = agent.dialog.confirm.call_args.kwargs["text"]
+        self.assertIsInstance(text, str)
+
+    def test_a_message_that_is_not_an_object_is_ignored(self):
+        agent = agent_mod.Agent(Path("/nonexistent"), log=lambda *_a: None)
+        agent.notifier = mock.Mock(available=lambda: False)
+        agent.dialog = mock.Mock()
+        agent._handle(b'["not", "an", "object"]')
+        agent.dialog.confirm.assert_not_called()
+
+
+class NotificationBodyIsNotMarkup(unittest.TestCase):
+    """Device strings reached the notification body as live markup."""
+
+    def test_device_markup_is_escaped(self):
+        notifier = agent.Notifier(log=lambda *_a: None)
+        notifier._gdbus = "/usr/bin/gdbus"
+        with mock.patch("subprocess.run") as run:
+            run.return_value = types.SimpleNamespace(
+                returncode=0, stdout="(uint32 7,)", stderr="")
+            notifier.notify("New USB device",
+                            '<a href="https://evil.example/">approve</a>')
+        argv = run.call_args[0][0]
+        # String arguments are GVariant literals now; JSON reads that subset.
+        import json
+        body = json.loads(argv[argv.index('"New USB device"') + 1])
+        self.assertNotIn("<a", body)
+        self.assertIn("&lt;a href=", body)
+
+
+class NotificationArgumentsAreLiterals(unittest.TestCase):
+    """gdbus decoded escapes in every bare string argument."""
+
+    HOSTILE = ("Kingston " + B + "u003ca href=" + B + "u0022https://evil.example"
+               + B + "u0022" + B + "u003eok" + B + "u003c/a" + B + "u003e "
+               + B + "u202eevil" + B + "n")
+
+    def _argv(self, summary, body):
+        notifier = agent.Notifier(log=lambda *_a: None)
+        notifier._gdbus = "/usr/bin/gdbus"
+        with mock.patch("subprocess.run") as run:
+            run.return_value = types.SimpleNamespace(
+                returncode=0, stdout="(uint32 7,)", stderr="")
+            notifier.notify(summary, body, actionable=False)
+        return run.call_args[0][0]
+
+    def test_every_literal_decodes_to_exactly_its_text(self):
+        # The escapes emitted (\\ \" \n \u00XX) are the subset GVariant text
+        # and JSON share, so JSON is an independent decoder for them.
+        for text in ("plain", 'a "quoted" word', B, B + B + "n",
+                     "line\nbreak", "tab\tstop", "é — ü", "", chr(0x7F),
+                     self.HOSTILE):
+            self.assertEqual(json.loads(agent._gvariant_string(text)), text)
+
+    def test_device_escapes_reach_the_server_as_typed(self):
+        argv = self._argv("New USB device", self.HOSTILE)
+        body = json.loads(argv[argv.index('"New USB device"') + 1])
+        self.assertIn(B + "u003ca href", body)
+        self.assertNotIn("<", body)
+        self.assertNotIn(chr(0x202E), body)
+
+    @unittest.skipIf(_glib() is None, "libglib-2.0 not available")
+    def test_glib_parses_each_literal_back_to_the_text(self):
+        lib = _glib()
+        lib.g_variant_parse.restype = ctypes.c_void_p
+        lib.g_variant_parse.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                                        ctypes.c_void_p, ctypes.c_void_p,
+                                        ctypes.c_void_p]
+        lib.g_variant_get_string.restype = ctypes.c_char_p
+        lib.g_variant_get_string.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.g_variant_unref.argtypes = [ctypes.c_void_p]
+        body = dialogs._markup_safe(self.HOSTILE) + "\n\nBlocked — waiting"
+        for text in (self.HOSTILE, body, 'a "b" c'):
+            value = lib.g_variant_parse(
+                b"s", agent._gvariant_string(text).encode(), None, None, None)
+            self.assertTrue(value, f"GLib refused the literal for {text!r}")
+            try:
+                self.assertEqual(
+                    lib.g_variant_get_string(value, None).decode(), text)
+            finally:
+                lib.g_variant_unref(value)
+
+
+class DialogTextIsNotUnescapedByTheBackend(unittest.TestCase):
+    """zenity and kdialog decode backslash escapes in the text they show."""
+
+    OCTAL = (B + "074a href=" + B + "042https://evil.example" + B + "042"
+             + B + "076ok" + B + "074/a" + B + "076")
+    FORGED_LINES = "Kingston" + B + "n" + B + "nNo findings. Safe to allow."
+
+    @staticmethod
+    def _argv(backend_cls, method, text):
+        backend = backend_cls()
+        backend._binary = "/usr/bin/dialog-tool"
+        with mock.patch.object(dialogs.subprocess, "run",
+                               return_value=mock.Mock(returncode=1,
+                                                      stdout="")) as run:
+            if method == "confirm":
+                backend.confirm("t", text, "y", "n", 1.0)
+            else:
+                backend.choose("t", text, "once", "always", "no", 1.0)
+        return run.call_args[0][0]
+
+    @staticmethod
+    def _kdialog_shows(text):
+        """kdialog's Utils::parseString(): \\\\ -> \\, \\n -> newline."""
+        out, escaped = [], False
+        for char in text:
+            if escaped:
+                escaped = False
+                out.append(char if char == B
+                           else "\n" if char == "n" else B + char)
+            elif char == B:
+                escaped = True
+            else:
+                out.append(char)
+        if escaped:
+            out.append(B)
+        return "".join(out)
+
+    def test_kdialog_shows_the_text_it_was_given(self):
+        for method in ("confirm", "choose"):
+            shown = self._kdialog_shows(
+                self._argv(dialogs.KDialogBackend, method,
+                           self.FORGED_LINES)[-1])
+            self.assertNotIn("\n", shown)
+            self.assertEqual(shown, dialogs._markup_safe(self.FORGED_LINES))
+
+    @unittest.skipIf(_glib() is None, "libglib-2.0 not available")
+    def test_zenity_shows_the_text_it_was_given(self):
+        lib = _glib()
+        lib.g_strcompress.restype = ctypes.c_void_p
+        lib.g_strcompress.argtypes = [ctypes.c_char_p]
+        lib.g_free.argtypes = [ctypes.c_void_p]
+        for method in ("confirm", "choose"):
+            argv = self._argv(dialogs.ZenityBackend, method, self.OCTAL)
+            pointer = lib.g_strcompress(argv[argv.index("--text") + 1].encode())
+            try:
+                shown = ctypes.string_at(pointer).decode()
+            finally:
+                lib.g_free(pointer)
+            self.assertNotIn("<", shown)
+            self.assertEqual(shown, dialogs._markup_safe(self.OCTAL))
+
+
+# --------------------------------------------------------------------------
+# 4. The agent's second dialog
+# --------------------------------------------------------------------------
+
+class ConfirmationEndsBeforeTheAnalyzerStopsListening(unittest.TestCase):
+
+    def build(self):
+        from probolos import agent as agent_mod
+        instance = agent_mod.Agent.__new__(agent_mod.Agent)
+        instance.log = lambda *a: None
+        instance.notifier = mock.Mock()
+        instance.notifier.available.return_value = False
+        instance.dialog = mock.Mock()
+        instance.sock = None
+        return instance, agent_mod
+
+    def test_second_dialog_gets_only_what_is_left(self):
+        agent, agent_mod = self.build()
+        clock = iter([100.0, 150.0])     # the first dialog took 50 of 60 s
+        agent.dialog.confirm.side_effect = [True, True]
+        with mock.patch.object(agent_mod.time, "monotonic",
+                               side_effect=lambda: next(clock)):
+            agent._ask_user({"title": "t", "body": "b"}, 60)
+        second_timeout = agent.dialog.confirm.call_args_list[1].kwargs["timeout"]
+        self.assertLessEqual(second_timeout, 60 - 50)
+
+    def test_no_budget_left_is_a_refusal_not_a_late_yes(self):
+        from probolos.agentlink import ANSWER_NO
+        agent, agent_mod = self.build()
+        clock = iter([100.0, 170.0])
+        agent.dialog.confirm.side_effect = [True, True]
+        with mock.patch.object(agent_mod.time, "monotonic",
+                               side_effect=lambda: next(clock)):
+            answer = agent._ask_user({"title": "t", "body": "b"}, 60)
+        self.assertEqual(answer, ANSWER_NO)
+        self.assertEqual(agent.dialog.confirm.call_count, 1)
+
+
+# ---------------------------------------------------------------------------
+# 8. A decision that was made must not evaporate
+# ---------------------------------------------------------------------------
+
+class AnUnofferedAlwaysIsDowngradedNotDiscarded(unittest.TestCase):
+    """
+    `continue` threw the answer away and went back to waiting, so a user who
+    clicked a button got a question that then timed out into a denial -- and
+    the daemon, seeing None, announced "no answer from the desktop agent" and
+    re-asked in a terminal the user may not have been looking at.
+
+    "Always" is "yes" plus "remember it". With remembering not on offer, the
+    honest reading is the yes without the remembering, which is strictly LESS
+    than the user asked for and so cannot grant anything unintended.
+    """
+
+    def _link_answering(self, answer):
+        import json
+        link = agentlink.AgentLink(Path("/nonexistent/agent.sock"),
+                                   log=lambda *a: None)
+        conn = mock.Mock()
+        link._conn = conn
+        sent = {}
+
+        def sendall(payload):
+            sent["id"] = json.loads(payload.decode())["id"]
+
+        conn.sendall.side_effect = sendall
+        conn.gettimeout.return_value = 1.0
+
+        def recv(*_a, **_k):
+            if "id" not in sent:
+                raise BlockingIOError
+            return (json.dumps({"type": agentlink.MSG_ANSWER,
+                                "id": sent["id"],
+                                "answer": answer}) + "\n").encode()
+
+        conn.recv.side_effect = recv
+        return link
+
+    def test_always_without_the_offer_becomes_yes(self):
+        link = self._link_answering(agentlink.ANSWER_ALWAYS)
+        self.assertEqual(
+            link.ask("t", "b", "none", allow_always=False, timeout=5),
+            agentlink.ANSWER_YES,
+            "a decision the user made must not be silently dropped")
+
+    def test_always_with_the_offer_stays_always(self):
+        link = self._link_answering(agentlink.ANSWER_ALWAYS)
+        self.assertEqual(
+            link.ask("t", "b", "none", allow_always=True, timeout=5),
+            agentlink.ANSWER_ALWAYS)
+
+    def test_no_is_still_no(self):
+        link = self._link_answering(agentlink.ANSWER_NO)
+        self.assertEqual(
+            link.ask("t", "b", "none", allow_always=False, timeout=5),
+            agentlink.ANSWER_NO)
+
+    def test_unavailable_is_still_not_a_decision(self):
+        """None means "fall back to the terminal", never "the user said no"."""
+        link = self._link_answering(agentlink.ANSWER_UNAVAILABLE)
+        self.assertIsNone(
+            link.ask("t", "b", "none", allow_always=False, timeout=5))
+
+
+class SocketChownDoesNotFollowALink(unittest.TestCase):
+    """
+    start() verified /run/probolos with open_directory(secure=True) and then
+    closed the descriptor, after which bind(), chmod() and chown() all worked
+    by NAME again. os.chown on a name follows symlinks, so the directory that
+    was checked and the one written to were the same only by assumption.
+    """
+
+    def test_chown_is_relative_to_the_verified_directory(self):
+        import inspect
+
+        from probolos import agentlink
+
+        source = inspect.getsource(agentlink.AgentLink._chown_for_owner)
+        self.assertIn("dir_fd=directory_fd", source)
+        self.assertIn("follow_symlinks=False", source)
+        # The old signature took `created_dir` and promised, in its docstring,
+        # that the directory was "only chowned if THIS call created it" -- a
+        # protection the body never implemented and never even read the flag
+        # for. The parameter must now be one the code actually uses.
+        signature = inspect.signature(agentlink.AgentLink._chown_for_owner)
+        self.assertNotIn("created_dir", signature.parameters)
+
+
+class DialogMarkupEscaping(unittest.TestCase):
+    """
+    The kdialog and zenity backends render markup; a device name that looks
+    like HTML must not become HTML in the prompt. tkinter and the terminal
+    render plain text and must NOT be escaped.
+    """
+
+    def setUp(self):
+        from probolos import dialogs
+        self.dialogs = dialogs
+
+    def test_markup_safe_neutralises_tags(self):
+        self.assertEqual(self.dialogs._markup_safe("<b>x</b>"),
+                         "&lt;b&gt;x&lt;/b&gt;")
+
+    def test_markup_safe_neutralises_a_link(self):
+        raw = 'Kingston<a href="file:///etc/shadow">.</a>'
+        self.assertNotIn("<a", self.dialogs._markup_safe(raw))
+
+    def test_markup_safe_preserves_a_legitimate_name(self):
+        """"A<B & C>D" is a real name shape and must survive, just inert."""
+        out = self.dialogs._markup_safe("A<B & C>D")
+        self.assertEqual(out, "A&lt;B &amp; C&gt;D")
+        self.assertNotIn("<", out)
+
+    def test_markup_safe_leaves_ordinary_text_untouched(self):
+        self.assertEqual(self.dialogs._markup_safe("Kingston DataTraveler"),
+                         "Kingston DataTraveler")
+
+
+class AgentUnavailableIsNotARefusal(unittest.TestCase):
+
+    def test_sentinel_is_not_a_decision(self):
+        """
+        The analyzer maps anything outside the three real answers to None, and
+        None means "fall back to the terminal". The sentinel must land there --
+        if it were ever added to the valid set, every dialog-less machine would
+        go back to silently denying devices.
+        """
+        self.assertNotIn(agentlink.ANSWER_UNAVAILABLE,
+                         (agentlink.ANSWER_YES,
+                          agentlink.ANSWER_ALWAYS,
+                          agentlink.ANSWER_NO))
+
+    def test_sentinel_is_distinct_from_no(self):
+        self.assertNotEqual(agentlink.ANSWER_UNAVAILABLE, agentlink.ANSWER_NO)
+
+
+# ---------------------------------------------------------------------------
+# 4. The agent's "I cannot ask" reply was produced and never consumed
+# ---------------------------------------------------------------------------
+
+class AgentUnavailableReturnsImmediately(unittest.TestCase):
+    """
+    ANSWER_UNAVAILABLE exists so a dialog-less agent is told apart from a user
+    saying no. The agent sends it; _parse_answer dropped it as "not one of the
+    three real answers"; ask() therefore kept waiting for a reply it already
+    had, for the whole 60-second budget. The udev loop is single-threaded, so
+    every device attached during that minute queued behind a question the agent
+    had already declined to ask.
+    """
+
+    def _link_over(self, sock):
+        link = agentlink.AgentLink.__new__(agentlink.AgentLink)
+        link.log = lambda *_a: None
+        link._lock = threading.Lock()
+        link._conn = sock
+        link._asking = 0
+        link._peer = None
+        sock.settimeout(1.0)
+        return link
+
+    def _answer_with(self, value):
+        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        link = self._link_over(ours)
+
+        def agent():
+            try:
+                message = json.loads(theirs.recv(65536).decode().strip())
+            except (OSError, ValueError):
+                return
+            theirs.sendall((json.dumps({
+                "type": agentlink.MSG_ANSWER,
+                "id": message["id"],
+                "answer": value}) + "\n").encode())
+
+        thread = threading.Thread(target=agent, daemon=True)
+        thread.start()
+        started = time.monotonic()
+        answer = link.ask("t", "b", "none", True, timeout=8.0)
+        return answer, time.monotonic() - started
+
+    def test_unavailable_does_not_wait_out_the_timeout(self):
+        answer, elapsed = self._answer_with(agentlink.ANSWER_UNAVAILABLE)
+        self.assertIsNone(answer, "not a decision")
+        self.assertLess(elapsed, 2.0,
+                        "the reply was already in hand; ask() must not block")
+
+    def test_unavailable_is_still_not_read_as_consent(self):
+        answer, _ = self._answer_with(agentlink.ANSWER_UNAVAILABLE)
+        self.assertNotEqual(answer, agentlink.ANSWER_YES)
+        self.assertNotEqual(answer, agentlink.ANSWER_ALWAYS)
+
+    def test_a_real_answer_still_works(self):
+        answer, elapsed = self._answer_with(agentlink.ANSWER_YES)
+        self.assertEqual(answer, agentlink.ANSWER_YES)
+        self.assertLess(elapsed, 2.0)
+
+    def test_nonsense_answers_are_still_ignored(self):
+        """An unknown string is not a decision AND not a reason to give up."""
+        answer, elapsed = self._answer_with("maybe")
+        self.assertIsNone(answer)
+        self.assertGreater(elapsed, 7.0, "kept waiting for a real answer")
+
+
+class NotificationCleanupNeverCostsAnAnswer(unittest.TestCase):
+    """
+    Notifier.close() runs in the `finally` of the agent's decision path, after
+    the human has already chosen. An unhandled TimeoutExpired there replaced
+    the return value with an exception and the decision was lost.
+    """
+
+    def test_a_hung_gdbus_is_swallowed(self):
+        from probolos import agent
+
+        notifier = agent.Notifier.__new__(agent.Notifier)
+        notifier._gdbus = "/bin/true"
+
+        real_run = subprocess.run
+        subprocess.run = lambda *a, **k: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd="gdbus", timeout=5))
+        try:
+            notifier.close(7)      # must simply return
+        finally:
+            subprocess.run = real_run
 
 
 if __name__ == "__main__":

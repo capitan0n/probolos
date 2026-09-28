@@ -73,8 +73,3 @@ target-version = "py310"
 # pyflakes + pycodestyle errors (ruff's defaults). The tree is clean against
 # them; `ruff check .` is meant to stay that way.
 select = ["E4", "E7", "E9", "F"]
-
-[tool.ruff.lint.per-file-ignores]
-# Several test modules are concatenations of older per-review files, each
-# section keeping its own imports next to the tests that need them.
-"tests/*.py" = ["E402"]

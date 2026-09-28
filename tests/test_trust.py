@@ -1,45 +1,24 @@
 """
-The trust store: what it admits without asking, who may write it, and
-the atomic write that keeps a crash from leaving it half-formed.
+The trust store: what it admits without asking, who may write it, and the
+atomic writes underneath it.
 
-Merged from: test_trust_storage.py, test_trust_integrity.py, test_atomicio.py
+Covers probolos.trust and probolos.atomicio.
 """
+
 from __future__ import annotations
 
-# =========================================================================
-# test_trust_storage.py
-#
-# Tests for remembered devices (allowlist) and for stage 4 medium inspection.
-# =========================================================================
-
-import struct
+import fnmatch
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from probolos import rules, storage, trust
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-
-def mbr_with(*entries, signature=True):
-    """Build a 512-byte MBR. Each entry is (type, start_lba, sectors, boot)."""
-    data = bytearray(512)
-    for i, (ptype, start, sectors, boot) in enumerate(entries):
-        struct.pack_into("<BBBBBBBBII", data, 446 + i * 16,
-                         0x80 if boot else 0x00, 0, 0, 0,
-                         ptype, 0, 0, 0, start, sectors)
-    if signature:
-        struct.pack_into("<H", data, 510, 0xAA55)
-    return bytes(data)
-
-
-def medium(partitions, size_sectors, signatures=None, scheme="mbr"):
-    return storage.MediumReport(
-        device="/dev/sdb", size_sectors=size_sectors, scheme=scheme,
-        partitions=partitions, signatures=signatures or {})
+from probolos import atomicio, trust
+from probolos import ledger as ledger_mod
+from probolos import trust as trust_mod
+from tests._support import make_kingston_device, storage_device_blob
 
 
 class Dev:
@@ -52,6 +31,20 @@ class Dev:
 
     def label(self):
         return "Kingston DataTraveler"
+
+
+def good_entry(key="v:p:s#abc"):
+    return {
+        "key": key,
+        "identity": "v:p:s",
+        "label": "Kingston",
+        "descriptor_hash": "abc",
+        "trusted_at": 1.0,
+        "last_seen": 2.0,
+        "times_admitted": 3,
+        "note": "",
+        "ports": ["1-1"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -127,124 +120,6 @@ class TestTrustStore(unittest.TestCase):
         self.assertEqual(store.lookup(Dev()).times_admitted, 2)
 
 
-# ---------------------------------------------------------------------------
-# Storage: ordinary media must stay silent
-# ---------------------------------------------------------------------------
-
-class TestOrdinaryMediaAreSilent(unittest.TestCase):
-
-    def test_typical_fat32_stick(self):
-        """One FAT32 partition at the standard 1 MiB alignment."""
-        parts = storage.parse_mbr(mbr_with((0x0C, 2048, 7811072, False)))
-        report = medium(parts, 7813120, {0: "FAT32"})
-        self.assertEqual(rules.storage_findings(report), [])
-
-    def test_exfat_stick_declared_as_ntfs_type(self):
-        """0x07 covers NTFS and exFAT alike; this pairing is routine."""
-        parts = storage.parse_mbr(mbr_with((0x07, 2048, 15000000, False)))
-        report = medium(parts, 15002048, {0: "exFAT"})
-        self.assertEqual(rules.storage_findings(report), [])
-
-    def test_superfloppy_without_a_partition_table(self):
-        """Plenty of sticks ship with a filesystem and no partition table."""
-        report = medium([], 7813120, {-1: "FAT32"}, scheme="none")
-        self.assertEqual(rules.storage_findings(report), [])
-
-    def test_eight_mib_alignment_is_accepted(self):
-        """Some tools align to 8 MiB; that must not read as a hidden area."""
-        parts = storage.parse_mbr(mbr_with((0x0C, 16384, 7790000, False)))
-        report = medium(parts, 7813120, {0: "FAT32"})
-        self.assertEqual(rules.storage_findings(report), [])
-
-    def test_two_partitions_side_by_side(self):
-        parts = storage.parse_mbr(mbr_with((0x0C, 2048, 4000000, False),
-                                           (0x83, 4002048, 3800000, False)))
-        report = medium(parts, 7813120, {0: "FAT32", 1: "ext2/3/4"})
-        self.assertEqual(rules.storage_findings(report), [])
-
-    def test_bootable_linux_installer_is_not_flagged(self):
-        """A bootable USB is an everyday object, not a finding."""
-        parts = storage.parse_mbr(mbr_with((0x0C, 2048, 7000000, True)))
-        report = medium(parts, 7813120, {0: "FAT32"})
-        self.assertEqual(rules.storage_findings(report), [])
-
-
-class TestStorageContradictions(unittest.TestCase):
-
-    def ids(self, report):
-        return [f.rule_id for f in rules.storage_findings(report)]
-
-    def test_partition_past_the_end_of_the_device(self):
-        """
-        Impossible on honest media, and the signature of a drive lying about
-        its capacity -- data written past the real end is silently lost.
-        """
-        parts = storage.parse_mbr(mbr_with((0x0C, 2048, 100_000_000, False)))
-        report = medium(parts, 7813120, {0: "FAT32"})
-        self.assertIn("partition-beyond-end-of-device", self.ids(report))
-
-    def test_overlapping_partitions(self):
-        parts = storage.parse_mbr(mbr_with((0x0C, 2048, 4000000, False),
-                                           (0x83, 3000000, 1000000, False)))
-        report = medium(parts, 7813120)
-        self.assertIn("overlapping-partitions", self.ids(report))
-
-    def test_declared_type_disagrees_with_content(self):
-        parts = storage.parse_mbr(mbr_with((0x83, 2048, 4000000, False)))
-        report = medium(parts, 7813120, {0: "NTFS"})
-        self.assertIn("filesystem-type-mismatch", self.ids(report))
-
-    def test_large_gap_before_the_first_partition(self):
-        parts = storage.parse_mbr(mbr_with((0x0C, 400000, 7000000, False)))
-        report = medium(parts, 7813120, {0: "FAT32"})
-        self.assertIn("large-unallocated-gap", self.ids(report))
-
-    def test_unreadable_medium_is_disclosed(self):
-        report = storage.MediumReport(error="Permission denied")
-        self.assertIn("storage-unreadable", self.ids(report))
-
-    def test_storage_findings_are_never_critical(self):
-        """
-        A partition table is metadata, not behaviour. These findings inform a
-        decision; they do not by themselves prove hostility, and inflating them
-        to CRITICAL would put them above evidence that does.
-        """
-        parts = storage.parse_mbr(mbr_with((0x0C, 2048, 100_000_000, False)))
-        for finding in rules.storage_findings(medium(parts, 7813120)):
-            self.assertLess(finding.severity, rules.Severity.CRITICAL)
-
-
-class TestMbrParsing(unittest.TestCase):
-
-    def test_missing_signature_yields_no_partitions(self):
-        self.assertEqual(
-            storage.parse_mbr(mbr_with((0x0C, 2048, 1000, False),
-                                       signature=False)), [])
-
-    def test_empty_slots_are_skipped(self):
-        parts = storage.parse_mbr(mbr_with((0x0C, 2048, 1000, False)))
-        self.assertEqual(len(parts), 1)
-
-    def test_truncated_data_does_not_raise(self):
-        self.assertEqual(storage.parse_mbr(b"\x00" * 10), [])
-
-    def test_filesystem_signatures(self):
-        fat32 = bytearray(512)
-        fat32[82:87] = b"FAT32"
-        self.assertEqual(storage.sniff_filesystem(bytes(fat32)), "FAT32")
-
-        ntfs = bytearray(512)
-        ntfs[3:11] = b"NTFS    "
-        self.assertEqual(storage.sniff_filesystem(bytes(ntfs)), "NTFS")
-
-        ext = bytearray(0x440)
-        struct.pack_into("<H", ext, 0x438, 0xEF53)
-        self.assertEqual(storage.sniff_filesystem(bytes(ext)), "ext2/3/4")
-
-        self.assertIsNone(storage.sniff_filesystem(bytes(512)))
-
-
-
 class TestNumberedManagement(unittest.TestCase):
     """ufw-style: list numbered, delete by number. Stable ordering is what
     makes the numbers safe to act on."""
@@ -281,102 +156,6 @@ class TestNumberedManagement(unittest.TestCase):
         self.store.forget_index(2)               # removes BBB
         removed = self.store.forget_index(2)     # now removes CCC
         self.assertIn("CCC", removed)
-
-
-# =========================================================================
-# test_trust_integrity.py
-#
-# Regression tests for trust store integrity (audit finding C3, second half).
-# =========================================================================
-
-import json
-import os
-import unittest
-from unittest import mock
-
-from probolos import privsep
-
-
-def good_entry(key="v:p:s#abc"):
-    return {
-        "key": key,
-        "identity": "v:p:s",
-        "label": "Kingston",
-        "descriptor_hash": "abc",
-        "trusted_at": 1.0,
-        "last_seen": 2.0,
-        "times_admitted": 3,
-        "note": "",
-        "ports": ["1-1"],
-    }
-
-
-class DirectorySeparation(unittest.TestCase):
-
-    def setUp(self):
-        self._d = tempfile.TemporaryDirectory()
-        self.addCleanup(self._d.cleanup)
-        self.root = Path(self._d.name)
-
-    def test_refuses_to_hand_over_a_directory_holding_trust(self):
-        """The core of the fix: that directory must never be chowned away."""
-        (self.root / "trusted.json").write_text("{}")
-        ledger = self.root / "ledger.json"
-        logged = []
-        privsep.prepare_state_dir(ledger, uid=65534, gid=65534,
-                                  log=logged.append)
-        self.assertTrue(any("REFUSING" in line for line in logged),
-                        "handing over a trust-store directory was not refused")
-
-    def test_a_clean_subdirectory_is_still_handed_over(self):
-        """The refusals must not break the legitimate ledger path."""
-        state = self.root / "state"
-        state.mkdir()
-        ledger = state / "ledger.json"
-        logged = []
-        # The tempdir is outside STATE_ROOTS, which is itself a refusal reason
-        # (see test_refuses_a_directory_outside_the_state_roots). Point the
-        # allowlist at it so this test exercises only the trust-store rule.
-        with mock.patch.object(privsep, "STATE_ROOTS", (str(self.root),)):
-            # chown will fail for non-root; what matters is that it was
-            # ATTEMPTED, i.e. we got past both refusals.
-            privsep.prepare_state_dir(ledger, uid=os.getuid(), gid=os.getgid(),
-                                      log=logged.append)
-        self.assertFalse(any("REFUSING" in line for line in logged))
-
-    def test_refuses_a_directory_outside_the_state_roots(self):
-        """
-        A typo must not cost the machine: `--ledger /etc/x.json` would chown
-        /etc to an unprivileged account at mode 0700, taking sudo, ssh and PAM
-        with it on a running system.
-        """
-        logged = []
-        privsep.prepare_state_dir("/etc/probolos-typo.json", uid=65534,
-                                  gid=65534, log=logged.append)
-        self.assertTrue(any("REFUSING" in line for line in logged))
-
-    def test_traversal_out_of_a_state_root_is_refused(self):
-        """realpath runs first, so ../ cannot smuggle a path back out."""
-        logged = []
-        privsep.prepare_state_dir("/var/lib/probolos/../../../etc/x.json",
-                                  uid=65534, gid=65534, log=logged.append)
-        self.assertTrue(any("REFUSING" in line for line in logged))
-
-    def test_a_sibling_sharing_the_prefix_is_refused(self):
-        """/var/lib/probolos-evil must not match /var/lib/probolos."""
-        logged = []
-        privsep.prepare_state_dir("/var/lib/probolos-evil/x.json", uid=65534,
-                                  gid=65534, log=logged.append)
-        self.assertTrue(any("REFUSING" in line for line in logged))
-
-    def test_trust_is_made_readable_not_writable(self):
-        target = self.root / "trusted.json"
-        target.write_text("{}")
-        os.chmod(target, 0o600)
-        privsep.prepare_trust_readable(target, log=lambda *_: None)
-        mode = target.stat().st_mode & 0o777
-        self.assertTrue(mode & 0o044, "analyzer cannot read the trust store")
-        self.assertFalse(mode & 0o022, "trust store became group/other writable")
 
 
 class EntryValidation(unittest.TestCase):
@@ -424,18 +203,6 @@ class EntryValidation(unittest.TestCase):
         removed = store.forget_index(1)
         self.assertEqual(removed, "v:p:s")
         self.assertEqual(store.devices, {})
-
-
-# =========================================================================
-# test_atomicio.py
-#
-# Regression tests for the symlink-safe state writes (audit finding C3), and for
-# =========================================================================
-
-import fnmatch
-import unittest
-
-from probolos import atomicio
 
 
 class WriteJsonAtomic(unittest.TestCase):
@@ -571,6 +338,174 @@ class SaveMethodsSurviveAPlantedTemp(unittest.TestCase):
 
         self.assertIsNone(store.save())
         self.assertEqual(victim.read_text(), "SACRED")
+
+
+# ---------------------------------------------------------------------------
+# 6. Trust store is intentionally left on the RAW hash
+# ---------------------------------------------------------------------------
+
+class TrustStoreStillPinsRawBytes(unittest.TestCase):
+    """
+    Trust and drift have different semantics. "I approved this exact blob"
+    is stricter than "the device did not change what it claims to be", and
+    a controller swap that changes the raw bytes SHOULD re-prompt for trust
+    -- because the trusted admission is admission WITHOUT prompting, and
+    conservative is the safe direction there.
+    """
+
+    def test_trust_key_uses_raw_bytes(self):
+        from probolos import trust
+        a = make_kingston_device(storage_device_blob(bcd_usb=0x0210))
+        b = make_kingston_device(storage_device_blob(bcd_usb=0x0320,
+                                            include_ss_companion=True))
+        self.assertNotEqual(trust.key_for(a), trust.key_for(b),
+                            "trust must not silently span controller swaps")
+
+
+# ==========================================================================
+# C3: the trust store is an admission list, so its permissions are load bearing
+# ==========================================================================
+
+class TrustStoreIntegrity(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "trusted.json"
+        self.path.write_text(json.dumps({
+            "schema": trust.SCHEMA_VERSION,
+            "devices": {
+                "1234:5678:AB#" + "a" * 64: {
+                    "key": "1234:5678:AB#" + "a" * 64,
+                    "identity": "1234:5678:AB",
+                    "descriptor_hash": "a" * 64,
+                    "trusted_at": 0.0,
+                    "last_seen": 0.0,
+                    "label": "test",
+                },
+            },
+        }))
+        os.chmod(self.path, 0o600)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_correct_store_still_loads(self):
+        """The check must not break the normal case, or it will be removed."""
+        store = trust.TrustStore(self.path)
+        self.assertIsNone(store.load_error)
+        self.assertEqual(len(store.devices), 1)
+
+    def test_a_world_writable_store_is_not_believed(self):
+        """Whoever can write this file can admit any device without ever
+        touching the machine. Writing it at 0600 says nothing about the file
+        we are about to READ: cp does not preserve mode, and restores and
+        backups do not go through our writer."""
+        os.chmod(self.path, 0o666)
+        store = trust.TrustStore(self.path)
+        self.assertIsNotNone(store.load_error)
+        self.assertEqual(store.devices, {},
+                         "fail closed: an untrustworthy store is an empty one")
+
+    def test_a_group_writable_store_is_not_believed(self):
+        os.chmod(self.path, 0o660)
+        store = trust.TrustStore(self.path)
+        self.assertIsNotNone(store.load_error)
+        self.assertEqual(store.devices, {})
+
+    def test_the_advice_in_the_error_is_actionable(self):
+        os.chmod(self.path, 0o666)
+        store = trust.TrustStore(self.path)
+        self.assertIn("chmod 600", store.load_error)
+
+    def test_a_symlink_is_refused_rather_than_followed(self):
+        """lstat, not stat. Following the link would check one inode's
+        ownership and then read a different inode's contents."""
+        real = Path(self._tmp.name) / "elsewhere.json"
+        real.write_text(self.path.read_text())
+        link = Path(self._tmp.name) / "link.json"
+        link.symlink_to(real)
+        store = trust.TrustStore(link)
+        self.assertIsNotNone(store.load_error)
+        self.assertIn("symlink", store.load_error)
+        self.assertEqual(store.devices, {})
+
+    def test_a_missing_store_is_not_an_error(self):
+        """First run. Nothing trusted yet is the normal state, not a fault."""
+        store = trust.TrustStore(Path(self._tmp.name) / "absent.json")
+        self.assertIsNone(store.load_error)
+        self.assertEqual(store.devices, {})
+
+
+# ---------------------------------------------------------------------------
+# 2. State files: valid JSON that is not an object
+# ---------------------------------------------------------------------------
+
+class NonObjectStateFiles(unittest.TestCase):
+    """
+    `[]` is valid JSON, so json.loads succeeds and .get() raises
+    AttributeError -- out of load(), out of __init__, uncaught. The daemon dies
+    during startup, BEFORE authorized_default is set to 0, so the gate never
+    closes. A one-byte file disables the tool and looks like a crash.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+
+    def test_ledger_survives_a_json_array(self):
+        path = self.root / "ledger.json"
+        path.write_text("[]")
+        store = ledger_mod.Ledger(path)
+        self.assertIsNotNone(store.load_error)
+        self.assertEqual(store.entries, {})
+
+    def test_ledger_survives_a_json_scalar(self):
+        path = self.root / "ledger.json"
+        path.write_text("42")
+        self.assertIsNotNone(ledger_mod.Ledger(path).load_error)
+
+    def _trust_file(self, text):
+        path = self.root / "trusted.json"
+        path.write_text(text)
+        os.chmod(path, 0o600)
+        return path
+
+    def test_trust_store_survives_a_json_scalar(self):
+        store = trust_mod.TrustStore(self._trust_file('"hello"'))
+        self.assertIsNotNone(store.load_error)
+        self.assertEqual(store.devices, {})
+
+    def test_trust_store_survives_a_non_empty_devices_array(self):
+        """`or {}` saved the empty case only; a non-empty list is truthy."""
+        store = trust_mod.TrustStore(
+            self._trust_file('{"schema": 1, "devices": ["a", "b"]}'))
+        self.assertIsNotNone(store.load_error)
+        self.assertEqual(store.devices, {})
+
+    def test_a_good_store_still_loads(self):
+        store = trust_mod.TrustStore(
+            self._trust_file('{"schema": 1, "devices": {}}'))
+        self.assertIsNone(store.load_error)
+
+
+class StateReload(unittest.TestCase):
+    def test_broken_reload_revokes_cached_trust(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trusted.json"
+            path.write_text('{"schema":1,"devices":{}}')
+            obj = trust.TrustStore(path)
+            obj.devices["stale"] = object()
+            path.write_text("[]")
+            obj.load()
+            self.assertEqual(obj.devices, {})
+            self.assertIsNotNone(obj.load_error)
+
+    def test_nonfinite_timestamps_are_rejected(self):
+        for value in (float("inf"), float("nan"), 10 ** 1000):
+            data = good_entry()
+            data["trusted_at"] = value
+            self.assertIsNone(trust.TrustedDevice.from_raw(data["key"], data))
 
 
 if __name__ == "__main__":

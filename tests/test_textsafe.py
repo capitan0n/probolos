@@ -1,22 +1,25 @@
 """
-Device-supplied text: sanitising it, and the chokepoint that guarantees
-every display path goes through the sanitiser.
+Device-supplied text: sanitising it, measuring it, and the chokepoint that
+guarantees it happens.
 
-Merged from: test_textsafe.py, test_stall_and_textsafe.py
+Covers probolos.textsafe.
 """
+
 from __future__ import annotations
 
-# =========================================================================
-# test_textsafe.py
-#
-# Regression tests for device-supplied text, one per way it could forge the UI.
-# =========================================================================
-
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
-from probolos import textsafe
-from probolos.textsafe import (NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE,
-                               NOTE_TRUNCATED, sanitize)
+from probolos import sysfs, textsafe
+from probolos.textsafe import (
+    NOTE_BIDI,
+    NOTE_CONTROL,
+    NOTE_INVISIBLE,
+    NOTE_TRUNCATED,
+    sanitize,
+)
 
 
 class DangerousStrings(unittest.TestCase):
@@ -157,55 +160,6 @@ class DisplayWidth(unittest.TestCase):
         self.assertEqual(textsafe.display_width(text), 6)
 
 
-# =========================================================================
-# test_stall_and_textsafe.py
-#
-# Regression tests for two defects that were documented but never applied.
-# =========================================================================
-
-import os
-import tempfile
-import unittest
-from pathlib import Path
-from unittest import mock
-
-from probolos import storage, sysfs
-
-
-class StorageStall(unittest.TestCase):
-
-    def setUp(self):
-        self._d = tempfile.TemporaryDirectory()
-        self.addCleanup(self._d.cleanup)
-        self.tmp = self._d.name
-
-    def test_a_stalled_inspection_times_out_instead_of_freezing(self):
-        """A reader on a writer-less fifo blocks forever; it must be killed."""
-        fifo = os.path.join(self.tmp, "stall")
-        os.mkfifo(fifo)
-        report = storage.inspect_safely(fifo, timeout=1.0)
-        self.assertFalse(report.inspected)
-        self.assertIn("did not respond", report.error)
-
-    def test_the_timeout_is_actually_enforced(self):
-        """Pin the bound itself: an unbounded read would never return."""
-        import time
-        fifo = os.path.join(self.tmp, "stall2")
-        os.mkfifo(fifo)
-        started = time.monotonic()
-        storage.inspect_safely(fifo, timeout=1.0)
-        self.assertLess(time.monotonic() - started, 5.0)
-
-    def test_a_healthy_medium_still_inspects(self):
-        """The bound must not break the normal path."""
-        path = os.path.join(self.tmp, "disk.img")
-        with open(path, "wb") as fh:
-            fh.write(b"\x00" * (storage.SECTOR - 2) + b"\x55\xaa")
-            fh.write(b"\x00" * (storage.HEADER_READ - storage.SECTOR))
-        report = storage.inspect_safely(path, timeout=5.0)
-        self.assertIsNone(report.error)
-
-
 class TextsafeChokepoint(unittest.TestCase):
     """
     load_device must sanitise, and must RECORD why. The rules engine already
@@ -247,6 +201,88 @@ class TextsafeChokepoint(unittest.TestCase):
         self.assertEqual(dev.string_notes, [])
         self.assertEqual(dev.string_note_fields, {})
         self.assertEqual(dev.product, "DataTraveler 3.0")
+
+
+class EscapesDecodeToWhatTheyDescribe(unittest.TestCase):
+
+    def test_an_astral_code_point_is_not_written_as_five_hex_digits(self):
+        """
+        U+E0001 became `\\u e0001`, which reads as U+0E00 followed by `1`. The
+        escape exists so the operator sees exactly what the device sent.
+        """
+        cleaned = textsafe.sanitize("A\U000E0001B")
+        self.assertIn("\\U000e0001", cleaned.text)
+        self.assertNotIn("\\ue0001", cleaned.text)
+
+    def test_the_escape_round_trips_through_python(self):
+        for char in ("\x1b", "‮", "\U000E0001"):
+            with self.subTest(char=char):
+                escaped = textsafe._escape(char)
+                self.assertEqual(escaped.encode().decode("unicode_escape"),
+                                 char)
+
+    def test_ordinary_escapes_are_unchanged(self):
+        self.assertEqual(textsafe._escape("\x1b"), "\\x1b")
+        self.assertEqual(textsafe._escape("‮"), "\\u202e")
+
+
+class StackedCombiningMarksAreVisible(unittest.TestCase):
+    """
+    Combining marks occupy zero terminal columns.
+
+    display_width() and fit() exist to stop a device name from pushing the
+    border of the report box off the line, and they measured a run of two
+    hundred marks as costing nothing. The terminal stacks them on the
+    preceding glyph and they spill over the lines around it -- the same
+    outcome, through the one route the width handling does not measure. Worse,
+    no note fired, so the rules layer never learned the name was abnormal.
+    """
+
+    def test_a_zalgo_name_is_escaped_and_reported(self):
+        from probolos import textsafe
+
+        result = textsafe.sanitize("ACME" + "́" * 200)
+        self.assertIn(textsafe.NOTE_STACKED_MARKS, result.notes)
+        # The escaped form is what makes it visible; ́ must appear as text.
+        self.assertIn("\\u0301", result.text)
+
+    def test_real_scripts_are_untouched(self):
+        """A rule that fires on ordinary hardware gets turned off."""
+        from probolos import textsafe
+
+        for name in ("Logitech USB Keyboard",
+                     "Tiế́ng Việt Kềyboard",
+                     "ロジクール キーボード",
+                     "Kingston DataTraveler"):
+            with self.subTest(name=name):
+                self.assertNotIn(textsafe.NOTE_STACKED_MARKS,
+                                 textsafe.sanitize(name).notes)
+
+    def test_the_note_reaches_the_operator_as_a_finding(self):
+        """A note nothing turns into a finding is a note nobody reads."""
+        from probolos import rules, textsafe
+
+        class FakeDevice:
+            string_notes = [textsafe.NOTE_STACKED_MARKS]
+            string_note_fields = {"iProduct": [textsafe.NOTE_STACKED_MARKS]}
+            descriptor_set = None
+            parse_error = None
+            device_class = None
+            vendor_id = "dead"
+            product_id = "beef"
+            manufacturer = product = serial = None
+            interfaces = []
+            interface_classes = []
+            kinds = ["other"]
+            claims = []
+            name = "1-4"
+            removable = None
+
+            def label(self):
+                return "test"
+
+        ids = [f.rule_id for f in rules.evaluate(FakeDevice())]
+        self.assertIn("stacked-combining-marks", ids)
 
 
 if __name__ == "__main__":

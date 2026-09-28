@@ -1,25 +1,44 @@
 """
-The rule engine: identity, crafted strings, and declared power.
+The rule engine: identity and consistency findings, crafted strings, rule
+configuration, analyzer containment and the rendered report.
 
-One file because one function is under test -- rules.evaluate() and the
-helpers it calls. Splitting them by which rule fired meant three places
-to look when a device produced an unexpected verdict.
-
-Merged from: test_rules.py, test_rules_crafted_strings.py, test_power.py
+Covers probolos.rules, probolos.analyzers and probolos.report.
 """
+
 from __future__ import annotations
 
-# =========================================================================
-# test_rules.py
-#
-# Tests for the stage 2 rule engine.
-# =========================================================================
-
+import struct
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
-from probolos import descriptors, rules, usbclass
-from tests.test_descriptors import (config_desc, device_desc, endpoint_desc,
-                                    iface_desc)
+from probolos import (
+    analyzers,
+    daemon,
+    descriptors,
+    report,
+    rules,
+    sysfs,
+    textsafe,
+    usbclass,
+)
+from probolos.textsafe import NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE
+from tests._support import (
+    STORAGE_BLOB,
+    config_desc,
+    descriptor_blob,
+    device_desc,
+    endpoint_desc,
+    iface_desc,
+    make_device,
+    make_widget_device,
+    power_config_desc,
+    power_device_desc,
+    storage_config_desc,
+    storage_device_desc,
+    storage_iface_desc,
+)
 
 
 class FakeDevice:
@@ -94,6 +113,112 @@ def real_chicony_camera():
     return FakeDevice("04f2", "b7ba", "Chicony Electronics Co.,Ltd.",
                       "Integrated Camera", "480",
                       build((0x0E, 0x01, 0x01), (0x0E, 0x02, 0x01)))
+
+
+def _device(*, notes=(), per_field=None, keyboard=False, classes=(),
+            interfaces=None):
+    """
+    A stub carrying exactly what evaluate() reads for these rules.
+
+    string_notes and string_note_fields are what descriptors.py attaches after
+    sanitising; the rest is the minimum evaluate() touches without erroring.
+    """
+    ifaces = interfaces if interfaces is not None else []
+    return SimpleNamespace(
+        string_notes=tuple(notes),
+        string_note_fields=per_field or {},
+        interfaces=ifaces,
+        interface_classes=list(classes),
+        manufacturer="stub", product="stub", serial="stub",
+    )
+
+
+class Dev:
+    """Duck-typed device carrying only what the power rules read."""
+
+    def __init__(self, blob, manufacturer="Generic", product="Thing",
+                 speed="480"):
+        self.descriptor_set = descriptors.parse(blob)
+        self.manufacturer = manufacturer
+        self.product = product
+        self.speed = speed
+        self.parse_error = None
+        self.vendor_id = "1234"
+        self.product_id = "5678"
+
+    @property
+    def interfaces(self):
+        return self.descriptor_set.primary_interfaces()
+
+    @property
+    def interface_classes(self):
+        return self.descriptor_set.interface_classes()
+
+    def label(self):
+        return f"{self.manufacturer} {self.product}"
+
+
+def build_power_device(raw_power, ifaces, bcd_usb=0x0200, attrs=0x80):
+    body = power_config_desc(raw_power, attrs=attrs, num_ifaces=len(ifaces))
+    for n, (cls, sub, proto) in enumerate(ifaces):
+        body += iface_desc(n, cls, subcls=sub, proto=proto) + endpoint_desc()
+    return power_device_desc(bcd_usb) + body
+
+
+# ---------------------------------------------------------------------------
+# 5. The BadUSB rule was evadable with two zero bytes
+# ---------------------------------------------------------------------------
+
+class _Iface:
+    number = 0
+    alternate = 0
+    num_endpoints = 1
+
+    def __init__(self, cls, subcls, proto):
+        self.interface_class = cls
+        self.interface_subclass = subcls
+        self.interface_protocol = proto
+
+
+class _Device:
+    parse_error = None
+    descriptor_set = None
+    serial = None
+    string_notes = ()
+    string_note_fields = {}
+
+    def __init__(self, ifaces, manufacturer="Acme", product="Widget",
+                 speed="12"):
+        self.interfaces = ifaces
+        self.manufacturer = manufacturer
+        self.product = product
+        self.speed = speed
+
+    @property
+    def interface_classes(self):
+        out = []
+        for i in self.interfaces:
+            if i.interface_class not in out:
+                out.append(i.interface_class)
+        return out
+
+    def label(self):
+        return f"{self.manufacturer} {self.product}"
+
+
+STORAGE = _Iface(0x08, 0x06, 0x50)
+
+
+BOOT_KEYBOARD = _Iface(0x03, 0x01, 0x01)
+
+
+BOOT_MOUSE = _Iface(0x03, 0x01, 0x02)
+
+
+UNDECLARED_HID = _Iface(0x03, 0x00, 0x00)
+
+
+BLUETOOTH = _Iface(0xE0, 0x01, 0x01)
 
 
 class TestNoFalsePositivesOnRealHardware(unittest.TestCase):
@@ -230,36 +355,6 @@ class TestKeyboardPredicate(unittest.TestCase):
         self.assertFalse(usbclass.is_keyboard(0x08, 0x06, 0x50))   # storage
 
 
-# =========================================================================
-# test_rules_crafted_strings.py
-#
-# Regression tests for the report-level consequences of a crafted string.
-# =========================================================================
-
-import unittest
-from types import SimpleNamespace
-
-from probolos.textsafe import NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE
-
-
-def _device(*, notes=(), per_field=None, keyboard=False, classes=(),
-            interfaces=None):
-    """
-    A stub carrying exactly what evaluate() reads for these rules.
-
-    string_notes and string_note_fields are what descriptors.py attaches after
-    sanitising; the rest is the minimum evaluate() touches without erroring.
-    """
-    ifaces = interfaces if interfaces is not None else []
-    return SimpleNamespace(
-        string_notes=tuple(notes),
-        string_note_fields=per_field or {},
-        interfaces=ifaces,
-        interface_classes=list(classes),
-        manufacturer="stub", product="stub", serial="stub",
-    )
-
-
 class CraftedStringFinding(unittest.TestCase):
 
     def _findings(self, dev):
@@ -350,127 +445,6 @@ class CraftedStringFinding(unittest.TestCase):
         cfg = rules.RuleConfig(disabled={"invisible-string-characters"})
         found = {f.rule_id: f for f in rules.evaluate(dev, cfg)}
         self.assertNotIn("invisible-string-characters", found)
-
-
-class DialogMarkupEscaping(unittest.TestCase):
-    """
-    The kdialog and zenity backends render markup; a device name that looks
-    like HTML must not become HTML in the prompt. tkinter and the terminal
-    render plain text and must NOT be escaped.
-    """
-
-    def setUp(self):
-        from probolos import dialogs
-        self.dialogs = dialogs
-
-    def test_markup_safe_neutralises_tags(self):
-        self.assertEqual(self.dialogs._markup_safe("<b>x</b>"),
-                         "&lt;b&gt;x&lt;/b&gt;")
-
-    def test_markup_safe_neutralises_a_link(self):
-        raw = 'Kingston<a href="file:///etc/shadow">.</a>'
-        self.assertNotIn("<a", self.dialogs._markup_safe(raw))
-
-    def test_markup_safe_preserves_a_legitimate_name(self):
-        """"A<B & C>D" is a real name shape and must survive, just inert."""
-        out = self.dialogs._markup_safe("A<B & C>D")
-        self.assertEqual(out, "A&lt;B &amp; C&gt;D")
-        self.assertNotIn("<", out)
-
-    def test_markup_safe_leaves_ordinary_text_untouched(self):
-        self.assertEqual(self.dialogs._markup_safe("Kingston DataTraveler"),
-                         "Kingston DataTraveler")
-
-
-# =========================================================================
-# test_power.py
-#
-# Tests for declared power consumption.
-# =========================================================================
-
-import struct
-import unittest
-
-
-
-def power_device_desc(bcd_usb=0x0200, num_configs=1):
-    return struct.pack("<BBHBBBBHHHBBBB", 18, 0x01, bcd_usb, 0, 0, 0, 64,
-                       0x1234, 0x5678, 0x0100, 1, 2, 3, num_configs)
-
-
-def power_config_desc(raw_power, attrs=0x80, num_ifaces=1, value=1, total=9):
-    return struct.pack("<BBHBBBBB", 9, 0x02, total, num_ifaces, value, 0,
-                       attrs, raw_power)
-
-
-class Dev:
-    """Duck-typed device carrying only what the power rules read."""
-
-    def __init__(self, blob, manufacturer="Generic", product="Thing",
-                 speed="480"):
-        self.descriptor_set = descriptors.parse(blob)
-        self.manufacturer = manufacturer
-        self.product = product
-        self.speed = speed
-        self.parse_error = None
-        self.vendor_id = "1234"
-        self.product_id = "5678"
-
-    @property
-    def interfaces(self):
-        return self.descriptor_set.primary_interfaces()
-
-    @property
-    def interface_classes(self):
-        return self.descriptor_set.interface_classes()
-
-    def label(self):
-        return f"{self.manufacturer} {self.product}"
-
-
-def build_power_device(raw_power, ifaces, bcd_usb=0x0200, attrs=0x80):
-    body = power_config_desc(raw_power, attrs=attrs, num_ifaces=len(ifaces))
-    for n, (cls, sub, proto) in enumerate(ifaces):
-        body += iface_desc(n, cls, subcls=sub, proto=proto) + endpoint_desc()
-    return power_device_desc(bcd_usb) + body
-
-
-class TestPowerUnits(unittest.TestCase):
-    """The shipped bug. One byte, two meanings, depending on bcdUSB."""
-
-    def test_usb2_uses_2ma_units(self):
-        ds = descriptors.parse(power_device_desc(0x0200) + power_config_desc(50))
-        self.assertEqual(ds.configs[0].max_power_ma, 100)
-        self.assertEqual(ds.configs[0].power_unit_ma, 2)
-
-    def test_superspeed_uses_8ma_units(self):
-        """The same byte means four times as much on USB 3.x."""
-        ds = descriptors.parse(power_device_desc(0x0300) + power_config_desc(50))
-        self.assertEqual(ds.configs[0].max_power_ma, 400)
-        self.assertEqual(ds.configs[0].power_unit_ma, 8)
-
-    def test_usb31_and_32_also_use_8ma_units(self):
-        for bcd in (0x0310, 0x0320):
-            ds = descriptors.parse(power_device_desc(bcd) + power_config_desc(50))
-            self.assertEqual(ds.configs[0].max_power_ma, 400)
-
-    def test_raw_byte_is_preserved_for_audit(self):
-        ds = descriptors.parse(power_device_desc(0x0300) + power_config_desc(50))
-        self.assertEqual(ds.configs[0].max_power_raw, 50)
-
-    def test_bus_limits_follow_the_specification(self):
-        self.assertEqual(descriptors.bus_power_limit_ma(0x0200), 500)
-        self.assertEqual(descriptors.bus_power_limit_ma(0x0300), 900)
-
-    def test_attribute_bits_are_decoded(self):
-        bus = descriptors.parse(power_device_desc() + power_config_desc(50, attrs=0x80))
-        self.assertFalse(bus.configs[0].self_powered)
-
-        selfp = descriptors.parse(power_device_desc() + power_config_desc(0, attrs=0xC0))
-        self.assertTrue(selfp.configs[0].self_powered)
-
-        wake = descriptors.parse(power_device_desc() + power_config_desc(50, attrs=0xA0))
-        self.assertTrue(wake.configs[0].remote_wakeup)
 
 
 class TestOrdinaryDevicesStaySilent(unittest.TestCase):
@@ -574,6 +548,425 @@ class TestPowerContradictions(unittest.TestCase):
             descriptor_set = None
         self.assertEqual(
             rules._power_findings(Bare(), rules.DEFAULT_CONFIG), [])
+
+
+# --------------------------------------------------------------------------
+# 2. Incomplete descriptor views
+# --------------------------------------------------------------------------
+
+class IncompleteDescriptorViewsAreCritical(unittest.TestCase):
+
+    def _worst(self, dev, rule_id):
+        findings = rules.evaluate(dev)
+        self.assertIn(rule_id, {f.rule_id for f in findings})
+        return rules.worst(findings)
+
+    def test_unparseable_descriptors_need_the_typed_word(self):
+        dev = make_widget_device(STORAGE_BLOB, parse_error="more than 4096 descriptors")
+        self.assertEqual(self._worst(dev, "unreadable-descriptors"),
+                         rules.Severity.CRITICAL)
+
+    def test_missing_configurations_need_the_typed_word(self):
+        dev = make_widget_device(storage_device_desc(num_configs=2) + storage_config_desc(18)
+                          + storage_iface_desc())
+        self.assertEqual(self._worst(dev, "configurations-missing"),
+                         rules.Severity.CRITICAL)
+        self.assertFalse(dev.inspection_safe)
+
+    def test_a_truncated_chain_needs_the_typed_word(self):
+        dev = make_widget_device(storage_device_desc() + storage_config_desc(27) + storage_iface_desc()
+                          + b"\x09\x04\x00")
+        self.assertEqual(self._worst(dev, "descriptor-chain-truncated"),
+                         rules.Severity.CRITICAL)
+
+    def test_a_complete_ordinary_device_stays_quiet(self):
+        findings = rules.evaluate(make_widget_device(STORAGE_BLOB))
+        ids = {f.rule_id for f in findings}
+        self.assertFalse(ids & {"unreadable-descriptors",
+                                "configurations-missing",
+                                "descriptor-chain-truncated"})
+        self.assertLess(rules.worst(findings), rules.Severity.WARNING)
+
+
+# ---------------------------------------------------------------------------
+# P4 -- the device does not get to draw on the decision screen
+# ---------------------------------------------------------------------------
+
+class ReportBoxHoldsItsShape(unittest.TestCase):
+
+    EXPECTED = report.WIDTH + 2
+
+    def _rows(self, block):
+        return [line for line in block.splitlines()
+                if line.startswith(("┌", "└", "├", "│"))]
+
+    def _assert_square(self, block, label):
+        for line in self._rows(block):
+            self.assertEqual(
+                textsafe.display_width(line), self.EXPECTED,
+                f"{label}: row is {textsafe.display_width(line)} columns, "
+                f"box is {self.EXPECTED}: {line[:80]!r}")
+
+    def test_ordinary_device(self):
+        device = make_device(manufacturer="PixArt", product="USB Optical Mouse")
+        self._assert_square(report.render(device, rules.evaluate(device)),
+                            "ordinary")
+
+    def test_long_ascii_name_cannot_push_the_border_off(self):
+        device = make_device(product="Logitech USB Receiver " + "A" * 100)
+        self._assert_square(report.render(device, rules.evaluate(device)),
+                            "long ASCII")
+
+    def test_wide_glyphs_are_measured_in_columns(self):
+        device = make_device(manufacturer="羅技",
+                             product="無線鍵盤滑鼠組" * 3)
+        self._assert_square(report.render(device, rules.evaluate(device)),
+                            "CJK")
+
+    def test_device_cannot_forge_a_row_of_the_report(self):
+        forged = ("Wireless Mouse" + " " * 44 + "│"
+                  + " No inconsistencies found in what it claims"
+                  + " " * 18 + "│")
+        device = make_device(product=forged)
+        block = report.render(device, rules.evaluate(device))
+        self._assert_square(block, "forged border")
+
+    def test_a_long_unbroken_token_inside_a_finding_is_split_not_dropped(self):
+        name = "Flash" + "Z" * 90          # trips self-contradictory-identity
+        device = make_device(
+            descriptor_blob((0x03, 0x01, 0x01)), product=name)
+        findings = rules.evaluate(device)
+        self.assertTrue(any(f.rule_id == "self-contradictory-identity"
+                            for f in findings))
+        block = report.render(device, findings)
+        self._assert_square(block, "device name inside a finding")
+        self.assertIn("ZZZ", block, "the evidence must survive the wrapping")
+
+    def test_combining_marks_do_not_shrink_the_box(self):
+        device = make_device(product="Kingston" + "́" * 40)
+        self._assert_square(report.render(device, rules.evaluate(device)),
+                            "stacked marks")
+
+    def test_split_width_loses_nothing(self):
+        text = "abc" + "字" * 10 + "def"
+        pieces = textsafe.split_width(text, 7)
+        self.assertEqual("".join(pieces), text)
+        for piece in pieces:
+            self.assertLessEqual(textsafe.display_width(piece), 7)
+
+
+# ---------------------------------------------------------------------------
+# 1. A failed decisive analyzer must not read as a clean device
+# ---------------------------------------------------------------------------
+
+class CrashedRuleEngineIsNotACleanVerdict(unittest.TestCase):
+    """
+    The containment in analyzers.run() is correct and must stay; what was
+    wrong was the SEVERITY it assigned. SemanticAnalyzer holds every CRITICAL
+    identity rule, so its silence cannot be told apart from "this device is
+    fine" -- and three separate consumers read the difference:
+
+      * daemon._on_add admits a remembered device when worst() < CRITICAL
+      * the terminal prompt drops to [y/N] instead of demanding the word
+      * the desktop agent is offered the device as a clickable question
+
+    so a NOTICE there was a device-triggerable fail-open.
+    """
+
+    class Exploding(analyzers.SemanticAnalyzer):
+        def analyze(self, ctx):
+            raise RuntimeError("descriptor walk blew up")
+
+    class ExplodingCosmetic(analyzers.LedgerAnalyzer):
+        def analyze(self, ctx):
+            raise RuntimeError("history unreadable")
+
+    def test_a_decisive_analyzer_failing_is_itself_critical(self):
+        findings = analyzers.run(analyzers.Context(device=object()),
+                                 analyzers=[self.Exploding()])
+        self.assertEqual(rules.worst(findings), rules.Severity.CRITICAL,
+                         "a crashed rule engine must not read as a clean "
+                         "device; it is what produces the verdict")
+
+    def test_the_trust_shortcut_no_longer_applies_to_it(self):
+        """The precise condition daemon._on_add tests before admitting."""
+        findings = analyzers.run(analyzers.Context(device=object()),
+                                 analyzers=[self.Exploding()])
+        self.assertFalse(rules.worst(findings) < rules.Severity.CRITICAL,
+                         "a remembered device must not be waved through on "
+                         "the strength of a check that never ran")
+
+    def test_a_cosmetic_analyzer_failing_stays_a_notice(self):
+        """
+        The other half of the fix. Escalating EVERY failure would make a
+        broken history file block a keyboard, which is the lockout the whole
+        project is built to avoid.
+        """
+        findings = analyzers.run(analyzers.Context(device=object()),
+                                 analyzers=[self.ExplodingCosmetic()])
+        self.assertEqual(rules.worst(findings), rules.Severity.NOTICE)
+
+    def test_the_run_still_continues_past_a_crash(self):
+        """Containment intact: the other analyzers still ran."""
+        class Quiet(analyzers.Analyzer):
+            id = "quiet"
+            def analyze(self, ctx):
+                return [rules.Finding("saw-it", rules.Severity.INFO, "t", "e")]
+
+        findings = analyzers.run(analyzers.Context(device=object()),
+                                 analyzers=[self.Exploding(), Quiet()])
+        self.assertIn("saw-it", [f.rule_id for f in findings])
+
+    def test_every_verdict_bearing_analyzer_is_marked_decisive(self):
+        """
+        Guards the fix against drift. A new analyzer that carries CRITICAL
+        rules and forgets `decisive` reintroduces the hole silently, so the
+        list is asserted rather than trusted.
+        """
+        for analyzer in (analyzers.SemanticAnalyzer(),
+                         analyzers.BehaviourAnalyzer(),
+                         analyzers.PayloadAnalyzer(),
+                         analyzers.StorageAnalyzer()):
+            self.assertTrue(analyzer.decisive,
+                            f"{analyzer.id} produces findings the decision "
+                            f"rests on and must be marked decisive")
+
+
+class RuleConfigFailsAsAConfigError(unittest.TestCase):
+
+    def setUp(self):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML is not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "rules.yaml"
+
+    def _load(self, text):
+        self.path.write_text(text)
+        return rules.load_config(self.path)
+
+    def test_a_file_that_is_not_a_mapping_is_a_value_error(self):
+        for text in ("- one\n- two\n", "just a string\n", "42\n"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    self._load(text)
+
+    def test_a_severity_block_of_the_wrong_shape_is_a_value_error(self):
+        with self.assertRaises(ValueError):
+            self._load("severity:\n  - not-a-mapping\n")
+
+    def test_benign_groups_must_be_lists_of_class_codes(self):
+        for text in ("benign_groups: 3\n",
+                     "benign_groups:\n  - 3\n",
+                     "benign_groups:\n  - [3, 'ff']\n"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    self._load(text)
+
+    def test_disabled_must_be_a_list(self):
+        with self.assertRaises(ValueError):
+            self._load("disabled: keyboard-at-high-speed\n")
+
+    def test_a_yaml_syntax_error_is_a_value_error(self):
+        # yaml.YAMLError is not a ValueError; unconverted, it escaped the
+        # entry point's handler as a traceback.
+        for text in ("severity: [unclosed\n", "disabled:\n  - a\n - b\n"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    self._load(text)
+
+    def test_a_well_formed_file_still_loads(self):
+        config = self._load(
+            "disabled:\n"
+            "  - keyboard-at-high-speed\n"
+            "severity:\n"
+            "  multiple-distinct-functions: warning\n"
+            "benign_groups:\n"
+            "  - [3, 255]\n")
+        self.assertFalse(config.enabled("keyboard-at-high-speed"))
+        self.assertEqual(config.severity("multiple-distinct-functions",
+                                         rules.Severity.NOTICE),
+                         rules.Severity.WARNING)
+        self.assertEqual(config.extra_benign_groups, [{3, 255}])
+
+    def test_the_entry_point_reports_it_as_a_config_error(self):
+        """
+        The consequence, not just the exception type: __main__ catches
+        RuntimeError, ValueError and OSError around load_config, so anything
+        else escaped as a traceback and the gate never closed.
+        """
+        from unittest import mock
+
+        from probolos import __main__ as entry
+        self.path.write_text("- not a mapping\n")
+        with mock.patch.object(entry, "require_usb"), \
+             mock.patch.object(entry.daemon, "serve") as serve:
+            with self.assertRaises(SystemExit) as caught:
+                entry.main(["--dry-run", "--rules", str(self.path)])
+        self.assertIn("rule config", str(caught.exception))
+        serve.assert_not_called()
+
+
+class TestAnalyzerContainment(unittest.TestCase):
+
+    class Exploding(analyzers.Analyzer):
+        id = "exploding"
+
+        def analyze(self, ctx):
+            raise RuntimeError("heuristic went wrong")
+
+    def test_a_broken_analyzer_cannot_stop_the_others(self):
+        """
+        A crash in a speculative check must never prevent somebody from
+        admitting their keyboard.
+        """
+        findings = analyzers.run(
+            analyzers.Context(device=None),
+            analyzers=[self.Exploding()])
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(findings[0].rule_id.startswith("analyzer-failed"))
+
+    def test_failure_is_visible_rather_than_silent(self):
+        findings = analyzers.run(analyzers.Context(device=None),
+                                 analyzers=[self.Exploding()])
+        self.assertNotEqual(rules.worst(findings), rules.Severity.INFO)
+
+    def test_analyzers_needing_an_observation_are_skipped_without_one(self):
+        findings = analyzers.run(
+            analyzers.Context(device=None, observation=None),
+            analyzers=[analyzers.BehaviourAnalyzer()])
+        self.assertEqual(findings, [])
+
+    def test_findings_come_back_worst_first(self):
+        class Noisy(analyzers.Analyzer):
+            id = "noisy"
+
+            def analyze(self, ctx):
+                return [
+                    rules.Finding("a", rules.Severity.NOTICE, "n", ""),
+                    rules.Finding("b", rules.Severity.CRITICAL, "c", ""),
+                    rules.Finding("c", rules.Severity.WARNING, "w", ""),
+                ]
+
+        findings = analyzers.run(analyzers.Context(device=None),
+                                 analyzers=[Noisy()])
+        self.assertEqual([f.severity for f in findings],
+                         [rules.Severity.CRITICAL, rules.Severity.WARNING,
+                          rules.Severity.NOTICE])
+
+
+class UndeclaredHidIsNotInnocence(unittest.TestCase):
+    """
+    is_keyboard() fires only on subclass 0x01 / protocol 0x01. A HID interface
+    declaring 0x00 / 0x00 is legal, common, and still a working keyboard under
+    Linux -- usbhid reads the REPORT descriptor, which is not in the sysfs blob
+    and cannot be fetched without talking to a device we are holding precisely
+    because we do not trust it. So the whole BadUSB rule was evadable by
+    omitting the boot protocol.
+    """
+
+    def _ids(self, dev):
+        return {f.rule_id for f in rules.evaluate(dev)}
+
+    # -- the classification primitives ------------------------------------
+
+    def test_declared_keyboard_is_a_keyboard(self):
+        self.assertTrue(usbclass.is_keyboard(0x03, 0x01, 0x01))
+        self.assertFalse(usbclass.is_undeclared_hid(0x03, 0x01, 0x01))
+
+    def test_declared_mouse_has_answered_the_question(self):
+        self.assertFalse(usbclass.is_undeclared_hid(0x03, 0x01, 0x02))
+        self.assertFalse(usbclass.may_type(0x03, 0x01, 0x02))
+
+    def test_hid_without_a_boot_protocol_might_type(self):
+        self.assertFalse(usbclass.is_keyboard(0x03, 0x00, 0x00))
+        self.assertTrue(usbclass.is_undeclared_hid(0x03, 0x00, 0x00))
+        self.assertTrue(usbclass.may_type(0x03, 0x00, 0x00))
+
+    def test_non_hid_never_types(self):
+        self.assertFalse(usbclass.may_type(0x08, 0x06, 0x50))
+
+    # -- the regression ----------------------------------------------------
+
+    def test_declared_badusb_is_still_critical(self):
+        dev = _Device([STORAGE, BOOT_KEYBOARD])
+        self.assertIn("storage-with-keyboard", self._ids(dev))
+        self.assertEqual(rules.worst(rules.evaluate(dev)),
+                         rules.Severity.CRITICAL)
+
+    def test_evasive_badusb_is_now_critical_too(self):
+        dev = _Device([STORAGE, UNDECLARED_HID])
+        self.assertIn("storage-with-undeclared-hid", self._ids(dev))
+        self.assertEqual(rules.worst(rules.evaluate(dev)),
+                         rules.Severity.CRITICAL)
+
+    def test_network_plus_undeclared_hid_is_a_warning_not_a_verdict(self):
+        """
+        Graded lower on purpose: some radios expose a vendor HID channel, and
+        what the interface does cannot be read from the descriptors.
+        """
+        dev = _Device([BLUETOOTH, UNDECLARED_HID])
+        found = rules.evaluate(dev)
+        self.assertIn("network-with-undeclared-hid",
+                      {f.rule_id for f in found})
+        self.assertEqual(rules.worst(found), rules.Severity.WARNING)
+
+    def test_disguised_injector_without_a_boot_protocol_is_caught(self):
+        dev = _Device([UNDECLARED_HID], manufacturer="Kingston",
+                      product="DataTraveler")
+        self.assertIn("self-contradictory-identity", self._ids(dev))
+
+    # -- and the design principle it must not break ------------------------
+
+    def test_an_ordinary_mouse_stays_silent(self):
+        self.assertEqual(self._ids(_Device([BOOT_MOUSE], "Logitech", "M185")),
+                         set())
+
+    def test_a_subclass_zero_mouse_stays_silent(self):
+        """The common shape. Flagging it alone would train people to ignore us."""
+        self.assertEqual(
+            self._ids(_Device([UNDECLARED_HID], "Logitech", "G502")), set())
+
+    def test_a_headset_with_hid_buttons_stays_silent(self):
+        dev = _Device([_Iface(0x01, 0x01, 0x00), _Iface(0x01, 0x02, 0x00),
+                       UNDECLARED_HID], "Sennheiser", "PC 8")
+        self.assertEqual(self._ids(dev), set())
+
+    def test_a_plain_flash_drive_stays_silent(self):
+        self.assertEqual(
+            self._ids(_Device([STORAGE], "Kingston", "DataTraveler")), set())
+
+
+class DescriptorCoverage(unittest.TestCase):
+    def device(self, truncated=False):
+        # Build explicitly: first config storage, second config HID.
+        raw = struct.pack("<BBHBBBBHHHBBBB", 18, 1, 0x200, 0, 0, 0, 64,
+                          0x1234, 0x5678, 0x100, 0, 0, 0, 2)
+        for value, cls in ((1, 8), (2, 3)):
+            raw += struct.pack("<BBHBBBBB", 9, 2, 18, 1, value, 0, 0x80, 50)
+            raw += struct.pack("<BBBBBBBBB", 9, 4, 0, 0, 1, cls, 1, 1, 0)
+        ds = descriptors.parse(raw)
+        if truncated:
+            ds.truncated = "missing tail"
+        return sysfs.UsbDevice(Path("unused"), "1-1", "1234", "5678", None,
+                              None, None, 1, 2, "12", 0, 0, ds)
+
+    def test_later_configuration_cannot_hide_input_from_storage_guard(self):
+        dev = self.device()
+        self.assertIn("input", dev.kinds)
+        self.assertIn("storage", dev.kinds)
+        self.assertEqual(rules.worst(rules.evaluate(dev)), rules.Severity.CRITICAL)
+
+    def test_truncated_descriptors_disable_early_activation(self):
+        self.assertFalse(self.device(truncated=True).inspection_safe)
+
+    def test_removed_baseline_port_is_not_ignored_forever(self):
+        engine = daemon.Probolos()
+        engine.known.add("1-1")
+        engine._on_remove("/sys/bus/usb/devices/1-1")
+        self.assertNotIn("1-1", engine.known)
 
 
 if __name__ == "__main__":

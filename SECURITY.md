@@ -176,7 +176,9 @@ constrained structurally, not by policy:
    configuration cannot reconstruct text even in memory. Timing analysis works
    without it.
 
-Points 1–3 are asserted in `tests/test_payload.py` and `tests/test_safety.py`.
+Points 1–3 are asserted in `tests/test_quarantine.py`, by
+`BaselineDevicesAreNeverInspected`, `QuarantineRunsOnlyBeforeTheDecision` and
+`DefaultConfigurationRecordsNoKeyIdentity`.
 
 There is therefore no configuration in which Probolos records a device that
 somebody has approved and is using. If you find one, that is a security bug and
