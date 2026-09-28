@@ -7,6 +7,7 @@ Covers probolos.quarantine, probolos.payload and probolos.deferred_bind.
 
 from __future__ import annotations
 
+import io
 import os
 import struct
 import sys
@@ -692,7 +693,7 @@ class DefaultConfigurationRecordsNoKeyIdentity(unittest.TestCase):
         with mock.patch.object(entry, "require_usb"), \
              mock.patch.object(entry, "require_root"), \
              mock.patch.object(entry.daemon, "serve") as serve, \
-             mock.patch.object(entry.sys, "stdout", new=mock.Mock()):
+             mock.patch.object(entry.sys, "stdout", new=io.StringIO()):
             entry.main(["--dry-run", "--no-ledger", "--no-trust"])
         self.assertIs(serve.call_args.kwargs["capture_payload"], False)
 

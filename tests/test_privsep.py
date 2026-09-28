@@ -37,6 +37,8 @@ from probolos.gate_client import GateClient
 class AnalyzerHasNoControllingTerminal(unittest.TestCase):
     """The analyzer could TIOCSTI into the terminal Probolos was started from."""
 
+    GATE_UP = b"<gate-up>"
+
     def _run(self, analyzer_body, while_running=None) -> str:
         """
         privsep.start() as a job started from a shell on a terminal.
@@ -68,7 +70,10 @@ class AnalyzerHasNoControllingTerminal(unittest.TestCase):
                         analyzer_body(write_end)
                         return 0
                     try:
-                        privsep.start(analyzer_main, log=lambda *_a: None)
+                        # The gate's log line is written once its signal
+                        # handlers are in place: keys are pressed after it.
+                        privsep.start(analyzer_main, log=lambda *_a: os.write(
+                            write_end, self.GATE_UP))
                     finally:
                         os._exit(0)
                 while True:
@@ -97,7 +102,8 @@ class AnalyzerHasNoControllingTerminal(unittest.TestCase):
                         finished = True
                         break
                     report += chunk
-                    if while_running is not None and b"ready" in report:
+                    if (while_running is not None and b"ready" in report
+                            and self.GATE_UP in report):
                         while_running(master)
                         while_running = None
         finally:
@@ -106,7 +112,7 @@ class AnalyzerHasNoControllingTerminal(unittest.TestCase):
                 os.kill(pid, signal.SIGKILL)   # fail, never hang the suite
             os.waitpid(pid, 0)
             os.close(master)
-        return report.decode()
+        return report.replace(self.GATE_UP, b"").decode()
 
     def test_the_analyzer_leads_its_own_session_and_cannot_inject(self):
         import fcntl

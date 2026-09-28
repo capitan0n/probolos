@@ -26,6 +26,13 @@ All notable changes to Probolos. Versioning is semantic.
   gate's signal handler raises too. The exit then escaped `os._exit()` and
   unwound through the parent's stack in the forked child, running its
   inherited atexit handlers. It now becomes an exit status like the rest.
+- **A Ctrl-C at `--privsep` startup could kill the root gate.** The gate
+  installed its signal handlers after `fork()`; a SIGINT in between met
+  Python's default handler, raised KeyboardInterrupt in the root process, and
+  left the analyzer running with nobody behind its socket. The handlers are
+  now in place before `fork()`, and the child restores what it inherited. The
+  root-only test that presses Ctrl-C was failing about one run in five for
+  this reason.
 - `interrogation_study.py` cleans device strings with `textsafe` before
   printing them. The fix had landed in a second copy under `probolos/`, which
   could not import the package when run as a script; that copy is removed.
@@ -46,7 +53,14 @@ All notable changes to Probolos. Versioning is semantic.
 - `ruff check .` is clean and configured in `pyproject.toml`; redundant
   re-imports left over from merging test modules, unused imports and dead
   locals are removed.
-- `.github/workflows/tests.yml` runs ruff and the suite on 3.10 and 3.12.
+- `.github/workflows/tests.yml` runs ruff and the suite on 3.10, 3.12 and
+  3.14.
+- The suite no longer depends on where it is run. `report.py` turns colour on
+  when stdout is a terminal, so three tests that look for a phrase in the
+  rendered report failed at a developer's prompt and passed in CI;
+  `tests/__init__.py` now sets `NO_COLOR`. On Python 3.14, argparse asks
+  stdout whether it is a terminal, which a test that replaced stdout with a
+  bare `Mock` could not answer; it uses a `StringIO`.
 - **The test suite is organised by module: 28 files became 13.** Half the
   files were named after the security review that produced them, so the
   tests for one module were spread over up to eleven files. Each file now

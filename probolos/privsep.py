@@ -249,9 +249,60 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     parent_sock, child_sock = socket.socketpair(
         socket.AF_UNIX, socket.SOCK_SEQPACKET)
 
+    # Ignore terminal signals in the gate. They are delivered to the whole
+    # process group, so without this the gate would tear down its socket at the
+    # same instant the analyzer is trying to send its final restore requests
+    # through it -- producing the "Broken pipe / FAILED to restore" cascade.
+    # The gate instead keeps serving until the analyzer finishes its cleanup
+    # and closes the connection, which is what ends serve_forever() cleanly.
+    #
+    # The analyzer is in a session of its own now (see above), so the
+    # terminal's Ctrl-C, Ctrl-\ and hangup no longer reach it directly. The
+    # gate passes those on instead: the analyzer still sees exactly the signal
+    # it used to, and its exit is what ends the gate. SIGTERM is still only
+    # ignored -- systemd delivers it to every process in the unit, and
+    # forwarding it would deliver it twice.
+    #
+    # Ctrl-Z is ignored. Off the controlling tty the analyzer is also outside
+    # job control, so suspending the gate alone would hand the terminal back
+    # to the shell while the analyzer went on reading it.
+    #
+    # Installed BEFORE fork(). Installed after it, a Ctrl-C landing in between
+    # found the gate on Python's default handler: KeyboardInterrupt in the root
+    # process, and an analyzer left running with nobody behind its socket.
+    # Until fork() returns the analyzer's pid there is nobody to forward to, so
+    # a signal in that instant is dropped rather than fatal; the child puts back
+    # the dispositions it inherited before it does anything else.
+    import signal
+    analyzer = []
+
+    def _forward(signum, _frame):
+        if not analyzer:
+            return
+        try:
+            os.kill(analyzer[0], signum)
+        except OSError:
+            pass
+
+    inherited = {}
+    for _sig, _handler in ((signal.SIGINT, _forward),
+                           (signal.SIGHUP, _forward),
+                           (signal.SIGQUIT, _forward),
+                           (signal.SIGTERM, signal.SIG_IGN),
+                           (signal.SIGTSTP, signal.SIG_IGN)):
+        try:
+            inherited[_sig] = signal.signal(_sig, _handler)
+        except (ValueError, OSError):
+            pass
+
     pid = os.fork()
     if pid == 0:
         # ---- child: becomes the unprivileged analyzer ----
+        for _sig, _handler in inherited.items():
+            try:
+                signal.signal(_sig, _handler)
+            except (TypeError, ValueError, OSError):
+                pass
         parent_sock.close()
         # A session of its own, so the terminal is no longer its CONTROLLING
         # terminal. The analyzer keeps the inherited stdin/stdout -- the
@@ -283,42 +334,8 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
         os._exit(rc)
 
     # ---- parent: stays root, runs the gate ----
+    analyzer.append(pid)
     child_sock.close()
-
-    # Ignore terminal signals in the gate. They are delivered to the whole
-    # process group, so without this the gate would tear down its socket at the
-    # same instant the analyzer is trying to send its final restore requests
-    # through it -- producing the "Broken pipe / FAILED to restore" cascade.
-    # The gate instead keeps serving until the analyzer finishes its cleanup
-    # and closes the connection, which is what ends serve_forever() cleanly.
-    #
-    # The analyzer is in a session of its own now (see above), so the
-    # terminal's Ctrl-C, Ctrl-\ and hangup no longer reach it directly. The
-    # gate passes those on instead: the analyzer still sees exactly the signal
-    # it used to, and its exit is what ends the gate. SIGTERM is still only
-    # ignored -- systemd delivers it to every process in the unit, and
-    # forwarding it would deliver it twice.
-    #
-    # Ctrl-Z is ignored. Off the controlling tty the analyzer is also outside
-    # job control, so suspending the gate alone would hand the terminal back
-    # to the shell while the analyzer went on reading it.
-    import signal
-
-    def _forward(signum, _frame):
-        try:
-            os.kill(pid, signum)
-        except OSError:
-            pass
-
-    for _sig, _handler in ((signal.SIGINT, _forward),
-                           (signal.SIGHUP, _forward),
-                           (signal.SIGQUIT, _forward),
-                           (signal.SIGTERM, signal.SIG_IGN),
-                           (signal.SIGTSTP, signal.SIG_IGN)):
-        try:
-            signal.signal(_sig, _handler)
-        except (ValueError, OSError):
-            pass
 
     log(f"[privsep] gate running as root (pid {os.getpid()}), "
         f"analyzer as {drop_to} (pid {pid})")

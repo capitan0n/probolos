@@ -14,8 +14,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Lowest supported (pyproject requires-python) and a current release.
-        python-version: ["3.10", "3.12"]
+        # Lowest supported (pyproject requires-python), a middle release, and
+        # the newest, which is what rolling distributions (Arch, Manjaro) ship.
+        python-version: ["3.10", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
         with:

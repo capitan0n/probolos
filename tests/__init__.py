@@ -1,9 +1,13 @@
 """
-Regression tests from each security review, named by what the review found.
+The test suite: one module per area of the code, see README.md.
 
-README.md describes this package and it did not exist, so the checks it
-promises were not being collected by anything. A round number stops meaning
-anything past the third review; a theme keeps working however many passes the
-tree accumulates, which is why the modules here are named after the defect
-rather than after the pass that found it.
+Output is made colourless here, before any test module imports probolos.
+report.py decides once, at import, whether stdout is a terminal; run from one,
+the rendered report carried escape codes in the middle of the phrases the tests
+look for, so the suite passed in CI and failed at a developer's prompt.
+NO_COLOR also turns off the colour Python 3.14's argparse and unittest add.
 """
+
+import os
+
+os.environ["NO_COLOR"] = "1"
