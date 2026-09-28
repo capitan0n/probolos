@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# Read-only token: the workflow only checks out and runs the suite.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Lowest supported (pyproject requires-python) and a current release.
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # PyYAML lets the --rules tests run instead of skipping; ruff is the
+      # linter configured in pyproject.toml. Nothing else is needed: the suite
+      # uses only the standard library, and needs no root and no USB hardware.
+      - run: python -m pip install pyyaml ruff
+      - run: ruff check .
+      - run: python -m tests.run_all
