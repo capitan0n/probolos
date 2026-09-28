@@ -236,11 +236,9 @@ class TestKeyboardPredicate(unittest.TestCase):
 # Regression tests for the report-level consequences of a crafted string.
 # =========================================================================
 
-import html
 import unittest
 from types import SimpleNamespace
 
-from probolos import rules, textsafe
 from probolos.textsafe import NOTE_BIDI, NOTE_CONTROL, NOTE_INVISIBLE
 
 
@@ -393,8 +391,6 @@ class DialogMarkupEscaping(unittest.TestCase):
 import struct
 import unittest
 
-from probolos import descriptors, rules
-from tests.test_descriptors import endpoint_desc, iface_desc
 
 
 def power_device_desc(bcd_usb=0x0200, num_configs=1):

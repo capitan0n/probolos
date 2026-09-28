@@ -18,10 +18,9 @@ def main():
     except PermissionError as exc:
         unavailable = str(exc)
     suite = unittest.TestSuite()
-    # rglob, not glob: tests/audit/ holds one module per security review and a
-    # top-level glob collected none of them, so `python -m tests.run_all` and
-    # `unittest discover` reported different totals -- which README.md says is
-    # itself a bug, and was one before for the same kind of reason.
+    # rglob, not glob: a top-level glob once missed a whole subdirectory of
+    # tests, so `python -m tests.run_all` and `unittest discover` reported
+    # different totals -- which README.md says is itself a bug.
     root = Path(__file__).parent
     for path in sorted(root.rglob("test_*.py")):
         dotted = ".".join(path.relative_to(root).with_suffix("").parts)

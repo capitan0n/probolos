@@ -291,12 +291,10 @@ class TestNumberedManagement(unittest.TestCase):
 
 import json
 import os
-import tempfile
 import unittest
 from unittest import mock
-from pathlib import Path
 
-from probolos import privsep, trust
+from probolos import privsep
 
 
 def good_entry(key="v:p:s#abc"):
@@ -435,11 +433,7 @@ class EntryValidation(unittest.TestCase):
 # =========================================================================
 
 import fnmatch
-import json
-import os
-import tempfile
 import unittest
-from pathlib import Path
 
 from probolos import atomicio
 

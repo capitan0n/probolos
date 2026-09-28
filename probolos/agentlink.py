@@ -288,7 +288,6 @@ class AgentLink:
         # it -- this becomes root chowning a file of someone else's choosing.
         directory_fd = None
         try:
-            created_dir = not self.path.parent.exists()
             if os.geteuid() == 0:
                 from .securefs import open_directory
                 directory_fd = open_directory(self.path.parent, create=True,

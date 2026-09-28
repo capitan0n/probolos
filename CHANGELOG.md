@@ -2,6 +2,54 @@
 
 All notable changes to Probolos. Versioning is semantic.
 
+## [Unreleased] — quality pass
+
+### Fixed
+
+- **A malformed `--rules` file ended in a traceback.** `yaml.YAMLError` is not
+  a `ValueError`, so a YAML syntax error escaped the entry point's handler; it
+  is now reported as the one-line `rule config: ...` error like every other
+  bad rule file.
+- **Duration flags accepted values that silently meant "off".** `--timeout`,
+  `--observe` and `--watchdog` took negative numbers, NaN and infinity, which
+  fell through the daemon's `> 0` tests — `--watchdog -1` disabled a safety
+  layer without a word. They now require a finite number of seconds, 0 or
+  more.
+- `--force-locked` and `--force-unlocked` are mutually exclusive; together,
+  the first used to win silently.
+- A missing `pyudev` is reported before the gate closes. It was discovered
+  only in the event loop, after every root hub had been closed and reopened,
+  and ended in a traceback.
+- **The `--privsep` analyzer child could exit by unwinding.** It caught
+  `KeyboardInterrupt` and `Exception`, but not `SystemExit`, which `serve()`
+  raises for a leftover panic file (and now a missing `pyudev`) and the
+  gate's signal handler raises too. The exit then escaped `os._exit()` and
+  unwound through the parent's stack in the forked child, running its
+  inherited atexit handlers. It now becomes an exit status like the rest.
+- `interrogation_study.py` cleans device strings with `textsafe` before
+  printing them. The fix had landed in a second copy under `probolos/`, which
+  could not import the package when run as a script; that copy is removed.
+
+### Removed
+
+- `probolos/_media.py`, a test fixture shipped inside the runtime package. The
+  entry below that "moved it back" to `tests/_media.py` added the new copy but
+  left this one; nothing imported it.
+
+### Tests and tooling
+
+- The whole-disk guard tests pass on Python 3.10, the declared minimum. The
+  harness patched `os.stat`, which 3.10's `pathlib` does not route through.
+- The late-input-node test asserts that discovery ran more than once.
+- New `tests/test_cli_validation.py`; a YAML-syntax case in
+  `test_parser_and_display_limits.py`.
+- `ruff check .` is clean and configured in `pyproject.toml`; redundant
+  re-imports left over from merging test modules, unused imports and dead
+  locals are removed.
+- `.github/workflows/tests.yml` runs ruff and the suite on 3.10 and 3.12.
+- README: the install step for `pyudev`, PyYAML as an optional requirement,
+  and `tests/audit/` references corrected — that directory no longer exists.
+
 ## [Unreleased] — input that crossed a boundary
 
 Four findings, each reproduced against the unpatched tree before it was fixed.

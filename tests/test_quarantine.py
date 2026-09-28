@@ -156,7 +156,6 @@ class TestInputNodeDiscovery(unittest.TestCase):
     """
 
     def test_bus_view_path_matches_resolved_udev_paths(self):
-        import os
         import tempfile
         from pathlib import Path
         from unittest import mock
@@ -280,7 +279,7 @@ class TestNoLiveWindowAfterObservation(unittest.TestCase):
 
 import unittest
 
-from probolos import analyzers, payload, quarantine, rules
+from probolos import analyzers, payload
 
 # Codes used below, from linux/input-event-codes.h
 K = {"h": 35, "e": 18, "l": 38, "o": 24, "space": 57, "enter": 28,

@@ -583,10 +583,16 @@ def load_config(path) -> RuleConfig:
     except ImportError:
         raise RuntimeError(
             "PyYAML is not installed (Manjaro: sudo pacman -S python-yaml). "
-            "Probolos runs fine without it using the built-in rules.")
+            "Probolos runs fine without it using the built-in rules.") from None
 
+    # A syntax error is a config error too. yaml.YAMLError derives from
+    # Exception, not ValueError, so it escaped __main__'s handler as a
+    # traceback -- the same failure the shape checks below exist to prevent.
     with open(path) as fh:
-        data = yaml.safe_load(fh) or {}
+        try:
+            data = yaml.safe_load(fh) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"not valid YAML: {exc}") from exc
 
     # Every access below assumed a mapping of the expected shape, so a file
     # that was merely the wrong shape -- a list, a bare string, a `severity:`

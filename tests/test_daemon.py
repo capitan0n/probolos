@@ -346,11 +346,7 @@ class TestHeldDevicesBypassTrust(unittest.TestCase):
 # =========================================================================
 
 import unittest
-from pathlib import Path
-from unittest import mock
 
-from probolos import daemon as daemon_mod
-from probolos import session, sysfs, usbclass
 
 
 def make_stage_device(name="3-9", kinds=None):

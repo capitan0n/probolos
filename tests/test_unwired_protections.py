@@ -91,7 +91,6 @@ class AgentUnavailableIsNotARefusal(unittest.TestCase):
 
 import json
 import os
-import stat
 import struct
 import unittest
 from pathlib import Path
@@ -410,18 +409,14 @@ class VersionHasOneSource(unittest.TestCase):
 # Regression tests for the second-pass audit findings.
 # =========================================================================
 
-import json
-import os
 import socket
 import tempfile
 import threading
 import time
 import unittest
-from pathlib import Path
-from unittest import mock
 
-from probolos import agentlink, gate_server, ledger as ledger_mod, payload
-from probolos import protocol, rules, trust as trust_mod, usbclass
+from probolos import gate_server, ledger as ledger_mod, payload
+from probolos import trust as trust_mod, usbclass
 
 
 # ---------------------------------------------------------------------------
@@ -833,12 +828,10 @@ class UndeclaredHidIsNotInnocence(unittest.TestCase):
 # Regressions found while reviewing the hardening patch, plus two older ones.
 # =========================================================================
 
-import os
 import subprocess
 import sys
 import types
 import unittest
-from pathlib import Path
 
 
 def _stub_pyudev():
@@ -1100,19 +1093,10 @@ class AdmitDescriptorIsCloseOnExec(unittest.TestCase):
 # Security regression scenarios: no real USB devices or root writes required.
 # =========================================================================
 
-import json
-import os
-from pathlib import Path
-import socket
-import struct
-import tempfile
-import threading
-import time
 import unittest
-from unittest import mock
 
-from probolos import agentlink, daemon, descriptors, gate, gate_server
-from probolos import ledger, privsep, protocol, quarantine, rules, sysfs, trust
+from probolos import daemon, gate
+from probolos import ledger, privsep, quarantine
 from probolos.gate_client import GateClient
 
 
@@ -1376,6 +1360,8 @@ class QuarantineLifetime(unittest.TestCase):
             obs = quarantine.quarantine(Path("unused"), lambda: None,
                                         deauthorize_fn=lambda: None, duration=0.001)
         self.assertEqual(obs.grabbed, ["/dev/input/event5", "/dev/input/event6"])
+        # The late node was found by asking again, not by the first scan.
+        self.assertGreaterEqual(discover.call_count, 2)
         for fd in (self.read_fd, second_read):
             with self.assertRaises(OSError):
                 os.fstat(fd)

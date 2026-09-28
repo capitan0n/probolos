@@ -109,6 +109,14 @@ class RuleConfigFailsAsAConfigError(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._load("disabled: keyboard-at-high-speed\n")
 
+    def test_a_yaml_syntax_error_is_a_value_error(self):
+        # yaml.YAMLError is not a ValueError; unconverted, it escaped the
+        # entry point's handler as a traceback.
+        for text in ("severity: [unclosed\n", "disabled:\n  - a\n - b\n"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    self._load(text)
+
     def test_a_well_formed_file_still_loads(self):
         config = self._load(
             "disabled:\n"

@@ -291,7 +291,7 @@ class WatcherTestBase(unittest.TestCase):
                       **(props or {})))
 
     def output(self):
-        return "\n".join(str(l) for l in self.lines)
+        return "\n".join(str(line) for line in self.lines)
 
 
 class WatcherBehaviour(WatcherTestBase):

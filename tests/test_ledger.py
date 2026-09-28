@@ -188,11 +188,8 @@ class TestDefaultPath(unittest.TestCase):
 # Regression tests for a ledger file that is valid JSON but wrong inside.
 # =========================================================================
 
-import json
-import tempfile
 import unittest
 from dataclasses import asdict
-from pathlib import Path
 
 from probolos.ledger import ENTRY_FIELD_NAMES, Entry, Ledger
 
@@ -325,12 +322,9 @@ class MalformedLedger(unittest.TestCase):
 # =========================================================================
 
 import copy
-import struct
-import tempfile
 import unittest
-from pathlib import Path
 
-from probolos import descriptors, ledger as ledger_mod, sysfs, analyzers, rules
+from probolos import descriptors, sysfs
 
 
 # ---------------------------------------------------------------------------

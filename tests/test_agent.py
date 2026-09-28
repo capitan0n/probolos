@@ -547,15 +547,8 @@ class TestServePassesAgentUid(unittest.TestCase):
 # Regression tests for the agent socket, one per way it could be abused.
 # =========================================================================
 
-import json
 import os
-import socket
-import tempfile
-import threading
-import time
 import unittest
-from unittest import mock
-from pathlib import Path
 
 from probolos.agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_YES,
                                 AgentLink, MSG_ANSWER, peer_credentials)

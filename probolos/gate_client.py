@@ -12,10 +12,8 @@ fds. Not root. That containment is the reason the split exists.
 from __future__ import annotations
 
 import array
-import os
 import socket
 import threading
-from typing import Optional
 
 from . import protocol
 

@@ -50,7 +50,7 @@ except ImportError:
     sys.exit("pyusb is required: sudo pacman -S python-pyusb")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from probolos import interrogate  # noqa: E402
+from probolos import interrogate, textsafe  # noqa: E402
 
 
 def describe(dev) -> str:
@@ -59,8 +59,12 @@ def describe(dev) -> str:
             return getter() or "-"
         except Exception:
             return "-"
-    manufacturer = safe(lambda: usb.util.get_string(dev, dev.iManufacturer))
-    product = safe(lambda: usb.util.get_string(dev, dev.iProduct))
+    # Device-chosen strings, printed to a root terminal by a tool meant to be
+    # pointed at attack hardware. Cleaned the same way the gate cleans them, so
+    # an escape sequence in iProduct is shown rather than executed.
+    manufacturer = textsafe.clean(
+        safe(lambda: usb.util.get_string(dev, dev.iManufacturer)))
+    product = textsafe.clean(safe(lambda: usb.util.get_string(dev, dev.iProduct)))
     return (f"{dev.idVendor:04x}:{dev.idProduct:04x} bus {dev.bus} "
             f"dev {dev.address}  {manufacturer} {product}")
 

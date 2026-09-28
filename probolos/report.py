@@ -95,7 +95,6 @@ def _quote(value: Optional[str]) -> str:
 def render(dev: sysfs.UsbDevice,
            findings: Optional[Sequence[rules.Finding]] = None) -> str:
     findings = list(findings or [])
-    verdict = rules.worst(findings)
     out: List[str] = []
 
     # --- header: two words, then a rule of dashes as a soft separator ------

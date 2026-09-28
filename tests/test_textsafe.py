@@ -169,7 +169,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from probolos import storage, sysfs, textsafe
+from probolos import storage, sysfs
 
 
 class StorageStall(unittest.TestCase):

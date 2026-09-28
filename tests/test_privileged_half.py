@@ -7,9 +7,7 @@ rest pin places where a check exists and does not reach the operation it was
 written to protect, which is this codebase's own documented failure pattern.
 """
 
-import os
 import socket
-import stat
 import tempfile
 import threading
 import unittest
@@ -296,6 +294,41 @@ class SocketChownDoesNotFollowALink(unittest.TestCase):
         # for. The parameter must now be one the code actually uses.
         signature = inspect.signature(agentlink.AgentLink._chown_for_owner)
         self.assertNotIn("created_dir", signature.parameters)
+
+
+
+class AnalyzerChildAlwaysEndsInAnExitStatus(unittest.TestCase):
+    """
+    The forked analyzer must leave through os._exit(). SystemExit is not an
+    Exception, so a deliberate exit inside serve() -- a leftover panic file, a
+    missing pyudev, the gate's own signal handler -- escaped the child's
+    handler and unwound through the parent's stack in the child process.
+    """
+
+    def _rc(self, analyzer_main):
+        import contextlib
+        import io
+        from probolos import privsep
+        with contextlib.redirect_stderr(io.StringIO()):
+            return privsep._run_analyzer(analyzer_main, object())
+
+    def _raises(self, exc):
+        def analyzer_main(_client):
+            raise exc
+        return analyzer_main
+
+    def test_system_exit_becomes_a_status(self):
+        self.assertEqual(self._rc(self._raises(SystemExit(0))), 0)
+        self.assertEqual(self._rc(self._raises(SystemExit(None))), 0)
+        self.assertEqual(self._rc(self._raises(SystemExit(3))), 3)
+        self.assertEqual(self._rc(self._raises(SystemExit("message"))), 1)
+
+    def test_the_other_endings_are_unchanged(self):
+        self.assertEqual(self._rc(lambda _c: 0), 0)
+        self.assertEqual(self._rc(lambda _c: None), 0)
+        self.assertEqual(self._rc(lambda _c: 4), 4)
+        self.assertEqual(self._rc(self._raises(KeyboardInterrupt())), 0)
+        self.assertEqual(self._rc(self._raises(RuntimeError("boom"))), 1)
 
 
 if __name__ == "__main__":

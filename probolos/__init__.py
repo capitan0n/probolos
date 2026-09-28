@@ -10,7 +10,7 @@
 __all__ = ["__version__"]
 
 try:
-    from importlib.metadata import PackageNotFoundError, version as _version
+    from importlib.metadata import version as _version
 
     __version__ = _version("probolos")
 except Exception:  # not installed: source checkout, or metadata unavailable

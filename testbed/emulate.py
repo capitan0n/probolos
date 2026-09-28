@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 from .rawgadget import (RawGadget, UsbCtrlRequest, USB_RAW_EVENT_CONNECT,
                         USB_RAW_EVENT_CONTROL, RawGadgetError, parse_setup)

@@ -118,14 +118,11 @@ class GateScope(unittest.TestCase):
 # Tests for privilege separation.
 # =========================================================================
 
-import os
 import socket
-import tempfile
 import threading
 import unittest
-from pathlib import Path
 
-from probolos import gate_server, protocol
+from probolos import protocol
 from probolos.gate_client import GateClient
 
 

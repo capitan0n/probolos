@@ -344,8 +344,8 @@ class MediaWatch:
         except OSError as exc:
             self.log(f"[!!] COULD NOT DEAUTHORIZE the reader "
                      f"{host.dev.name}: {exc}")
-            self.log(f"[!!] The card in it is still reachable. Remove it, or "
-                     f"unplug the reader.")
+            self.log("[!!] The card in it is still reachable. Remove it, or "
+                     "unplug the reader.")
             return "deauthorization failed"
         self.unregister(host.dev.name)
         self.log(f"[-] READER DEAUTHORIZED — {report.one_liner(host.dev)}")

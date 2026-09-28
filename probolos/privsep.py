@@ -41,7 +41,6 @@ import os
 import pwd
 import socket
 import sys
-from typing import Optional
 
 from . import gate_server
 
@@ -55,7 +54,7 @@ def resolve_user(name: str) -> tuple:
     try:
         entry = pwd.getpwnam(name)
     except KeyError:
-        raise PrivsepError(f"user {name!r} does not exist")
+        raise PrivsepError(f"user {name!r} does not exist") from None
     return entry.pw_uid, entry.pw_gid
 
 
@@ -188,6 +187,32 @@ def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
             os.close(directory_fd)
 
 
+def _run_analyzer(analyzer_main, client) -> int:
+    """
+    Run the analyzer and turn every way it can end into an exit status.
+
+    The caller is a forked child and must leave through os._exit(), never by
+    unwinding: an exception that escapes would carry on through the PARENT's
+    stack in this process and run the atexit handlers it inherited. SystemExit
+    is caught for that reason too -- serve() raises it (a leftover panic file,
+    a missing pyudev) and so does the gate's signal handler -- and it is not
+    an Exception, so the handler below never saw it.
+    """
+    try:
+        rc = analyzer_main(client)
+    except KeyboardInterrupt:
+        return 0
+    except SystemExit as exc:
+        if exc.code is None or isinstance(exc.code, int):
+            return exc.code or 0
+        print(exc.code, file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"[analyzer] crashed: {exc}", file=sys.stderr)
+        return 1
+    return rc or 0
+
+
 def start(analyzer_main, drop_to: str = "nobody", log=print,
           state_paths=(), watch_media: bool = False) -> int:
     """
@@ -252,15 +277,10 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
             os._exit(70)
         from .gate_client import GateClient
         try:
-            rc = analyzer_main(GateClient(child_sock))
-        except KeyboardInterrupt:
-            rc = 0
-        except Exception as exc:  # noqa: BLE001
-            print(f"[analyzer] crashed: {exc}", file=sys.stderr)
-            rc = 1
+            rc = _run_analyzer(analyzer_main, GateClient(child_sock))
         finally:
             child_sock.close()
-        os._exit(rc or 0)
+        os._exit(rc)
 
     # ---- parent: stays root, runs the gate ----
     child_sock.close()

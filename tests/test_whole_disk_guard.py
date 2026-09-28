@@ -91,6 +91,11 @@ class _Tree:
 
         return [
             mock.patch("os.stat", fake_stat),
+            # Python 3.10's pathlib bound os.stat at import time, so patching
+            # os.stat alone left Path.stat() -- used by the rdev re-check after
+            # open -- reporting the real regular file, on 3.10 only.
+            mock.patch.object(Path, "stat",
+                              lambda self, *a, **kw: fake_stat(self, *a, **kw)),
             mock.patch("os.fstat", fake_fstat),
             mock.patch.object(sysfs, "_BLOCK_DIR", str(self.dev)),
             mock.patch.object(sysfs, "SYS_DEV_BLOCK", self.dev_block),

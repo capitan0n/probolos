@@ -187,12 +187,8 @@ class TestGateDoesNotPerpetuateLockout(unittest.TestCase):
 # Regression tests for the panic file, one per way it could be forged.
 # =========================================================================
 
-import os
-import tempfile
 import unittest
-from pathlib import Path
 
-from probolos import safety
 
 
 class PanicFileValidation(unittest.TestCase):

@@ -25,7 +25,6 @@ question that is about itself.
 
 from __future__ import annotations
 
-import json
 import os
 import select
 import threading
@@ -248,7 +247,7 @@ class Probolos:
                 import traceback
                 print(f"[!] {Path(device.sys_path).name}: unhandled error "
                       f"while gating this device: {exc!r}")
-                print(f"[!] It stays BLOCKED. The gate is still running.")
+                print("[!] It stays BLOCKED. The gate is still running.")
                 traceback.print_exc()
 
     def _dispatch(self, device) -> None:
@@ -557,8 +556,8 @@ class Probolos:
                 # Never swallowed. Failing to switch off a device that just
                 # typed at you is the most dangerous outcome in this program.
                 print(f"\n[!!] COULD NOT DEAUTHORIZE {dev.name}: {exc}")
-                print(f"[!!] The device may still be live. Unplug it now, or "
-                      f"run as root:")
+                print("[!!] The device may still be live. Unplug it now, or "
+                      "run as root:")
                 print(f"[!!]   echo 0 > {dev.syspath}/authorized\n")
             print(f"[-] REJECTED — {report.one_liner(dev, findings)}\n")
 
@@ -665,9 +664,9 @@ class Probolos:
                     syspath, instance):
                 print(f"[!] {name}: a DIFFERENT device now occupies this port "
                       f"than the one held while you were away.")
-                print(f"    It stays blocked and is not being asked about "
-                      f"under the old entry. Replug it to have it gated "
-                      f"normally.\n")
+                print("    It stays blocked and is not being asked about "
+                      "under the old entry. Replug it to have it gated "
+                      "normally.\n")
                 continue
             # Same reasoning as the poll loop: one held device failing must not
             # abandon the rest of the queue, and must not end the daemon.
@@ -965,7 +964,7 @@ class Probolos:
         if self.agent is not None and self.agent.connected:
             if critical:
                 self.agent.notify_critical(
-                    f"Dangerous USB device blocked",
+                    "Dangerous USB device blocked",
                     report.one_liner(dev, findings))
                 print("  (a warning was sent to your desktop; this device "
                       "cannot be approved from a notification)")
@@ -1154,8 +1153,8 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
             who = "any local process" if permitted is None else f"uid {agent_uid}"
             print(f"  - desktop agent socket: {agent_socket} "
                   f"(answers accepted from {who})")
-            print(f"    start the agent in your session with: "
-                  f"python -m probolos.agent")
+            print("    start the agent in your session with: "
+                  "python -m probolos.agent")
         else:
             link = None
 
@@ -1190,15 +1189,13 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
     # lstat -- saw it, refused it, and complained about it twice a second for
     # the whole run. The two checks look at the same path and must agree about
     # what is there; anything left at the path is the operator's to clear.
-    import os as _os
-    if _os.path.lexists(policy.panic_file) and not dry_run:
+    if os.path.lexists(policy.panic_file) and not dry_run:
         raise SystemExit(
             f"A panic file already exists at {policy.panic_file}.\n"
             f"It would force the gate open immediately. Remove it first:\n"
             f"    rm {policy.panic_file}")
 
     if close_race_window and not dry_run:
-        from . import deferred_bind
         if deferred_bind.supported():
             print("  - experimental deferred binding enabled; "
                   "the input grab race still exists")
@@ -1207,6 +1204,16 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
                   f"{deferred_bind.unsupported_reason()}")
             print("    Devices will be observed with the exposure window open; "
                   "it is measured and printed per device.")
+
+    # Checked here, not only in run(): run() is reached after the gate has
+    # closed, so a missing pyudev closed every hub, reopened it, and ended in a
+    # traceback. Refuse before touching anything instead.
+    if pyudev is None:
+        if link:
+            link.stop()
+        raise SystemExit("pyudev is not installed; it drives the event loop.\n"
+                         "Install it (Manjaro/Arch: sudo pacman -S python-pyudev, "
+                         "or: pip install pyudev) and try again.")
 
     print("[*] Closing the USB authorization gate:")
     with gate.AuthorizationGate(dry_run=dry_run) as opened:

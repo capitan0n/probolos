@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 try:
     import usb.core
@@ -102,7 +102,7 @@ class Probe:
     benign: bool = True
 
 
-def _timed(fn) -> (float, object):
+def _timed(fn) -> Tuple[float, object]:
     start = time.perf_counter()
     value = fn()
     return (time.perf_counter() - start) * 1000.0, value

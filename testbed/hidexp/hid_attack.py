@@ -105,7 +105,7 @@ def run_attack(markers: int, interval_ms: float) -> int:
     print(f"[+] Sent {sent} keystrokes at {interval_ms:.0f} ms intervals "
           f"(inhuman: steady, no variance).")
     print(f"    All {sent} should have been caught by Probolos.")
-    print(f"    Whatever reached the session = LEAKAGE.")
+    print("    Whatever reached the session = LEAKAGE.")
     return sent
 
 

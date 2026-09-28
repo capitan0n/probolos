@@ -65,6 +65,7 @@ asserting that other tools invariably decide after driver binding was removed.
 ```bash
 git clone https://github.com/capitan0n/probolos
 cd probolos
+sudo pacman -S python-pyudev     # or your distro's package, or: pip install pyudev
 sudo python3 -m probolos --observe 3
 ```
 
@@ -205,6 +206,7 @@ does.
 - Linux with sysfs USB authorization (`/sys/bus/usb/devices/*/authorized`)
 - Python 3.10+
 - `pyudev` for the event loop
+- Optional: `PyYAML`, only for `--rules FILE`
 - Optional: `kdialog`, `zenity`, or `tkinter` for the desktop agent
 
 No `python-evdev`: the quarantine talks to the kernel directly through one
@@ -226,10 +228,19 @@ different totals, that difference is a bug — it was one before, when the
 defensive-parsing checks were bare module-level functions that unittest
 discovery does not collect and only `run_all` picked up.
 
+```bash
+ruff check .                                    # lint (config in pyproject.toml)
+```
+
+The suite needs only the standard library: no root, no USB hardware and no
+`pyudev` (a few tests skip themselves when an optional piece such as PyYAML
+is missing).
+
 `tests/` holds one module per subject — `test_gate.py`, `test_ledger.py`,
-`test_rules.py` and so on. `tests/audit/` holds the regression tests from each
-security review, named by what that review found rather than by its number: a
-round number stops meaning anything past the third one, while a theme keeps
+`test_rules.py` and so on — alongside the regression tests from each security
+review, named by what that review found rather than by its number (for
+example `test_forged_signatures.py`, `test_escape_and_terminal_boundaries.py`):
+a round number stops meaning anything past the third one, while a theme keeps
 working however many passes the project accumulates.
 
 `testbed/` emulates USB devices in software via `dummy_hcd` + `raw_gadget`,
@@ -268,7 +279,7 @@ Short version:
 
 Status: **alpha — under active development.** The tree has been through six
 security review passes; each finding has a regression test named after the
-defect, under `tests/audit/`.
+defect, under `tests/`.
 
 **Verified on real hardware.** Closing and restoring `authorized_default` on
 all five root hubs of the reference laptop. A Kingston DataTraveler 3.0 through

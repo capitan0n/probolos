@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import array
 import os
+import re as _re
 import socket
 import stat
 import time
@@ -53,7 +54,6 @@ SYS_CLASS_PREFIX = "/sys/class/"
 # happens to be attached, and a partition node would let a caller reach into a
 # disk it was never asked about.
 BLOCK_PREFIX = "/dev/"
-import re as _re
 _BLOCK_NAME = _re.compile(r"^sd[a-z]+$")
 # The kernel's index of block devices by number. Whether a node is a whole disk
 # or a partition is read from here, never inferred from its name or minor.

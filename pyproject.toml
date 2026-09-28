@@ -42,8 +42,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# `pip install .[agent]` pulls the Tk fallback for the desktop prompt. kdialog
-# and zenity are system packages, not pip ones, so they stay out of here.
+# Placeholders, kept so `pip install .[agent]` / `.[dev]` keep resolving. Both
+# are empty on purpose: the agent's dialog backends (kdialog, zenity, and the
+# tkinter fallback) are distro packages, not pip ones, and the test suite runs
+# on the standard library alone. PyYAML, needed only for --rules, is likewise
+# optional and imported on demand.
 agent = []
 dev = []
 
@@ -62,3 +65,16 @@ probolos = "probolos.__main__:main"
 # Explicit package list so the testbed/ and tests/ trees are not shipped as
 # importable packages of the installed distribution.
 packages = ["probolos"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# pyflakes + pycodestyle errors (ruff's defaults). The tree is clean against
+# them; `ruff check .` is meant to stay that way.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Several test modules are concatenations of older per-review files, each
+# section keeping its own imports next to the tests that need them.
+"tests/*.py" = ["E402"]

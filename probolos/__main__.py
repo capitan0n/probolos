@@ -10,6 +10,7 @@ Command line entry point.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -138,7 +139,6 @@ def _active_session_user() -> Optional[str]:
     chosen Name=, handing the agent slot to a uid of its choosing. The same
     reasoning is spelled out in full in session.py.
     """
-    import os
     import subprocess
 
     from .session import _find_loginctl, _is_user_class
@@ -156,8 +156,9 @@ def _active_session_user() -> Optional[str]:
                          "-p", "Name", "-p", "Class", "-p", "Active",
                          "-p", "Remote"],
                         capture_output=True, text=True, timeout=3)
-                    values = dict(l.split("=", 1)
-                                  for l in info.stdout.splitlines() if "=" in l)
+                    values = dict(entry.split("=", 1)
+                                  for entry in info.stdout.splitlines()
+                                  if "=" in entry)
                     # The ACTIVE, local, person's session -- not merely the
                     # first graphical one listed. GDM's greeter (user `gdm`)
                     # and another user's background session are graphical
@@ -268,6 +269,24 @@ def cmd_forget(path, pattern: str) -> None:
         sys.exit(f"could not write trust store: {error}")
 
 
+def _seconds(text: str) -> float:
+    """argparse type for a duration: a finite number of seconds, 0 or more.
+
+    Every duration flag documents 0 as "off"/"wait". A negative value, NaN or
+    infinity used to be accepted and then fell through `> 0` tests, silently
+    becoming "off" (for --watchdog, that disables a safety layer) or, for
+    infinity, an unbounded select().
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: expected a finite number of seconds, 0 or more")
+    return value
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         prog="probolos",
@@ -280,13 +299,13 @@ def main(argv=None) -> None:
                         help="authorize all blocked devices and reopen the gate")
     parser.add_argument("--dry-run", action="store_true",
                         help="report devices without ever blocking or authorizing")
-    parser.add_argument("--timeout", type=float, default=0.0, metavar="SEC",
+    parser.add_argument("--timeout", type=_seconds, default=0.0, metavar="SEC",
                         help="auto-deny after SEC seconds of no answer (0 = wait)")
     parser.add_argument("--log", type=Path, metavar="FILE",
                         help="append decisions as JSON lines to FILE")
     parser.add_argument("--rules", type=Path, metavar="FILE",
                         help="YAML file tuning rule severities (optional)")
-    parser.add_argument("--observe", type=float, default=3.0, metavar="SEC",
+    parser.add_argument("--observe", type=_seconds, default=3.0, metavar="SEC",
                         help="seconds of behavioural quarantine for input "
                              "devices (0 disables stage 3)")
     parser.add_argument("--capture-payload", action="store_true",
@@ -307,7 +326,7 @@ def main(argv=None) -> None:
     parser.add_argument("--gate-fixed-ports", action="store_true",
                         help="also gate internal, non-removable ports. "
                              "This can lock you out of a laptop keyboard")
-    parser.add_argument("--watchdog", type=float, default=60.0, metavar="SEC",
+    parser.add_argument("--watchdog", type=_seconds, default=60.0, metavar="SEC",
                         help="reopen the gate if the daemon stops making "
                              "progress for SEC seconds (0 disables)")
     parser.add_argument("--panic-file", type=Path,
@@ -345,9 +364,10 @@ def main(argv=None) -> None:
                         help="what to do when a device arrives while the "
                              "screen is locked: hold it and ask on unlock "
                              "(default), deny outright, or take no notice")
-    parser.add_argument("--force-locked", action="store_true",
+    forced = parser.add_mutually_exclusive_group()
+    forced.add_argument("--force-locked", action="store_true",
                         help="pretend the screen is locked (to test the policy)")
-    parser.add_argument("--force-unlocked", action="store_true",
+    forced.add_argument("--force-unlocked", action="store_true",
                         help="pretend the screen is unlocked")
     parser.add_argument("--agent", action="store_true",
                         help="accept decisions from a desktop notification "

@@ -200,7 +200,7 @@ class FixedPortExemption(unittest.TestCase):
         self.assertIsNone(self.policy.is_protected(self._device_at(child)))
 
     def test_bus_view_path_still_resolves_to_the_real_chain(self):
-        internal = self.fake.add_device("1-8", removable="fixed")
+        self.fake.add_device("1-8", removable="fixed")
         self.assertIsNotNone(
             self.policy.is_protected(self._device_at(self.fake.bus / "1-8")),
             "the flat bus view must be resolved before the chain is walked")

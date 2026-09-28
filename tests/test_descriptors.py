@@ -163,7 +163,6 @@ class TestParser(unittest.TestCase):
 # test_descriptors_malformed.py — Regression tests για το αμυντικό parsing.
 # =========================================================================
 
-import sys
 
 # Δουλεύει και ως μέρος του πακέτου (pytest από τη ρίζα του repo)
 # και σκέτο (python test_descriptors_malformed.py μέσα στον φάκελο).
