@@ -212,7 +212,7 @@ def render_medium(medium, findings: Sequence[rules.Finding]) -> str:
 
     out: List[str] = []
     out.append("")
-    out.append(_bold("MEDIUM") + _dim(" · read-only, never mounted"))
+    out.append(_bold("CONTENTS") + _dim(" · read-only, never mounted"))
     out.append(_dim("─" * WIDTH))
 
     if medium.error:

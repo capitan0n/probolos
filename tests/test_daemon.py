@@ -977,26 +977,34 @@ class ThePromptOffersWhatItAccepts(unittest.TestCase):
     entry that admits that device silently from then on.
     """
 
-    def _prompt_for(self, *, timeout, has_trust):
+    def _engine(self, *, timeout, has_trust, writable=True):
+        from probolos import daemon as daemon_mod
+
+        engine = daemon_mod.Probolos.__new__(daemon_mod.Probolos)
+        engine.timeout = timeout
+        engine.trust = (mock.Mock(**{"writable.return_value": writable})
+                        if has_trust else None)
+        engine.agent = None
+        engine.observe = 0
+        return engine
+
+    def _prompt_for(self, *, timeout, has_trust, writable=True, typed=""):
         import io
         import sys as _sys
 
         from probolos import daemon as daemon_mod
 
-        engine = daemon_mod.Probolos.__new__(daemon_mod.Probolos)
-        engine.timeout = timeout
-        engine.trust = object() if has_trust else None
-        engine.agent = None
-        engine.observe = 0
-
+        engine = self._engine(timeout=timeout, has_trust=has_trust,
+                              writable=writable)
         captured = io.StringIO()
         real_stdout, real_stdin = _sys.stdout, _sys.stdin
         _sys.stdout = captured
-        _sys.stdin = io.StringIO("")      # EOF -> denied, after the prompt
+        _sys.stdin = io.StringIO(typed)   # "" = EOF -> denied, after the prompt
         try:
-            daemon_mod.Probolos._ask(engine, dev=None, findings=())
+            self.answer = daemon_mod.Probolos._ask(engine, dev=None,
+                                                   findings=())
         except Exception:
-            pass
+            self.answer = None
         finally:
             _sys.stdout, _sys.stdin = real_stdout, real_stdin
         return captured.getvalue()
@@ -1009,6 +1017,40 @@ class ThePromptOffersWhatItAccepts(unittest.TestCase):
     def test_no_always_is_offered_without_a_trust_store(self):
         text = self._prompt_for(timeout=30.0, has_trust=False)
         self.assertNotIn("[a]lways", text.lower())
+
+    def test_no_always_is_offered_when_trust_cannot_be_saved(self):
+        """Under --privsep the analyzer reads trust and cannot write it; an
+        "always" there admitted once and silently lost the trust entry."""
+        for timeout in (0.0, 30.0):
+            text = self._prompt_for(timeout=timeout, has_trust=True,
+                                    writable=False)
+            self.assertNotIn("[a]lways", text.lower())
+
+    def _answered_after(self, typed):
+        import io
+        import sys as _sys
+        from probolos import daemon as daemon_mod
+        engine = self._engine(timeout=0.0, has_trust=False)
+        real = _sys.stdin, _sys.stdout
+        _sys.stdin, _sys.stdout = io.StringIO(typed), io.StringIO()
+        try:
+            approved = daemon_mod.Probolos._ask(engine, dev=None, findings=())
+        finally:
+            _sys.stdin, _sys.stdout = real
+        return approved, engine._answered
+
+    def test_no_input_denies_but_is_not_an_answer(self):
+        """The service's stdin is /dev/null: EOF must deny, and must not be
+        recorded as a person saying no."""
+        self.assertEqual(self._answered_after(""), (False, False))
+
+    def test_a_typed_no_is_an_answer(self):
+        self.assertEqual(self._answered_after("n\n"), (False, True))
+
+    def test_always_typed_anyway_is_not_accepted_when_not_offered(self):
+        self._prompt_for(timeout=0.0, has_trust=True, writable=False,
+                         typed="a\n")
+        self.assertFalse(self.answer)
 
 
 class LoginctlTimeoutIsContained(unittest.TestCase):

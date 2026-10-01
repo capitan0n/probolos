@@ -34,6 +34,10 @@ Type=simple
 # gate still closed -- instead of handing the prompt to whichever account
 # happened to be logged in when the service started.
 Environment=PROBOLOS_AGENT_USER=nobody
+# Unbuffered: Python block-buffers a pipe, so without this nothing
+# reached the journal until the process exited, and every line of a
+# run arrived at once with the exit's timestamp.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -m probolos --privsep --timeout 0 \
           --agent --agent-user ${PROBOLOS_AGENT_USER}
 Restart=on-failure
@@ -57,7 +61,11 @@ ProtectHome=yes
 StateDirectory=probolos
 StateDirectoryMode=0755
 RuntimeDirectory=probolos
-RuntimeDirectoryMode=0750
+# 2750, not 0750: the setgid bit makes the agent socket inherit the desktop
+# user's group (see agentlink.prepare_socket_dir). It must be set HERE, by
+# systemd, because RestrictSUIDSGID=yes below refuses the service any chmod
+# that carries it.
+RuntimeDirectoryMode=2750
 # /sys must be writable: the entire mechanism is writing `authorized` and
 # `authorized_default`. This is the one broad permission the design requires,
 # and it is why the privileged half is kept small enough to audit.

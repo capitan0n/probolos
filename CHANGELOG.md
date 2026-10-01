@@ -2,9 +2,99 @@
 
 All notable changes to Probolos. Versioning is semantic.
 
-## [Unreleased] — quality pass
+## [0.10.0] — 2026-10-01 · quality pass
+
+### Added
+
+- **The desktop prompt asks with as much friction as the device earns.**
+  One dialog for a device that can neither type nor carry traffic and showed
+  nothing suspicious; a second "switch it on?" when it can (keyboard/HID,
+  network, radio, vendor-specific, or anything unknown) or when a warning was
+  found. The dialogs now say what the device is in plain words and which port
+  it is on, list every finding (most severe first; "...and 1 more" hid
+  warnings), and name what THIS device will be able to do. The notification
+  is one line instead of a copy of the dialog.
+- **Critical devices can be approved from the desktop, after a 10 s
+  countdown.** They used to be approvable only by typing `authorize` in the
+  terminal, which the service does not have -- so under the service a known
+  device after a firmware update could not be approved at all. "Allow anyway"
+  now stays disabled for 10 seconds (a real countdown button with tkinter; a
+  read-first window before the question with kdialog/zenity), "always" is
+  never offered, and the daemon refuses an approval that arrives sooner,
+  whatever sent it. A previously refused device is now CRITICAL too, so it
+  gets the countdown. The window's warning fits the finding ("allow it only
+  if refusing it was a mistake" rather than "matches an attack pattern" for a
+  refused stick), and with tkinter it is drawn in the desktop's own colours
+  and font from `~/.config/kdeglobals`. Every refusal button reads "Keep
+  blocked".
+
+- **`sudo ./install.sh`** runs Probolos as a background service in one step:
+  root-owned code in `/opt/probolos`, a `probolos` command (run with `-I`, so
+  a `probolos/` folder in the current directory is never executed as root),
+  both systemd units with drop-ins for the local settings, and the prompt
+  enabled only for the account that ran `sudo`. Re-run to update;
+  `--uninstall` removes it and keeps `/var/lib/probolos`.
+- **`--remove-trusted N|PATTERN|all`** replaces `--forget` (still accepted).
+  It says plainly that device history is kept, which is what the old
+  "Forgot all 0 device(s)" left users wondering about. `all` asks first.
+- **`--remove-all`** clears remembered devices and the device history
+  together. It always asks, lists the devices whose descriptor-drift
+  evidence would be erased, refuses while a daemon holds the history, and
+  takes `-y/--yes` for scripts. Without a terminal and without `--yes` it
+  refuses rather than guess.
 
 ### Fixed
+
+- **A crashed tkinter dialog answered for the user.** Python exits 1 on any
+  uncaught exception, and the tkinter dialogs used exit 1 for an answer:
+  "no" from confirm(), and "Always allow" from choose() -- reached after the
+  person had clicked Allow once, so a crash there trusted the device for
+  good. Answers now use their own exit codes and anything else is "no
+  decision". tkinter also counts as available only when it can open a
+  window, not merely import, so a service with no `$DISPLAY` falls back to
+  kdialog/zenity instead of refusing every critical device unseen.
+- **The journal showed nothing until a service exited.** Python
+  block-buffers a pipe; both units now set `PYTHONUNBUFFERED=1`, so events
+  are logged when they happen.
+- **Unanswered prompts were recorded as refusals.** A dialog left to time out
+  came back as "Keep blocked", and under the service a question nobody
+  answered fell through to the terminal, read EOF from `/dev/null`, and was
+  logged as `user rejected` -- so the next plug warned "You have refused this
+  device before" about a refusal nobody made. The device is still denied,
+  but recorded as `no answer`; only a real click or keystroke counts as a
+  refusal.
+- **Two gates could run at once, and the second reopened the ports.** A
+  probolos started by hand beside the service took the closed gate for a
+  crashed run, asked about the same devices, and set `authorized_default=1`
+  on exit while the service still believed it was guarding. A gate now takes
+  a root-only lock (`/var/lib/probolos/instance.lock`) before touching
+  anything, and a second one refuses to start. `--dry-run` never takes it.
+- **"Always allow" was offered where it could not be kept.** Under
+  `--privsep` the analyzer can read the trust store but never write it, so
+  the answer admitted the device once and lost the trust entry. "Always" is
+  now offered (and accepted) only when the trust store is writable, in the
+  dialog and the terminal alike, and startup says so.
+- The partition warnings blamed the device ("how a device lies about its own
+  capacity"). A genuine drive holding an image made for a larger disk trips
+  them too, so they now name both causes and point to a capacity test.
+- **The shipped service crash-looped with the gate open.** `probolos.service`
+  sets `RestrictSUIDSGID=yes`, which refuses any chmod carrying the setgid
+  bit, and the launcher chmodded `/run/probolos` to `2750` on every start:
+  `could not prepare the agent socket directory: [Errno 1] Operation not
+  permitted`, a restart every five seconds, and USB devices admitted with no
+  prompt. systemd now creates the directory `2750` itself
+  (`RuntimeDirectoryMode`), and the launcher chmods only when the mode is not
+  already right, so the hardening stays on.
+- **Revoking trust did not reach a running daemon.** The daemon read the
+  trust store once at startup, so a device removed with `--forget` stayed
+  admitted without a prompt until a restart, and the next admission of any
+  remembered device wrote the revoked entry back to disk. The store is now
+  re-read whenever the file changes (including a chmod that makes it
+  untrustworthy, which fails closed), and saves keep the file's read bits
+  so a root-run edit no longer locks a `--privsep` analyzer out of it. The
+  ledger is deliberately not reloaded the same way: its directory belongs to
+  `nobody` under `--privsep`, so `--remove-all` waits for the daemon to stop
+  instead.
 
 - **A malformed `--rules` file ended in a traceback.** `yaml.YAMLError` is not
   a `ValueError`, so a YAML syntax error escaped the entry point's handler; it
@@ -72,7 +162,7 @@ All notable changes to Probolos. Versioning is semantic.
 - README: the install step for `pyudev`, PyYAML as an optional requirement,
   and `tests/audit/` references corrected — that directory no longer exists.
 
-## [Unreleased] — input that crossed a boundary
+## [0.10.0] · input that crossed a boundary
 
 Four findings, each reproduced against the unpatched tree before it was fixed.
 Regression tests are in `tests/test_escape_and_terminal_boundaries.py`.
@@ -103,7 +193,7 @@ Regression tests are in `tests/test_escape_and_terminal_boundaries.py`.
   which let a device add lines to the prompt. Backslashes in the dialog text
   are now doubled, which both tools decode back to one.
 
-## [Unreleased] — the sixth review
+## [0.10.0] · the sixth review
 
 A pass over the privilege boundary, the agent socket and the parsers. Every
 finding below has a regression test under `tests/audit/`, each proven to fail

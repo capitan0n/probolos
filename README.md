@@ -87,7 +87,21 @@ python3 -m probolos.agent          # in your graphical session
 `--privsep` runs the analyzer as `nobody` and routes privileged operations
 through a separate gate. The trusted code also includes startup preparation,
 protocol handling and cleanup; it is not a 150-line security boundary.
-`--agent` moves the prompt into a desktop dialog.
+`--agent` moves the prompt into a desktop dialog: one dialog for a plain
+storage device, a second confirmation for anything that can type or carry
+traffic or showed a warning, and a 10-second countdown before "Allow anyway"
+for a critical finding (a refused device returning, a changed identity).
+
+### Run it in the background
+
+```bash
+sudo ./install.sh              # install and start; re-run after pulling to update
+sudo ./install.sh --uninstall  # stop and remove (history is kept)
+```
+
+This installs the code to `/opt/probolos` (root-owned), a `probolos` command
+(`sudo probolos --history`), the gate as a system service with `--privsep`, and
+the desktop prompt as a user service for the account that ran `sudo`.
 
 ### Stop automount racing the scan
 
@@ -158,7 +172,9 @@ of watched readers read-only and switch those readers off. See `SECURITY.md`.
 | `--agent` | ask via a desktop dialog instead of the terminal |
 | `--dry-run` | report everything, change nothing |
 | `--list` | read-only inventory of attached devices; never closes the gate |
-| `--trusted` / `--forget N` | list and revoke remembered devices |
+| `--trusted` / `--remove-trusted N\|all` | list and revoke remembered devices (history is kept) |
+| `--history [-v]` | every device seen, its decisions and descriptor drift |
+| `--remove-all` | clear remembered devices **and** history; asks first, refuses while the daemon runs |
 | `--no-storage-scan` | skip stage 4 entirely |
 | `--watch-media` | inspect and alert on cards inserted into admitted readers (detection only) |
 | `--media-policy log\|deauthorize` | with `--watch-media`: on a CRITICAL media finding, log (default) or drop the whole reader |
@@ -195,7 +211,8 @@ echo 1 | sudo tee /sys/bus/usb/devices/usb1/authorized_default
 
 ## Running as a service
 
-See [`systemd/README.md`](systemd/README.md) for the two units (a system
+`sudo ./install.sh` does all of it. See [`systemd/README.md`](systemd/README.md)
+for what it sets up by hand: the two units (a system
 service for the gate, a user service for the agent) and what the sandboxing
 does.
 

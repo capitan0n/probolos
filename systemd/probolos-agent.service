@@ -9,6 +9,10 @@ After=graphical-session.target
 
 [Service]
 Type=simple
+# Unbuffered: Python block-buffers a pipe, so without this nothing
+# reached the journal until the process exited, and every line of a
+# run arrived at once with the exit's timestamp.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -m probolos.agent
 # The socket may not exist yet if the system service is still starting, and the
 # session may outlive a Probolos restart. Retrying quietly is correct here.

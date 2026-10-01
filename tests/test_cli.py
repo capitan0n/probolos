@@ -34,6 +34,7 @@ class AgentUserMustNotBeTheAnalyzerAccount(unittest.TestCase):
 
         with mock.patch.object(cli, "require_usb"), \
                 mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "claim_the_gate"), \
                 mock.patch.object(cli.sysfs, "install_backend"), \
                 mock.patch.object(cli.daemon, "serve",
                                   side_effect=lambda **kw: served.update(kw)), \
@@ -128,6 +129,7 @@ class CommandLineWiring(unittest.TestCase):
 
         with mock.patch.object(cli, "require_usb"), \
              mock.patch.object(cli, "require_root"), \
+             mock.patch.object(cli, "claim_the_gate"), \
              mock.patch.object(privsep, "start", fake_start), \
              mock.patch.object(cli.daemon, "serve",
                                side_effect=lambda **kw: captured.update(kw)), \
@@ -226,3 +228,199 @@ class VersionHasOneSource(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ==========================================================================
+# --remove-trusted / --remove-all
+# ==========================================================================
+
+class RemoveCommands(unittest.TestCase):
+    """
+    Two stores, two commands. --remove-trusted revokes trust and keeps the
+    history; --remove-all clears both, always asks, and refuses while a
+    daemon holds the history in memory (it would write it straight back).
+    """
+
+    def setUp(self):
+        import tempfile
+        from probolos import ledger as ledger_mod, trust as trust_mod
+        from tests._support import descriptor_blob, make_device
+        self.ledger_mod = ledger_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.trust_path = root / "trusted.json"
+        self.ledger_path = root / "state" / "ledger.json"
+
+        store = trust_mod.TrustStore(self.trust_path)
+        store.trust(make_device())
+        self.assertIsNone(store.save())
+
+        # Same identity, then an added keyboard interface: descriptor drift.
+        led = ledger_mod.Ledger(self.ledger_path)
+        led.record(make_device(), "user approved", approved=True)
+        led.record(make_device(raw=descriptor_blob((0x08, 0x06, 0x50),
+                                                   (0x03, 0x01, 0x01))),
+                   "user rejected")
+        self.assertIsNone(led.save())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *argv, tty=True, answer="y"):
+        out = io.StringIO()
+        stdin = mock.Mock()
+        stdin.isatty.return_value = tty
+        with mock.patch.object(cli, "require_usb"), \
+             mock.patch.object(cli, "require_root") as root, \
+             mock.patch.object(cli.sys, "stdin", stdin), \
+             mock.patch("builtins.input", return_value=answer) as asked, \
+             redirect_stdout(out):
+            cli.main([*argv, "--trust-file", str(self.trust_path),
+                      "--ledger", str(self.ledger_path)])
+        root.assert_not_called()          # never reaches the gate
+        return out.getvalue(), asked
+
+    def _trusted_count(self):
+        from probolos import trust as trust_mod
+        return len(trust_mod.TrustStore(self.trust_path).devices)
+
+    # ---- --remove-trusted ------------------------------------------------
+
+    def test_one_entry_goes_without_a_question_and_history_stays(self):
+        out, asked = self._run("--remove-trusted", "1")
+        asked.assert_not_called()
+        self.assertEqual(self._trusted_count(), 0)
+        self.assertTrue(self.ledger_path.exists())
+        self.assertIn("history is kept", out)
+
+    def test_all_asks_and_no_keeps_everything(self):
+        out, asked = self._run("--remove-trusted", "all", answer="n")
+        asked.assert_called_once()
+        self.assertEqual(self._trusted_count(), 1)
+        self.assertIn("Nothing removed", out)
+
+    def test_all_with_yes_skips_the_question(self):
+        _, asked = self._run("--remove-trusted", "all", "--yes")
+        asked.assert_not_called()
+        self.assertEqual(self._trusted_count(), 0)
+
+    def test_forget_is_still_accepted(self):
+        self._run("--forget", "1")
+        self.assertEqual(self._trusted_count(), 0)
+
+    # ---- --remove-all ----------------------------------------------------
+
+    def test_remove_all_clears_both_and_names_the_drift_it_erases(self):
+        out, asked = self._run("--remove-all")
+        asked.assert_called_once()
+        self.assertFalse(self.trust_path.exists())
+        self.assertFalse(self.ledger_path.exists())
+        self.assertIn("DRIFT", out)
+        self.assertIn("0951:1666", out)
+
+    def test_remove_all_declined_removes_nothing(self):
+        self._run("--remove-all", answer="")          # Enter = the default, No
+        self.assertTrue(self.trust_path.exists())
+        self.assertTrue(self.ledger_path.exists())
+
+    def test_remove_all_without_a_terminal_refuses(self):
+        with self.assertRaises(SystemExit) as caught:
+            self._run("--remove-all", tty=False)
+        self.assertIn("--yes", str(caught.exception))
+        self.assertTrue(self.ledger_path.exists())
+
+    def test_remove_all_refuses_while_a_daemon_holds_the_history(self):
+        import os
+        fd = self.ledger_mod.claim(self.ledger_path)
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                self._run("--remove-all", "--yes")
+        finally:
+            os.close(fd)
+        self.assertIn("running", str(caught.exception))
+        self.assertTrue(self.trust_path.exists())
+        self.assertTrue(self.ledger_path.exists())
+
+    def test_nothing_there_says_so(self):
+        self.trust_path.unlink()
+        self.ledger_path.unlink()
+        out, asked = self._run("--remove-all")
+        asked.assert_not_called()
+        self.assertIn("Nothing to remove", out)
+
+
+# ==========================================================================
+# One gate per machine
+# ==========================================================================
+
+class OneGatePerMachine(unittest.TestCase):
+    """
+    The service and a copy started by hand ran side by side: both asked about
+    every device, and the second copy reopened the gate when it exited.
+    """
+
+    def setUp(self):
+        import tempfile
+        from probolos import instance
+        self.instance = instance
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.object(instance, "LOCK_PATH",
+                                    Path(tmp.name) / "probolos" / "instance.lock")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _hold(self):
+        import os
+        fd = self.instance.acquire()
+        self.addCleanup(os.close, fd)
+        return fd
+
+    def test_a_second_gate_is_refused(self):
+        self._hold()
+        with self.assertRaises(self.instance.AlreadyRunning):
+            self.instance.acquire()
+
+    def test_running_reports_a_held_lock_and_only_a_held_lock(self):
+        import os
+        self.assertFalse(self.instance.running())       # no file yet
+        fd = self.instance.acquire()
+        self.assertTrue(self.instance.running())
+        os.close(fd)
+        self.assertFalse(self.instance.running())
+
+    def test_the_lock_file_is_root_only(self):
+        import os
+        import stat
+        self._hold()
+        mode = stat.S_IMODE(os.stat(self.instance.LOCK_PATH).st_mode)
+        self.assertEqual(mode & 0o077, 0, f"lock file mode {mode:04o}")
+
+    def test_main_refuses_before_touching_the_gate(self):
+        self._hold()
+        out = io.StringIO()
+        with mock.patch.object(cli, "require_usb"), \
+             mock.patch.object(cli, "require_root"), \
+             mock.patch.object(cli.daemon, "serve") as serve, \
+             redirect_stdout(out):
+            with self.assertRaises(SystemExit) as caught:
+                cli.main(["--no-trust", "--no-ledger"])
+        serve.assert_not_called()
+        self.assertIn("already running", str(caught.exception))
+        self.assertNotIn("Closing", out.getvalue())
+
+    def test_dry_run_needs_no_lock(self):
+        self._hold()
+        with mock.patch.object(cli, "require_usb"), \
+             mock.patch.object(cli.daemon, "serve") as serve, \
+             redirect_stdout(io.StringIO()):
+            cli.main(["--dry-run", "--no-trust", "--no-ledger"])
+        serve.assert_called_once()
+
+    def test_an_uncreatable_lock_does_not_stop_the_gate(self):
+        """Refusing to start would leave the ports open."""
+        with mock.patch.object(self.instance, "acquire",
+                               side_effect=PermissionError(13, "denied")), \
+             redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(cli.claim_the_gate())
+        self.assertIn("could not check", out.getvalue())

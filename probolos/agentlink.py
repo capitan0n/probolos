@@ -122,9 +122,16 @@ ANSWER_YES = "yes"
 ANSWER_ALWAYS = "always"
 ANSWER_NO = "no"
 # Not a decision. Sent by the agent when it has no way to show a dialog at all,
-# so the analyzer can tell "the user refused" apart from "the user was never
-# asked" and fall back to the terminal instead of silently denying everything.
+# or when nobody answered the dialog in time, so the analyzer can tell "the
+# user refused" apart from "the user never answered" and fall back to the
+# terminal instead of silently denying everything.
 ANSWER_UNAVAILABLE = "unavailable"
+
+# How the agent asks, from least to most friction. Chosen by the daemon per
+# device (daemon.Probolos._prompt_steps).
+STEPS_ONE = "one"               # one dialog: allow / keep blocked
+STEPS_TWO = "two"               # plus a second "switch it on?" confirmation
+STEPS_COUNTDOWN = "countdown"   # CRITICAL: Allow unlocks after a countdown
 
 MAX_MESSAGE = 16384
 
@@ -224,7 +231,15 @@ def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
     fd = open_directory(directory, create=True)
     try:
         os.fchown(fd, owner_uid, group_gid)
-        os.fchmod(fd, 0o2750)
+        # Only when the mode is not already right. The shipped unit runs with
+        # RestrictSUIDSGID=yes, which refuses ANY chmod carrying the setgid
+        # bit -- even one that changes nothing -- so the service crashed here
+        # on every start and the gate never closed. There systemd creates the
+        # directory 2750 itself (RuntimeDirectoryMode), before the sandbox
+        # applies. Checking after the chown is sound: the kernel clears setgid
+        # on chown only for non-directories.
+        if (os.fstat(fd).st_mode & 0o7777) != 0o2750:
+            os.fchmod(fd, 0o2750)
     finally:
         os.close(fd)
 
@@ -527,7 +542,9 @@ class AgentLink:
     # ---- asking ----
 
     def ask(self, title: str, body: str, severity: str,
-            allow_always: bool, timeout: float) -> Optional[str]:
+            allow_always: bool, timeout: float, *, steps: str = STEPS_TWO,
+            capabilities: str = "", countdown: float = 0,
+            note: str = "") -> Optional[str]:
         """
         Put a question to the agent and wait for an answer.
 
@@ -567,6 +584,13 @@ class AgentLink:
             "severity": severity,
             "allow_always": allow_always,
             "timeout": timeout,
+            # How the agent asks (STEPS_*), what the device will be
+            # able to do, and how long "Allow" stays disabled. The countdown is
+            # enforced by the daemon too; the agent only makes it visible.
+            "steps": steps,
+            "capabilities": capabilities,
+            "countdown": countdown,
+            "note": note,               # the countdown window's warning line
         }
         try:
             conn.sendall((json.dumps(message) + "\n").encode())

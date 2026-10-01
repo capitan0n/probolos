@@ -825,7 +825,7 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
 
     if report.error:
         add("storage-unreadable", Severity.NOTICE,
-            "The medium could not be read",
+            "The drive's contents could not be read",
             f"{report.error}. Its contents were not examined, so this device "
             "was judged on its declared identity alone.")
         return out
@@ -842,11 +842,13 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
         if len(report.suspicious) > 4:
             detail += f"; and {len(report.suspicious) - 4} more"
         add("impossible-partition-geometry", Severity.WARNING,
-            "The medium describes structures that cannot exist",
+            "Its partition table describes things that cannot exist",
             f"{detail}. These were not read, deliberately: seeking to an "
-            "offset a device invented is how a partition table becomes an "
-            "instruction rather than a description. Honest media do not "
-            "produce this.")
+            "offset the drive invented is how a partition table becomes an "
+            "instruction rather than a description. Ordinary formatting does "
+            "not produce this; an image made for a larger disk copied onto "
+            "this one does, and so does a device misreporting its capacity. "
+            "A capacity test such as f3probe tells the two apart.")
 
     # -- 0b. A filesystem signature with nothing behind it ------------------
     # The signature is not reported as a filesystem (storage.identify_
@@ -858,9 +860,9 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
         add("filesystem-signature-without-structure", Severity.NOTICE,
             "A filesystem signature is present without the filesystem",
             f"{'; '.join(hollow[:4])}. The identifying bytes are there but "
-            "the volume structure they introduce is not, so the medium is not "
+            "the volume structure they introduce is not, so the drive is not "
             "reported as that filesystem. Ordinary formatting does not produce "
-            "this. Corruption can, and so can bytes planted to make the medium "
+            "this. Corruption can, and so can bytes planted to make the drive "
             "look like something it is not.")
 
     partitions = [p for p in report.partitions
@@ -873,13 +875,16 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
             if part.end_lba > size:
                 over = part.end_lba - size
                 add("partition-beyond-end-of-device", Severity.WARNING,
-                    "A partition claims space past the end of the device",
+                    "A partition claims more space than the drive has",
                     f"Partition {part.index + 1} ends at sector "
-                    f"{part.end_lba} on a device of {size} sectors, "
-                    f"{over} sectors too far. This cannot happen on honestly "
-                    "written media; it is how a device lies about its own "
-                    "capacity, and reading it will not return what was "
-                    "written.")
+                    f"{part.end_lba} on a drive of {size} sectors, "
+                    f"{over} sectors too far. Ordinary formatting does not "
+                    "produce this. Usually an image made for a larger disk "
+                    "was copied onto this one; it can also be a device "
+                    "misreporting its capacity. Either way the filesystem "
+                    "expects space that is not there, and writes past the "
+                    "real end are lost. A capacity test such as f3probe "
+                    "tells the two apart.")
                 break
 
     # -- 2. Partitions that overlap each other -------------------------------
@@ -892,7 +897,7 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
                 f"{earlier.end_lba} while partition {later.index + 1} starts "
                 f"at {later.start_lba}. Overlapping partitions are impossible "
                 "to produce by ordinary formatting and mean the two views of "
-                "the medium disagree about what is stored where.")
+                "the drive disagree about what is stored where.")
             break
 
     # -- 3. Declared type versus what is actually written --------------------
@@ -904,7 +909,7 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
                 "A partition contains something other than it declares",
                 f"Partition {part.index + 1} is declared as "
                 f"{storage_mod.type_name(part.type_byte)} but contains a "
-                f"{seen} signature. Usually this is a medium that was "
+                f"{seen} signature. Usually this is a drive that was "
                 "reformatted without the partition type being updated, which "
                 "is harmless; it is reported because the two statements do "
                 "not agree.")
@@ -929,7 +934,7 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
         if not protective:
             add("gpt-without-protective-mbr", Severity.NOTICE,
                 "GPT header present without a protective MBR",
-                "A GPT-partitioned medium normally carries a protective MBR "
+                "A GPT-partitioned drive normally carries a protective MBR "
                 "so that older tools do not treat it as unpartitioned. Its "
                 "absence is unusual, though some tools produce it.")
 
@@ -972,7 +977,7 @@ def media_findings(medium, *, drift: Optional[str] = None,
 
     if locked:
         add("media-inserted-while-locked", Severity.WARNING,
-            "A medium was inserted while the session was locked",
+            "A card was inserted while the session was locked",
             "Nobody was at the machine to insert it. A card slot in a reader "
             "that was already trusted has no admission step of its own, so "
             "this is the moment it would be used by someone with brief "
@@ -989,7 +994,7 @@ def media_findings(medium, *, drift: Optional[str] = None,
             if e.type_guid == storage_mod.GPT_ESP_GUID]
     if esp:
         add("media-efi-system-partition", Severity.CRITICAL,
-            "The inserted medium carries an EFI system partition",
+            "The inserted card carries an EFI system partition",
             f"{', '.join(esp[:4])}. An EFI system partition holds boot "
             "loaders: it is what makes a card a boot payload rather than "
             "storage. Firmware can be set to boot from it, and nothing about "
@@ -1002,7 +1007,7 @@ def media_findings(medium, *, drift: Optional[str] = None,
                if e.attributes & storage_mod.GPT_ATTR_HIDDEN]
     if hidden:
         add("media-hidden-partition", Severity.CRITICAL,
-            "The inserted medium carries a hidden partition",
+            "The inserted card carries a hidden partition",
             f"{', '.join(hidden[:4])}. The type or attribute exists so that "
             "file managers and operating systems skip the partition. Data "
             "on a card that is meant not to be seen by the person using it "
@@ -1011,15 +1016,15 @@ def media_findings(medium, *, drift: Optional[str] = None,
     if drift is not None:
         if drift_known:
             add("media-layout-drift", Severity.NOTICE,
-                "This slot has seen a different medium before",
-                "The layout differs from the first medium recorded in this "
+                "This slot has seen a different card before",
+                "The layout differs from the first card recorded in this "
                 "slot of this reader, but matches one seen here since. "
                 "Usually several cards in rotation.")
         else:
             add("media-layout-drift", Severity.WARNING,
-                "A medium this slot has never seen",
+                "A card this slot has never seen",
                 "The layout (partition table, sizes, filesystem signatures) "
-                "differs from every medium recorded in this slot of this "
+                "differs from every card recorded in this slot of this "
                 "reader. A new card is often just a new card; it is reported "
                 "because the reader was trusted on the strength of a "
                 "different one.")

@@ -227,23 +227,84 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
         dev.label.return_value = "Test Stick"
         return dev
 
-    def test_critical_is_never_asked_through_the_agent(self):
+    def test_critical_is_asked_with_a_countdown_and_never_always(self):
         """
-        The whole point of the escalated terminal prompt is that it cannot be
-        satisfied by clicking. Offering a CRITICAL device to a notification
-        would undo it.
+        Under the service there is no terminal, so a CRITICAL device that could
+        only be approved by typing there could not be approved at all. It is
+        offered through the agent now -- with a countdown, and never "always".
         """
         link = mock.Mock()
         link.connected = True
-        engine = daemon_mod.Probolos(agent=link, observe=0)
+        link.ask.return_value = agentlink.ANSWER_NO
+        engine = daemon_mod.Probolos(agent=link, trust_store=mock.Mock(),
+                                     observe=0)
         finding = rules.Finding("storage-with-keyboard", rules.Severity.CRITICAL,
                                 "Storage device that can also type", "")
 
-        with mock.patch("sys.stdin", io.StringIO("no\n")):
-            engine._ask(self.device(), [finding])
+        self.assertFalse(engine._ask(self.device(), [finding]))
+        kwargs = link.ask.call_args.kwargs
+        self.assertEqual(kwargs["steps"], agentlink.STEPS_COUNTDOWN)
+        self.assertEqual(kwargs["countdown"], daemon_mod.CRITICAL_COUNTDOWN)
+        self.assertFalse(kwargs["allow_always"])
 
-        link.ask.assert_not_called()
-        link.notify_critical.assert_called_once()
+    def test_the_countdown_note_fits_the_finding(self):
+        note = daemon_mod.Probolos._critical_note
+
+        def f(rid):
+            return rules.Finding(rid, rules.Severity.CRITICAL, "t", "")
+        refused = note([f("previously-rejected")])
+        self.assertIn("refusing it was a mistake", refused)
+        self.assertNotIn("attack pattern", refused)
+        self.assertIn("why it changed", note([f("descriptor-drift")]))
+        both = note([f("previously-rejected"), f("descriptor-drift")])
+        self.assertIn("mistake", both)
+        self.assertIn("why it changed", both)
+        self.assertIn("attack pattern",
+                      note([f("previously-rejected"),
+                            f("storage-with-keyboard")]),
+                      "a real attack finding keeps the strong wording")
+        self.assertEqual(note([rules.Finding("w", rules.Severity.WARNING,
+                                             "t", "")]), "")
+
+    def test_the_note_reaches_the_agent(self):
+        link = mock.Mock()
+        link.connected = True
+        link.ask.return_value = agentlink.ANSWER_NO
+        engine = daemon_mod.Probolos(agent=link, observe=0)
+        engine._ask(self.device(), [rules.Finding(
+            "previously-rejected", rules.Severity.CRITICAL, "t", "")])
+        self.assertIn("mistake", link.ask.call_args.kwargs["note"])
+
+    def _critical_answer_after(self, seconds, answer=agentlink.ANSWER_YES):
+        link = mock.Mock()
+        link.connected = True
+        link.ask.return_value = answer
+        engine = daemon_mod.Probolos(agent=link, observe=0)
+        finding = rules.Finding("previously-rejected", rules.Severity.CRITICAL,
+                                "Changed what it claims to be", "")
+        clock = iter([100.0, 100.0 + seconds])
+        with mock.patch.object(daemon_mod.time, "monotonic",
+                               side_effect=lambda: next(clock)), \
+             mock.patch("sys.stdin", io.StringIO("")), \
+             mock.patch("sys.stdout", io.StringIO()):
+            return engine._ask(self.device(), [finding]), engine
+
+    def test_a_critical_approval_before_the_countdown_is_ignored(self):
+        """The daemon enforces the countdown too: whatever answered in 3 s,
+        it was not a person waiting for the button to unlock."""
+        approved, engine = self._critical_answer_after(3.0)
+        self.assertFalse(approved)
+        self.assertFalse(engine._answered)
+
+    def test_a_critical_approval_after_the_countdown_stands(self):
+        approved, _ = self._critical_answer_after(12.0)
+        self.assertTrue(approved)
+
+    def test_always_is_never_remembered_for_a_critical_device(self):
+        approved, engine = self._critical_answer_after(
+            12.0, answer=agentlink.ANSWER_ALWAYS)
+        self.assertTrue(approved)
+        self.assertFalse(getattr(engine, "_remember", False))
 
     def test_a_normal_device_is_asked_through_the_agent(self):
         link = mock.Mock()
@@ -264,6 +325,16 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
 
         self.assertTrue(engine._ask(self.device(), []))
         self.assertTrue(engine._remember)
+
+    def test_always_is_not_offered_when_trust_cannot_be_saved(self):
+        link = mock.Mock()
+        link.connected = True
+        link.ask.return_value = agentlink.ANSWER_YES
+        store = mock.Mock(**{"writable.return_value": False})
+        engine = daemon_mod.Probolos(agent=link, trust_store=store, observe=0)
+
+        self.assertTrue(engine._ask(self.device(), []))
+        self.assertFalse(link.ask.call_args.kwargs["allow_always"])
 
     def test_no_answer_falls_back_to_the_terminal(self):
         """
@@ -294,17 +365,310 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
                              "an explicit refusal from the agent must stand, "
                              "not be re-asked on the terminal")
 
-    def test_body_text_stays_short_enough_to_read(self):
-        """
-        A notification that must be scrolled will not be read, and an unread
-        warning trains the habit of clicking through.
-        """
-        findings = [rules.Finding(f"r{i}", rules.Severity.NOTICE,
-                                  f"Finding number {i}", "long explanation")
-                    for i in range(6)]
+    def test_every_finding_is_shown_most_severe_first(self):
+        """"...and 1 more finding(s)" hid warnings on the one screen where the
+        decision is made."""
+        findings = ([rules.Finding(f"n{i}", rules.Severity.NOTICE,
+                                   f"Notice {i}", "") for i in range(3)]
+                    + [rules.Finding("w", rules.Severity.WARNING,
+                                     "The warning", "")])
         body = daemon_mod.Probolos._agent_body(self.device(), findings)
-        self.assertLessEqual(len(body.splitlines()), 6)
-        self.assertIn("more finding", body)
+        lines = body.splitlines()
+        self.assertIn("0951:1665", lines[0])
+        self.assertIn("The warning", lines[2], "most severe first")
+        for i in range(3):
+            self.assertIn(f"Notice {i}", body)
+        self.assertNotIn("more", body)
+
+    def test_a_pathological_list_is_capped_and_says_where_the_rest_is(self):
+        findings = [rules.Finding(f"r{i}", rules.Severity.NOTICE,
+                                  f"Finding {i}", "") for i in range(12)]
+        body = daemon_mod.Probolos._agent_body(self.device(), findings)
+        self.assertIn("4 more", body)
+        self.assertIn("journalctl", body)
+
+
+def _iface(cls, sub=0, proto=0):
+    from types import SimpleNamespace
+    return SimpleNamespace(interface_class=cls, interface_subclass=sub,
+                           interface_protocol=proto)
+
+
+class PromptFrictionMatchesTheRisk(unittest.TestCase):
+    """Two dialogs for everything trains the reflex to click through both."""
+
+    def device(self, *interfaces):
+        dev = mock.Mock(spec=sysfs.UsbDevice)
+        dev.name = "3-9"
+        dev.interfaces = list(interfaces)
+        dev.claims = []
+        return dev
+
+    def steps(self, dev, *severities):
+        findings = [rules.Finding(f"f{i}", sev, "t", "")
+                    for i, sev in enumerate(severities)]
+        return daemon_mod.Probolos._prompt_steps(dev, findings)
+
+    def test_a_clean_storage_device_gets_one_dialog(self):
+        self.assertEqual(self.steps(self.device(_iface(0x08, 6, 0x50))),
+                         agentlink.STEPS_ONE)
+
+    def test_a_notice_does_not_add_a_step(self):
+        self.assertEqual(self.steps(self.device(_iface(0x08)),
+                                    rules.Severity.NOTICE),
+                         agentlink.STEPS_ONE)
+
+    def test_a_warning_adds_the_second_confirmation(self):
+        self.assertEqual(self.steps(self.device(_iface(0x08)),
+                                    rules.Severity.WARNING),
+                         agentlink.STEPS_TWO)
+
+    def test_anything_that_can_type_or_carry_traffic_gets_two(self):
+        for cls in (0x03, 0x02, 0x0A, 0xE0, 0xFF, 0x42):
+            self.assertEqual(self.steps(self.device(_iface(0x08), _iface(cls))),
+                             agentlink.STEPS_TWO, f"class 0x{cls:02x}")
+
+    def test_unknown_interfaces_are_not_assumed_safe(self):
+        self.assertEqual(self.steps(self.device()), agentlink.STEPS_TWO)
+
+    def test_critical_gets_the_countdown(self):
+        self.assertEqual(self.steps(self.device(_iface(0x08)),
+                                    rules.Severity.CRITICAL),
+                         agentlink.STEPS_COUNTDOWN)
+
+    def test_title_and_capabilities_are_plain_and_specific(self):
+        dev = self.device(_iface(0x08, 6, 0x50), _iface(0x03, 1, 1))
+        title = daemon_mod.Probolos._agent_title(dev)
+        self.assertIn("USB storage", title)
+        self.assertIn("keyboard", title)
+        self.assertIn("port 3-9", title)
+        caps = daemon_mod.Probolos._agent_capabilities(dev)
+        self.assertIn("read and write files", caps)
+        self.assertIn("type", caps)
+        self.assertNotIn("network", caps, "only what THIS device declared")
+
+
+class AgentAsksWithTheRightFriction(unittest.TestCase):
+
+    def build(self):
+        from probolos import agent as agent_mod
+        agent = agent_mod.Agent.__new__(agent_mod.Agent)
+        agent.log = lambda *a: None
+        agent.notifier = mock.Mock(**{"available.return_value": True,
+                                      "notify.return_value": 7})
+        agent.dialog = mock.Mock()
+        agent.countdown_dialog = mock.Mock()
+        agent.sock = None
+        return agent
+
+    def ask(self, agent, **fields):
+        return agent._ask_user({"title": "USB storage · port 3-9",
+                                "body": "Stick · 0951:1665",
+                                "capabilities": "read and write files",
+                                **fields}, 60)
+
+    def test_one_step_is_a_single_dialog(self):
+        agent = self.build()
+        agent.dialog.confirm.return_value = True
+        self.assertEqual(self.ask(agent, steps=agentlink.STEPS_ONE),
+                         agentlink.ANSWER_YES)
+        self.assertEqual(agent.dialog.confirm.call_count, 1)
+        self.assertIn("read and write files",
+                      agent.dialog.confirm.call_args.kwargs["text"])
+
+    def test_one_step_with_remembering_offers_the_three_choices_at_once(self):
+        from probolos import dialogs
+        agent = self.build()
+        agent.dialog.choose.return_value = dialogs.CHOICE_ALWAYS
+        self.assertEqual(self.ask(agent, steps=agentlink.STEPS_ONE,
+                                  allow_always=True),
+                         agentlink.ANSWER_ALWAYS)
+        agent.dialog.confirm.assert_not_called()
+
+    def test_the_second_dialog_names_what_this_device_can_do(self):
+        agent = self.build()
+        agent.dialog.confirm.side_effect = [True, True]
+        self.ask(agent, steps=agentlink.STEPS_TWO)
+        second = agent.dialog.confirm.call_args_list[1].kwargs["text"]
+        self.assertIn("read and write files", second)
+        self.assertNotIn("use the network", second)
+
+    def test_a_missing_or_unknown_step_is_the_careful_two(self):
+        agent = self.build()
+        agent.dialog.confirm.side_effect = [True, True]
+        self.ask(agent, steps="zero")
+        self.assertEqual(agent.dialog.confirm.call_count, 2)
+
+    def test_countdown_uses_the_countdown_dialog_and_only_true_approves(self):
+        agent = self.build()
+        # The fallback (main dialog) also has no answer, so None stays None.
+        agent.dialog.confirm_countdown.return_value = None
+        for result, expected in ((True, agentlink.ANSWER_YES),
+                                 (False, agentlink.ANSWER_NO),
+                                 (None, agentlink.ANSWER_UNAVAILABLE),
+                                 (mock.Mock(), agentlink.ANSWER_NO)):
+            agent.countdown_dialog.confirm_countdown.return_value = result
+            self.assertEqual(self.ask(agent, steps=agentlink.STEPS_COUNTDOWN,
+                                      countdown=10, allow_always=True),
+                             expected)
+        kwargs = agent.countdown_dialog.confirm_countdown.call_args.kwargs
+        self.assertEqual(kwargs["delay"], 10)
+        agent.dialog.choose.assert_not_called()
+
+    def test_the_countdown_window_shows_the_note_it_was_sent(self):
+        agent = self.build()
+        agent.countdown_dialog.confirm_countdown.return_value = False
+        self.ask(agent, steps=agentlink.STEPS_COUNTDOWN, countdown=10,
+                 note="You refused this device before.")
+        text = agent.countdown_dialog.confirm_countdown.call_args.kwargs["text"]
+        self.assertIn("You refused this device before.", text)
+        self.assertNotIn("attack pattern", text)
+
+    def test_every_refusal_button_says_keep_blocked(self):
+        from probolos import dialogs
+        agent = self.build()
+        agent.dialog.confirm.side_effect = [True, False]
+        self.ask(agent, steps=agentlink.STEPS_TWO)
+        self.assertEqual(agent.dialog.confirm.call_args.kwargs["no_label"],
+                         "Keep blocked")
+        agent.dialog.confirm.side_effect = [True]
+        agent.dialog.choose.return_value = dialogs.CHOICE_NO
+        self.ask(agent, steps=agentlink.STEPS_TWO, allow_always=True)
+        self.assertEqual(agent.dialog.choose.call_args.kwargs["no_label"],
+                         "Keep blocked")
+
+    def test_the_countdown_is_never_shorter_than_ten_seconds(self):
+        from probolos import agent as agent_mod
+        for value, expected in ((0, 10), (3, 10), ("x", 10), (None, 10),
+                                (float("nan"), 10), (15, 15), (999, 30)):
+            self.assertEqual(agent_mod._countdown(value), expected, value)
+
+    def test_the_notification_is_one_line_not_the_dialog_again(self):
+        agent = self.build()
+        agent.dialog.confirm.return_value = False
+        self.ask(agent, steps=agentlink.STEPS_TWO)
+        title, text = agent.notifier.notify.call_args.args[:2]
+        self.assertEqual(title, "USB device blocked")
+        self.assertNotIn("0951:1665", text)
+        self.assertLessEqual(len(text.splitlines()), 2)
+
+
+class CountdownDialogs(unittest.TestCase):
+    """kdialog and zenity cannot disable a button, so they show the findings
+    in a window that approves nothing first; tkinter draws a real countdown."""
+
+    def backend(self):
+        from probolos import dialogs
+        b = dialogs.KDialogBackend()
+        b._binary = "/usr/bin/kdialog"
+        return b
+
+    def test_closing_the_first_window_early_keeps_it_blocked(self):
+        b = self.backend()
+        with mock.patch.object(b, "notice", return_value=True), \
+             mock.patch.object(b, "confirm") as confirm:
+            self.assertIs(b.confirm_countdown("t", "x", "Allow", "No", 10, 60),
+                          False)
+        confirm.assert_not_called()
+
+    def test_the_question_comes_only_after_the_countdown(self):
+        b = self.backend()
+        with mock.patch.object(b, "notice", return_value=False) as notice, \
+             mock.patch.object(b, "confirm", return_value=True) as confirm:
+            self.assertIs(b.confirm_countdown("t", "x", "Allow", "No", 10, 60),
+                          True)
+        self.assertEqual(notice.call_args.kwargs["timeout"], 10)
+        self.assertLessEqual(confirm.call_args.args[4], 60)
+
+    def test_a_window_that_cannot_be_shown_is_no_decision(self):
+        b = self.backend()
+        with mock.patch.object(b, "notice", return_value=None):
+            self.assertIsNone(b.confirm_countdown("t", "x", "A", "N", 10, 60))
+
+    def test_kdialog_notice_outcomes(self):
+        from probolos import dialogs
+        b = self.backend()
+        run = dialogs.subprocess
+        cases = ((run.TimeoutExpired(cmd="kdialog", timeout=10), False),
+                 (OSError("no display"), None))
+        for effect, expected in cases:
+            with mock.patch.object(run, "run", side_effect=effect):
+                self.assertIs(b.notice("t", "x", 10), expected)
+        with mock.patch.object(run, "run", return_value=mock.Mock(returncode=0)):
+            self.assertIs(b.notice("t", "x", 10), True)
+
+    def test_tkinter_countdown_outcomes(self):
+        from probolos import dialogs
+        b = dialogs.TkinterBackend()
+        with mock.patch.object(dialogs.subprocess, "run",
+                               return_value=mock.Mock(returncode=11)) as run:
+            b.confirm_countdown("t", "x", "A", "N", 10, 60)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[1], "-I", "isolated from env and cwd")
+        self.assertTrue(argv[2].endswith("countdown_dialog.py"))
+        self.assertTrue(Path(argv[2]).is_file())
+        # 1 is what Python exits with on ANY crash (no $DISPLAY, say): it is
+        # no decision, never "Keep blocked" and never an approval.
+        for code, expected in ((10, True), (11, False), (0, None), (1, None),
+                               (2, None)):
+            with mock.patch.object(dialogs.subprocess, "run",
+                                   return_value=mock.Mock(returncode=code)):
+                self.assertIs(b.confirm_countdown("t", "x", "A", "N", 10, 60),
+                              expected, f"exit {code}")
+        with mock.patch.object(dialogs.subprocess, "run",
+                               side_effect=dialogs.subprocess.TimeoutExpired(
+                                   cmd="python", timeout=60)):
+            self.assertIsNone(b.confirm_countdown("t", "x", "A", "N", 10, 60))
+
+    def test_the_window_takes_kde_colours_and_font_and_ignores_junk(self):
+        import configparser
+        from probolos import countdown_dialog as cd
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read_string(
+            "[Colors:Window]\nBackgroundNormal=32,35,38\n"
+            "ForegroundNormal=252,252,252\nForegroundNegative=999,0,0\n"
+            "[Colors:Selection]\nBackgroundNormal=not,a,colour\n"
+            "[General]\nfont=Noto Sans,10,-1,5,50,0,0,0,0,0\n")
+        colors = cd.kde_colors(parser)
+        self.assertEqual(colors["bg"], "#202326")
+        self.assertEqual(colors["fg"], "#fcfcfc")
+        self.assertNotIn("danger", colors, "out-of-range values are dropped")
+        self.assertNotIn("accent", colors)
+        self.assertEqual(cd.kde_font(parser), ("Noto Sans", 10))
+        empty = configparser.ConfigParser()
+        self.assertEqual(cd.kde_colors(empty), {})
+        self.assertIsNone(cd.kde_font(empty))
+
+    def test_a_crashed_tk_is_never_always_allow(self):
+        """choose() mapped exit 1 to "Always allow", and Python exits 1 on any
+        crash -- reached only after the person clicked Allow once."""
+        from probolos import dialogs
+        b = dialogs.TkinterBackend()
+        for code in (0, 1, 2):
+            with mock.patch.object(dialogs.subprocess, "run",
+                                   return_value=mock.Mock(returncode=code)):
+                self.assertIsNone(b.choose("t", "x", "o", "a", "n", 5))
+                self.assertIsNone(b.confirm("t", "x", "y", "n", 5))
+        answers = {10: dialogs.CHOICE_ONCE, 12: dialogs.CHOICE_ALWAYS,
+                   11: dialogs.CHOICE_NO}
+        for code, expected in answers.items():
+            with mock.patch.object(dialogs.subprocess, "run",
+                                   return_value=mock.Mock(returncode=code)):
+                self.assertEqual(b.choose("t", "x", "o", "a", "n", 5), expected)
+
+    def test_a_failed_countdown_window_falls_back_to_the_main_dialog(self):
+        from probolos import agent as agent_mod
+        agent = agent_mod.Agent.__new__(agent_mod.Agent)
+        agent.log = lambda *a: None
+        agent.dialog = mock.Mock(**{"confirm_countdown.return_value": True})
+        agent.dialog.name = "kdialog"
+        agent.countdown_dialog = mock.Mock(
+            **{"confirm_countdown.return_value": None})
+        import time
+        answer = agent._ask_countdown("t", "b", "c", 10,
+                                      time.monotonic() + 60)
+        self.assertEqual(answer, agentlink.ANSWER_YES)
+        agent.dialog.confirm_countdown.assert_called_once()
 
 
 class TestDialogBackends(unittest.TestCase):
@@ -327,10 +691,12 @@ class TestDialogBackends(unittest.TestCase):
             self.assertEqual(dialogs.detect(log=lambda *a: None).name,
                              "kdialog")
 
-    def test_a_timed_out_dialog_is_a_refusal(self):
+    def test_a_timed_out_dialog_is_no_answer_and_never_a_yes(self):
         """
-        Left unanswered means no. A dialog nobody dealt with must not become an
-        approval just because it went away.
+        A dialog nobody dealt with must not become an approval just because it
+        went away -- and must not become a recorded refusal either, or the
+        next plug warns "You have refused this device before" about a refusal
+        nobody made. None: falsy, and "no decision" to every caller.
         """
         from probolos import dialogs
         backend = dialogs.KDialogBackend()
@@ -338,7 +704,7 @@ class TestDialogBackends(unittest.TestCase):
         with mock.patch.object(dialogs.subprocess, "run",
                                side_effect=dialogs.subprocess.TimeoutExpired(
                                    cmd="kdialog", timeout=1)):
-            self.assertIs(backend.confirm("t", "x", "y", "n", 1.0), False)
+            self.assertIsNone(backend.confirm("t", "x", "y", "n", 1.0))
 
     def test_a_dialog_that_cannot_run_returns_none_not_false(self):
         """
@@ -514,14 +880,33 @@ class TestKdialogThreeWayMapping(unittest.TestCase):
                     self.backend().choose("t", "x", "once", "always", "no", 5),
                     expected)
 
-    def test_a_timeout_refuses(self):
+    def test_a_timeout_is_no_answer(self):
         from probolos import dialogs
         with mock.patch.object(dialogs.subprocess, "run",
                                side_effect=dialogs.subprocess.TimeoutExpired(
                                    cmd="kdialog", timeout=1)):
+            self.assertIsNone(
+                self.backend().choose("t", "x", "once", "always", "no", 1))
+
+    def test_an_unanswered_dialog_reaches_the_analyzer_as_no_decision(self):
+        """Both dialogs, both ways they can go unanswered."""
+        from probolos import agent as agent_mod
+        from probolos.agentlink import ANSWER_UNAVAILABLE
+        agent = agent_mod.Agent.__new__(agent_mod.Agent)
+        agent.log = lambda *a: None
+        agent.notifier = mock.Mock(**{"available.return_value": False})
+        agent.dialog = mock.Mock()
+        cases = [
+            ({"allow_always": False}, [None], None),         # first dialog
+            ({"allow_always": False}, [True, None], None),   # confirm
+            ({"allow_always": True}, [True], None),          # three-way
+        ]
+        for extra, confirms, choice in cases:
+            agent.dialog.confirm.side_effect = confirms
+            agent.dialog.choose.return_value = choice
             self.assertEqual(
-                self.backend().choose("t", "x", "once", "always", "no", 1),
-                dialogs.CHOICE_NO)
+                agent._ask_user({"title": "t", "body": "b", **extra}, 30),
+                ANSWER_UNAVAILABLE, f"{extra} {confirms}")
 
 
 class TestServePassesAgentUid(unittest.TestCase):
@@ -893,6 +1278,21 @@ class SocketDirectoryIsNotGroupWritable(unittest.TestCase):
             agentlink.prepare_socket_dir(Path("/etc/probolos-agent.sock"),
                                          os.getuid(), os.getgid())
 
+    def test_a_directory_systemd_already_made_2750_needs_no_chmod(self):
+        """
+        Under the shipped unit RestrictSUIDSGID=yes makes every chmod that
+        carries the setgid bit fail with EPERM, and systemd has already
+        created the directory 2750 (RuntimeDirectoryMode). The service used
+        to chmod it anyway and crash-looped with the gate open.
+        """
+        self.root.mkdir()
+        os.chmod(self.root, 0o2750)
+        refused = PermissionError(1, "Operation not permitted")
+        with mock.patch.object(agentlink.os, "fchmod", side_effect=refused):
+            agentlink.prepare_socket_dir(self.root / "agent.sock",
+                                         os.getuid(), os.getgid())
+        self.assertEqual(stat.S_IMODE(os.stat(self.root).st_mode), 0o2750)
+
 
 class SocketMetadataIsNotChangedByName(unittest.TestCase):
 
@@ -1203,15 +1603,17 @@ class ConfirmationEndsBeforeTheAnalyzerStopsListening(unittest.TestCase):
         second_timeout = agent.dialog.confirm.call_args_list[1].kwargs["timeout"]
         self.assertLessEqual(second_timeout, 60 - 50)
 
-    def test_no_budget_left_is_a_refusal_not_a_late_yes(self):
-        from probolos.agentlink import ANSWER_NO
+    def test_no_budget_left_is_no_decision_not_a_late_yes(self):
+        """Out of time before the second dialog: never a yes, and not a
+        refusal the user made either."""
+        from probolos.agentlink import ANSWER_UNAVAILABLE
         agent, agent_mod = self.build()
         clock = iter([100.0, 170.0])
         agent.dialog.confirm.side_effect = [True, True]
         with mock.patch.object(agent_mod.time, "monotonic",
                                side_effect=lambda: next(clock)):
             answer = agent._ask_user({"title": "t", "body": "b"}, 60)
-        self.assertEqual(answer, ANSWER_NO)
+        self.assertEqual(answer, ANSWER_UNAVAILABLE)
         self.assertEqual(agent.dialog.confirm.call_count, 1)
 
 

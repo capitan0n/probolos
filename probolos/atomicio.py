@@ -13,7 +13,7 @@ So an attacker who is `nobody` could pre-plant
 
     /var/lib/probolos/trusted.tmp  ->  /etc/cron.d/root_job
 
-and the next save() -- especially `sudo python -m probolos --forget N`, which
+and the next save() -- especially `sudo python -m probolos --remove-trusted N`, which
 runs as ROOT -- would write the JSON through the symlink and clobber the
 target with root privileges. A trust store meant to be edited by root becomes
 an arbitrary-file-write primitive.
@@ -100,7 +100,8 @@ def _staging_path(path: Path) -> Path:
         f"{secrets.token_hex(8)}{TMP_SUFFIX}")
 
 
-def write_json_atomic(path: Path, payload: dict) -> None:
+def write_json_atomic(path: Path, payload: dict,
+                      mode: int = 0o600) -> os.stat_result:
     """
     Serialise `payload` as JSON to `path`, atomically and without ever
     following a symlink at the temporary staging path.
@@ -109,6 +110,11 @@ def write_json_atomic(path: Path, payload: dict) -> None:
     or EEXIST if a temp file is already sitting there). Callers already treat
     OSError from save() as "could not persist" and report it once, so no new
     error handling is needed at the call sites.
+
+    Returns the fstat of the file written, taken on the descriptor before the
+    rename. A stat of `path` afterwards could already describe someone else's
+    file; this one cannot, so a caller can later tell its own write apart from
+    a newer one.
     """
     from .securefs import open_directory
     path = Path(path)
@@ -121,9 +127,12 @@ def write_json_atomic(path: Path, payload: dict) -> None:
         fd = os.open(tmp, flags, 0o600, dir_fd=directory_fd)
         created = True
         with os.fdopen(fd, "wb") as fh:
+            if mode != 0o600:
+                os.fchmod(fh.fileno(), mode)
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+            written = os.fstat(fh.fileno())
         os.replace(tmp, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         created = False
         try:
@@ -137,3 +146,4 @@ def write_json_atomic(path: Path, payload: dict) -> None:
             except OSError:
                 pass
         os.close(directory_fd)
+    return written

@@ -6,6 +6,21 @@ Two units, because the two halves live in different places: the gate is a
 
 ## Install
 
+**The easy way**, from the source tree:
+
+```bash
+sudo ./install.sh                # install and start; re-run after pulling to update
+sudo ./install.sh --uninstall    # stop and remove; /var/lib/probolos is kept
+```
+
+It does everything below: code to `/opt/probolos` (root-owned, since a root
+service must not run code its user can edit), a `probolos` command in
+`/usr/local/bin`, both units with local settings in drop-ins
+(`PROBOLOS_AGENT_USER` = the account that ran `sudo`), and it starts both. It
+refuses while a probolos started by hand is still running.
+
+**By hand:**
+
 ```bash
 # the gate, as root
 sudo cp systemd/probolos.service /etc/systemd/system/

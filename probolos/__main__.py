@@ -16,9 +16,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import (agentlink, daemon, gate, ledger as ledger_mod, report, rules,
-               safety, session as session_mod, sysfs, trust as trust_mod,
-               usbclass)
+from . import (agentlink, daemon, gate, instance, ledger as ledger_mod,
+               report, rules, safety, session as session_mod, sysfs, textsafe,
+               trust as trust_mod, usbclass)
 
 # The rename from Cerberus reached ~60 files and missed this one, which is the
 # first thing every user sees. Same figlet font ("small"), without smushing.
@@ -240,15 +240,48 @@ def cmd_trusted(path) -> None:
               f"{entry.times_admitted} time(s)")
         print(f"      ports       : {', '.join(entry.ports) or '-'}")
         print()
-    print("Remove one with:  sudo python -m probolos --forget N   "
+    print("Remove one with:  sudo python -m probolos --remove-trusted N   "
           "(N is the number in brackets)")
 
 
-def cmd_forget(path, pattern: str) -> None:
+def _confirm(question: str, assume_yes: bool) -> bool:
+    """
+    Ask y/N. The default, and anything but a yes, is no.
+
+    Without a terminal there is nobody to ask, and guessing either way is
+    wrong: proceeding destroys state nobody confirmed, and silently doing
+    nothing looks like success to a script. So refuse and name the flag.
+    """
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        sys.exit("No terminal to confirm on. Re-run with --yes to proceed.")
+    try:
+        answer = input(f"{question} [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def cmd_remove_trusted(path, pattern: str, assume_yes: bool = False) -> None:
+    """
+    Revoke trust. History is untouched: that is --remove-all.
+
+    Only 'all' asks first. Removing trust is the safe direction -- the worst
+    a mistake costs is being asked about a device again -- so a single entry
+    goes without ceremony, like `ufw delete N`.
+    """
     store = trust_mod.TrustStore(path)
     if pattern.lower() == "all":
+        if not store.devices:
+            print("No remembered devices.")
+            return
+        if not _confirm(f"Remove all {len(store.devices)} remembered "
+                        f"device(s)?", assume_yes):
+            print("Nothing removed.")
+            return
         count = store.clear()
-        print(f"Forgot all {count} device(s).")
+        print(f"Removed all {count} remembered device(s).")
     elif pattern.isdigit():
         # A bare number refers to the position shown by --trusted, like
         # `ufw delete N`. This is the common case: look, then delete by number.
@@ -256,17 +289,93 @@ def cmd_forget(path, pattern: str) -> None:
         if identity is None:
             sys.exit(f"No remembered device numbered {pattern}. "
                      f"Run --trusted to see the list.")
-        print(f"Forgot [{pattern}] {identity}")
+        print(f"Removed [{pattern}] {textsafe.clean(identity)}")
     else:
         removed = store.forget(pattern)
         if not removed:
             print(f"Nothing matched {pattern!r}. Run --trusted to see the list.")
             return
         for identity in removed:
-            print(f"  forgot {identity}")
+            print(f"  removed {textsafe.clean(identity)}")
     error = store.save()
     if error:
         sys.exit(f"could not write trust store: {error}")
+    print("Device history is kept (--history). --remove-all clears both.")
+
+
+def cmd_remove_all(trust_path, ledger_path, assume_yes: bool = False) -> None:
+    """
+    Remove every remembered device AND all device history.
+
+    Always asks: history is the evidence drift detection compares against,
+    and it cannot be rebuilt. Afterwards every device is a first sighting.
+    """
+    if ledger_mod.in_use(ledger_path):
+        sys.exit("probolos is running and holds the device history in memory;\n"
+                 "it would write it straight back. Stop it first:\n"
+                 "    in its terminal:  Ctrl-C\n"
+                 "    as a service:     sudo systemctl stop probolos")
+
+    store = trust_mod.TrustStore(trust_path)
+    led = ledger_mod.Ledger(ledger_path)
+    has_trust = trust_path.exists()
+    has_history = ledger_path.exists()
+    if not has_trust and not has_history:
+        print("Nothing to remove.")
+        return
+
+    print("This permanently removes:")
+    if has_trust:
+        count = "unreadable" if store.load_error else len(store.devices)
+        print(f"  - {count} remembered device(s)   {trust_path}")
+    if has_history:
+        print(f"  - history of {len(led.entries)} device(s)     {ledger_path}")
+    drifted = [e.identity for e in led.entries.values()
+               if len(e.known_hashes) > 1]
+    if drifted:
+        print(f"  ! {len(drifted)} of them changed descriptors (DRIFT); "
+              f"that evidence goes too:")
+        for identity in drifted:
+            print(f"      {textsafe.clean(identity)}")
+    if not _confirm("Remove everything?", assume_yes):
+        print("Nothing removed.")
+        return
+
+    try:
+        # History first: it is the one a running daemon could resurrect, and
+        # remove() refuses under the same lock it checks, so a daemon started
+        # after the check above still stops us before anything is lost.
+        if has_history:
+            ledger_mod.remove(ledger_path)
+        if has_trust:
+            trust_path.unlink(missing_ok=True)
+    except ledger_mod.InUse:
+        sys.exit("probolos started meanwhile; nothing removed. Stop it and "
+                 "run this again.")
+    except OSError as exc:
+        sys.exit(f"could not remove: {exc}")
+    print("Removed. Every device will be asked about as if new.")
+
+
+def claim_the_gate() -> Optional[int]:
+    """
+    Refuse to run beside another gate; see instance.py for why.
+
+    Returns the lock descriptor, held until exit. A lock that cannot be
+    created at all (read-only /var/lib, say) is reported and NOT fatal:
+    refusing to start would leave the ports open, which is the failure this
+    exists to prevent.
+    """
+    try:
+        return instance.acquire()
+    except instance.AlreadyRunning:
+        sys.exit("probolos is already running; this copy would fight it for "
+                 "the USB gate.\nStop the other one first:\n"
+                 "    in its terminal:  Ctrl-C\n"
+                 "    as a service:     sudo systemctl stop probolos")
+    except OSError as exc:
+        print(f"[!] could not check for another running probolos: {exc}")
+        return None
 
 
 def _seconds(text: str) -> float:
@@ -335,9 +444,19 @@ def main(argv=None) -> None:
                              "the gate open")
     parser.add_argument("--trusted", action="store_true",
                         help="list remembered devices and exit")
-    parser.add_argument("--forget", metavar="PATTERN",
+    parser.add_argument("--remove-trusted", metavar="N|PATTERN|all",
                         help="remove a remembered device: a number from "
-                             "--trusted, a name/id substring, or 'all'")
+                             "--trusted, a name/id substring, or 'all'. "
+                             "History is kept")
+    # The old name, kept so existing scripts and muscle memory still work.
+    parser.add_argument("--forget", dest="remove_trusted",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--remove-all", action="store_true",
+                        help="remove all remembered devices AND all device "
+                             "history. Asks first")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="answer yes to --remove-* confirmations "
+                             "(for scripts)")
     parser.add_argument("--history", action="store_true",
                         help="show the recorded history of every USB device seen, and exit")
     parser.add_argument("--no-trust", action="store_true",
@@ -351,7 +470,7 @@ def main(argv=None) -> None:
                         help="inspect (read-only, never mounted) and alert "
                              "on cards inserted into card readers that are "
                              "already admitted. Detection only: a card is "
-                             "a medium, not a device, and is NOT gated")
+                             "not a device, and is NOT gated")
     parser.add_argument("--media-policy", default="log",
                         choices=["log", "deauthorize"],
                         help="with --watch-media, on a CRITICAL media finding: "
@@ -409,16 +528,24 @@ def main(argv=None) -> None:
         print(history.show_history(verbose=args.verbose,
                                    path=args.ledger if args.ledger else None))
         return
-    if args.forget:
-        cmd_forget(trust_path, args.forget)
+    if args.remove_trusted:
+        cmd_remove_trusted(trust_path, args.remove_trusted, args.yes)
+        return
+    if args.remove_all:
+        cmd_remove_all(trust_path, args.ledger or ledger_mod.default_path(),
+                       args.yes)
         return
     if args.release:
         cmd_release()
         return
 
-    print(BANNER)
     if not args.dry_run:
         require_root()
+        # Held until the process exits. Before the banner, so a refusal is
+        # the only thing printed.
+        gate_lock = claim_the_gate()  # noqa: F841
+    print(BANNER)
+    if not args.dry_run:
         print("[!] The gate will close: NEW USB devices will not work until")
         print("[!] you approve them here. Keep a second way in (SSH, or your")
         print("[!] built-in keyboard) while testing.\n")

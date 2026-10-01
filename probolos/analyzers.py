@@ -169,9 +169,13 @@ class LedgerAnalyzer(Analyzer):
                 f"{len(entry.known_hashes) or 1} distinct identity "
                 f"fingerprint(s) recorded under it."))
 
+        # CRITICAL, not WARNING: a device you turned away that comes back is
+        # the case the countdown exists for. It stays approvable -- the
+        # refusal may have been a mistake -- but not by reflex. Only a real
+        # refusal counts: an unanswered prompt is recorded as "no answer".
         if "user rejected" in entry.decisions:
             findings.append(rules.Finding(
-                "previously-rejected", rules.Severity.WARNING,
+                "previously-rejected", rules.Severity.CRITICAL,
                 "You have refused this device before",
                 f"This identity was rejected on a previous occasion "
                 f"(seen {entry.times_seen} time(s), ports: "
@@ -218,7 +222,7 @@ class StorageAnalyzer(Analyzer):
     behavioural quarantine.
     """
     id = "storage"
-    title = "what the medium contains"
+    title = "what the drive contains"
     # impossible-partition-geometry and the overlap/past-the-end rules are the
     # only evidence about the medium the operator ever sees.
     decisive = True

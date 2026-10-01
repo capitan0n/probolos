@@ -29,9 +29,12 @@ TRUST NEVER OVERRIDES EVIDENCE
     case the tool exists for.
 
 TRUST IS VISIBLE AND REVOCABLE
-    `--trusted` lists it, `--forget` removes it. A trust store you cannot
-    inspect is a liability, because you cannot answer "what does this machine
-    currently let in without asking?"
+    `--trusted` lists it, `--remove-trusted` removes it. A trust store you
+    cannot inspect is a liability, because you cannot answer "what does this
+    machine currently let in without asking?"
+
+    Revocation takes effect in a daemon that is already running: the store is
+    re-read whenever the file on disk changes (see refresh).
 """
 
 from __future__ import annotations
@@ -160,19 +163,69 @@ def key_for(dev) -> Optional[str]:
     return f"{identity_of(dev)}#{digest}"
 
 
+def _signature_of(st):
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size,
+            st.st_mode, st.st_uid)
+
+
 class TrustStore:
     def __init__(self, path: Path = None):
         self.path = Path(path) if path else default_path()
         self.devices: Dict[str, TrustedDevice] = {}
         self.load_error: Optional[str] = None
         self._last_save_error: Optional[str] = None
+        # What the file on disk looked like when we last read or wrote it.
+        self._disk_sig = None
         self.load()
 
     # ---------- persistence ----------
 
+    def _signature(self):
+        """
+        Identify the file currently at self.path, or None if there is none.
+
+        Every write replaces the file with a new inode (atomicio renames into
+        place), and an in-place edit changes mtime or size, so any change by
+        another process shows up here. Mode and owner are included because
+        load() judges them: a chmod that makes the store untrustworthy must
+        be noticed like an edit. A stat that fails for any other reason
+        returns a value that never compares equal, which forces a reload --
+        and a reload of an unreadable store fails closed.
+        """
+        import os
+        try:
+            return _signature_of(os.stat(self.path))
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return object()
+
+    def refresh(self) -> None:
+        """
+        Re-read the store if the file changed since we last read or wrote it.
+
+        WHY (the bug this fixes)
+        ------------------------
+        The daemon loaded the store once at startup. `--forget N` in another
+        terminal changed the file and nothing else: the running daemon kept
+        admitting the revoked device without a prompt until it was restarted,
+        and the next admission of any remembered device saved the whole
+        in-memory store -- revoked entry included -- back to disk. Revocation
+        neither took effect nor stuck.
+
+        Reloading is safe here in a way it would not be for the ledger: this
+        file's directory is root-owned (see default_path), and load() fails
+        closed on anything it cannot vouch for.
+        """
+        if self._signature() != self._disk_sig:
+            self.load()
+
     def load(self) -> None:
         self.devices.clear()
         self.load_error = None
+        # Taken BEFORE reading: if the file changes between the two, the
+        # recorded signature is the older one and the next refresh reads again.
+        self._disk_sig = self._signature()
         if not self.path.exists():
             return
 
@@ -312,11 +365,21 @@ class TrustStore:
         return None
 
     def save(self) -> Optional[str]:
+        import os
+        # Keep the read bits the file already has, never any write bits.
+        # Under --privsep the launcher makes this file 0644 so the analyzer
+        # can read it; a root-run `--remove-trusted` rewriting it at 0600
+        # would lock a running analyzer out of the whole store until restart.
         try:
-            atomicio.write_json_atomic(self.path, {
+            mode = 0o600 | (os.stat(self.path).st_mode & 0o044)
+        except OSError:
+            mode = 0o600
+        try:
+            written = atomicio.write_json_atomic(self.path, {
                 "schema": SCHEMA_VERSION,
                 "devices": {k: asdict(v) for k, v in self.devices.items()},
-            })
+            }, mode=mode)
+            self._disk_sig = _signature_of(written)
             return None
         except OSError as exc:
             message = str(exc)
@@ -325,9 +388,28 @@ class TrustStore:
             self._last_save_error = message
             return message
 
+    def writable(self) -> bool:
+        """
+        Whether save() can succeed from this process.
+
+        Under --privsep the analyzer runs as `nobody` and this file's directory
+        is root-owned on purpose (see ledger.default_path): the analyzer reads
+        trust and can never write it. "Always allow" was offered there anyway,
+        and clicking it admitted the device once and lost the trust entry,
+        with one line in the journal to say so.
+        """
+        import os
+        directory = str(self.path.parent)
+        # save() creates missing directories, so what matters is the nearest
+        # one that exists.
+        while not os.path.exists(directory):
+            directory = os.path.dirname(directory)
+        return os.access(directory, os.W_OK)
+
     # ---------- use ----------
 
     def lookup(self, dev) -> Optional[TrustedDevice]:
+        self.refresh()
         key = key_for(dev)
         return self.devices.get(key) if key else None
 
@@ -339,6 +421,7 @@ class TrustStore:
         key = key_for(dev)
         if key is None:
             return None
+        self.refresh()
         now = time.time()
         entry = TrustedDevice(
             key=key,

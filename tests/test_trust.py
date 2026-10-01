@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -510,3 +511,122 @@ class StateReload(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Revocation reaches a daemon that is already running
+# ---------------------------------------------------------------------------
+
+class RevocationReachesARunningDaemon(unittest.TestCase):
+    """
+    `--remove-trusted` edits the file from one process while the daemon holds
+    its own TrustStore in another. The daemon used to load once at startup,
+    so a revoked device stayed admitted until a restart, and its next save
+    wrote the revoked entry back.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "trusted.json"
+        self.a = Dev(serial="AAA", raw=b"a")
+        self.b = Dev(serial="BBB", raw=b"b")
+        self.daemon = trust.TrustStore(self.path)
+        self.daemon.trust(self.a)
+        self.daemon.trust(self.b)
+        self.assertIsNone(self.daemon.save())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _revoke_a_elsewhere(self):
+        cli = trust.TrustStore(self.path)
+        self.assertIn("AAA", cli.forget_index(1))
+        self.assertIsNone(cli.save())
+
+    def test_revoked_device_is_no_longer_trusted(self):
+        self._revoke_a_elsewhere()
+        self.assertFalse(self.daemon.is_trusted(self.a))
+        self.assertTrue(self.daemon.is_trusted(self.b))
+
+    def test_admitting_another_device_does_not_bring_it_back(self):
+        self._revoke_a_elsewhere()
+        self.daemon.record_admission(self.b)
+        self.assertIsNone(self.daemon.save())
+        fresh = trust.TrustStore(self.path)
+        self.assertFalse(fresh.is_trusted(self.a))
+        self.assertTrue(fresh.is_trusted(self.b))
+
+    def test_remembering_a_new_device_does_not_bring_it_back(self):
+        self._revoke_a_elsewhere()
+        self.daemon.trust(Dev(serial="CCC", raw=b"c"))
+        self.assertIsNone(self.daemon.save())
+        self.assertFalse(trust.TrustStore(self.path).is_trusted(self.a))
+
+    def test_deleted_file_means_nothing_is_trusted(self):
+        self.path.unlink()
+        self.assertFalse(self.daemon.is_trusted(self.a))
+
+    def test_unchanged_file_is_not_read_again(self):
+        with mock.patch.object(self.daemon, "load") as load:
+            self.assertTrue(self.daemon.is_trusted(self.a))
+        load.assert_not_called()
+
+    def test_a_store_made_untrustworthy_meanwhile_fails_closed(self):
+        os.chmod(self.path, 0o666)
+        self.assertFalse(self.daemon.is_trusted(self.a))
+        self.assertIsNotNone(self.daemon.load_error)
+
+
+class SaveKeepsReadBitsNeverWriteBits(unittest.TestCase):
+    """Under --privsep the launcher makes the store 0644 so the analyzer can
+    read it. A root-run edit that rewrote it 0600 locked the analyzer out."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "trusted.json"
+        self.store = trust.TrustStore(self.path)
+        self.store.trust(Dev())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _mode(self):
+        return os.stat(self.path).st_mode & 0o777
+
+    def test_a_new_store_is_private(self):
+        self.store.save()
+        self.assertEqual(self._mode(), 0o600)
+
+    def test_a_readable_store_stays_readable(self):
+        self.store.save()
+        os.chmod(self.path, 0o644)
+        self.store.save()
+        self.assertEqual(self._mode(), 0o644)
+
+    def test_write_bits_are_never_carried_over(self):
+        self.store.save()
+        os.chmod(self.path, 0o666)
+        self.store.save()
+        self.assertEqual(self._mode(), 0o644)
+
+
+class WritableSaysWhetherAlwaysCanBeKept(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_writable_directory_is_writable(self):
+        store = trust.TrustStore(Path(self.tmp.name) / "trusted.json")
+        self.assertTrue(store.writable())
+
+    def test_a_missing_directory_is_judged_by_the_nearest_existing_one(self):
+        store = trust.TrustStore(Path(self.tmp.name) / "a" / "b" / "t.json")
+        with mock.patch("os.access", return_value=True) as access:
+            self.assertTrue(store.writable())
+        self.assertEqual(access.call_args.args[0], self.tmp.name)
+
+    def test_a_read_only_directory_is_not(self):
+        store = trust.TrustStore(Path(self.tmp.name) / "trusted.json")
+        with mock.patch("os.access", return_value=False):
+            self.assertFalse(store.writable())

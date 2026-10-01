@@ -89,8 +89,13 @@ CHOICE_NO = "no"
 
 
 class DialogBackend:
-    """A way of asking a question. Returns an answer, or None if it could not
-    even be asked."""
+    """A way of asking a question. Returns an answer, or None if no answer was
+    obtained: the question could not be shown, or nobody answered in time.
+
+    A timeout used to come back as "no", and was recorded as the user refusing
+    the device -- which then warned "You have refused this device before" at
+    the next plug, about a refusal nobody made. None is still never an
+    approval: every caller treats it as falsy or maps it to "no decision"."""
 
     name = "none"
 
@@ -119,6 +124,45 @@ class DialogBackend:
         """
         raise NotImplementedError
 
+    def notice(self, title: str, text: str, timeout: float) -> Optional[bool]:
+        """
+        Show text with a single button that approves nothing. Returns True if
+        the person closed it, False if it stayed open for the whole timeout
+        (it is then closed for them), None if it could not be shown.
+        """
+        raise NotImplementedError
+
+    def confirm_countdown(self, title: str, text: str, yes_label: str,
+                          no_label: str, delay: float,
+                          timeout: float) -> Optional[bool]:
+        """
+        Like confirm(), but "yes" cannot be chosen until `delay` seconds have
+        passed. For a device matching an attack pattern: approving it must
+        take a decision, not a reflex.
+
+        kdialog and zenity cannot disable a button for a while, so this is two
+        windows: the findings first, in a window whose only button keeps the
+        device blocked and which closes itself after `delay` seconds; then the
+        real question. Closing the first window early keeps the device
+        blocked. Backends that can draw a countdown button override this.
+        """
+        import time
+        started = time.monotonic()
+        early = self.notice(
+            title,
+            f"{text}\n\nRead this first. The choice to allow it appears "
+            f"in {delay:.0f} seconds.\nPressing OK or closing this window "
+            f"now keeps the device blocked.",
+            timeout=delay)
+        if early is None:
+            return None
+        if early:
+            return False
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            return None
+        return self.confirm(title, text, yes_label, no_label, remaining)
+
 
 class KDialogBackend(DialogBackend):
     """KDE's own dialog tool. Present wherever Plasma is."""
@@ -146,7 +190,7 @@ class KDialogBackend(DialogBackend):
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
         except subprocess.TimeoutExpired:
-            return False        # left unanswered: refuse
+            return None         # left unanswered: no decision
         except OSError:
             return None         # could not ask at all
         return result.returncode == 0
@@ -168,7 +212,7 @@ class KDialogBackend(DialogBackend):
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
         except subprocess.TimeoutExpired:
-            return CHOICE_NO
+            return None
         except OSError:
             return None
         if result.returncode == 0:
@@ -176,6 +220,20 @@ class KDialogBackend(DialogBackend):
         if result.returncode == 1:
             return CHOICE_ALWAYS
         return CHOICE_NO
+
+    def notice(self, title: str, text: str, timeout: float) -> Optional[bool]:
+        # --sorry: a warning icon and one "OK" button, which the text says
+        # keeps the device blocked. When the time is up, subprocess.run kills
+        # kdialog, which closes the window.
+        args = [self._binary, "--title", _markup_safe(title),
+                "--sorry", _backslash_safe(_markup_safe(text))]
+        try:
+            subprocess.run(args, timeout=timeout, capture_output=True)
+        except subprocess.TimeoutExpired:
+            return False
+        except OSError:
+            return None
+        return True
 
 
 class ZenityBackend(DialogBackend):
@@ -203,7 +261,7 @@ class ZenityBackend(DialogBackend):
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
         except subprocess.TimeoutExpired:
-            return False
+            return None
         except OSError:
             return None
         return result.returncode == 0
@@ -222,7 +280,7 @@ class ZenityBackend(DialogBackend):
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True, text=True)
         except subprocess.TimeoutExpired:
-            return CHOICE_NO
+            return None
         except OSError:
             return None
         if result.returncode == 0:
@@ -230,6 +288,17 @@ class ZenityBackend(DialogBackend):
         if (result.stdout or "").strip() == always_label:
             return CHOICE_ALWAYS
         return CHOICE_NO
+
+    def notice(self, title: str, text: str, timeout: float) -> Optional[bool]:
+        args = [self._binary, "--warning", "--title", _markup_safe(title),
+                "--text", _backslash_safe(_markup_safe(text))]
+        try:
+            subprocess.run(args, timeout=timeout, capture_output=True)
+        except subprocess.TimeoutExpired:
+            return False
+        except OSError:
+            return None
+        return True
 
 
 class TkinterBackend(DialogBackend):
@@ -244,13 +313,24 @@ class TkinterBackend(DialogBackend):
     name = "tkinter"
 
     def available(self) -> bool:
+        # Opening (and at once destroying) a root window, not just importing:
+        # tkinter imports fine in a service with no $DISPLAY and then fails
+        # at the first window, which is too late to pick another backend.
         try:
             result = subprocess.run(
-                [self._python(), "-c", "import tkinter"],
+                [self._python(), "-c",
+                 "import tkinter; r = tkinter.Tk(); r.withdraw(); r.destroy()"],
                 capture_output=True, timeout=5)
             return result.returncode == 0
         except (OSError, subprocess.SubprocessError):
             return False
+
+    # Exit codes the dialog scripts use for their answers. NOT 0/1/2: Python
+    # exits 1 on any uncaught exception, so a tk that crashed read as "no"
+    # from confirm() and as "Always allow" from choose() -- after the person
+    # had clicked Allow once, a crash made the device trusted for good.
+    # Anything that is not one of these is "no decision".
+    _YES, _NO, _ALWAYS = 10, 11, 12
 
     @staticmethod
     def _python() -> str:
@@ -267,16 +347,18 @@ class TkinterBackend(DialogBackend):
             "root.attributes('-topmost', True)\n"
             "answer = messagebox.askyesno(sys.argv[1], sys.argv[2],\n"
             "                             default=messagebox.NO, icon='warning')\n"
-            "sys.exit(0 if answer else 1)\n")
+            f"sys.exit({self._YES} if answer else {self._NO})\n")
         try:
             result = subprocess.run(
                 [self._python(), "-c", script, title, text],
                 timeout=timeout, capture_output=True)
         except subprocess.TimeoutExpired:
-            return False
+            return None
         except OSError:
             return None
-        return result.returncode == 0
+        if result.returncode not in (self._YES, self._NO):
+            return None
+        return result.returncode == self._YES
 
     def choose(self, title: str, text: str, once_label: str,
                always_label: str, no_label: str,
@@ -291,21 +373,46 @@ class TkinterBackend(DialogBackend):
             "answer = messagebox.askyesnocancel(sys.argv[1], sys.argv[2],\n"
             "                                   default=messagebox.CANCEL,\n"
             "                                   icon='warning')\n"
-            "sys.exit(0 if answer is True else (1 if answer is False else 2))\n")
+            f"sys.exit({self._YES} if answer is True else "
+            f"({self._ALWAYS} if answer is False else {self._NO}))\n")
         try:
             result = subprocess.run(
                 [self._python(), "-c", script, title,
                  f"{text}\n\nYes = {once_label}\nNo = {always_label}"],
                 timeout=timeout, capture_output=True)
         except subprocess.TimeoutExpired:
-            return CHOICE_NO
+            return None
         except OSError:
             return None
-        if result.returncode == 0:
+        if result.returncode == self._YES:
             return CHOICE_ONCE
-        if result.returncode == 1:
+        if result.returncode == self._ALWAYS:
             return CHOICE_ALWAYS
-        return CHOICE_NO
+        if result.returncode == self._NO:
+            return CHOICE_NO
+        return None
+
+    def confirm_countdown(self, title: str, text: str, yes_label: str,
+                          no_label: str, delay: float,
+                          timeout: float) -> Optional[bool]:
+        # A real "Allow anyway (9)" button that stays disabled, in the
+        # desktop's own colours: see countdown_dialog.py. Run by file path
+        # under -I, so neither the environment nor the current directory can
+        # decide what code draws it.
+        from pathlib import Path
+        script = str(Path(__file__).with_name("countdown_dialog.py"))
+        try:
+            result = subprocess.run(
+                [self._python(), "-I", script, title, text,
+                 yes_label, no_label, str(delay)],
+                timeout=timeout, capture_output=True)
+        except subprocess.TimeoutExpired:
+            return None
+        except OSError:
+            return None
+        if result.returncode not in (self._YES, self._NO):
+            return None             # tk failed: no decision
+        return result.returncode == self._YES
 
 
 def detect(log=print) -> Optional[DialogBackend]:

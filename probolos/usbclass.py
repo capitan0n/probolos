@@ -178,3 +178,68 @@ def may_type(cls: int, subcls: int, proto: int) -> bool:
 def kind_of(cls: int) -> str:
     """Map a class code to the behavioural bucket used for routing."""
     return _KIND_BY_CLASS.get(cls, KIND_OTHER)
+
+
+# ---------------------------------------------------------------------------
+# Plain words for the desktop prompt
+#
+# "Mass Storage (SCSI)" is accurate and means nothing to most people. What a
+# person needs in order to answer "allow it?" is what the thing IS and what it
+# will be able to DO once switched on -- in words, not class codes.
+# ---------------------------------------------------------------------------
+
+_PLAIN_NAMES = {
+    0x01: "audio device",
+    0x02: "network adapter or modem",
+    0x06: "camera or scanner",
+    0x07: "printer",
+    0x08: "USB storage (flash drive or disk)",
+    0x09: "USB hub",
+    0x0B: "smart card reader",
+    0x0E: "webcam",
+    0x10: "audio/video device",
+    0xE0: "wireless radio (Bluetooth or similar)",
+    0xFF: "vendor-specific device",
+}
+
+_CAPABILITIES = {
+    0x01: "play or record sound",
+    0x02: "act as a network connection or serial port",
+    0x03: "type and move the pointer, as if it were your keyboard or mouse",
+    0x06: "transfer images and files",
+    0x07: "receive print jobs",
+    0x08: "read and write files",
+    0x09: "connect more USB devices (each one is asked about separately)",
+    0x0A: "carry network or serial traffic",
+    0x0B: "read smart cards",
+    0x0E: "show what its camera sees",
+    0x10: "play or record sound and video",
+    0xE0: "act as a radio that can connect further devices later, which "
+          "Probolos cannot see",
+    0xFF: "do things only its maker's software knows about",
+}
+
+# Classes that can neither type nor carry traffic nor hide behaviour behind a
+# vendor protocol. A device made only of these, with nothing suspicious found,
+# is asked about in one dialog; anything else gets the second confirmation.
+# An allowlist, not a denylist: a class nobody thought about is not "safe".
+ONE_STEP_CLASSES = frozenset({0x01, 0x06, 0x07, 0x08, 0x09, 0x0B, 0x0E, 0x10})
+
+
+def plain_name(cls: int, subcls: int, proto: int) -> str:
+    """What one interface is, in plain words."""
+    if cls == HID_CLASS:
+        if is_keyboard(cls, subcls, proto):
+            return "keyboard"
+        if is_mouse(cls, subcls, proto):
+            return "mouse"
+        return "input device (did not say which; could be a keyboard)"
+    if cls == 0x0A:
+        return "network adapter or modem"      # the data half of class 0x02
+    return _PLAIN_NAMES.get(cls, class_name(cls).lower())
+
+
+def capability(cls: int) -> str:
+    """What an interface of this class can do once switched on."""
+    return _CAPABILITIES.get(
+        cls, f"do things Probolos cannot describe (class 0x{cls:02x})")

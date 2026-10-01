@@ -75,6 +75,109 @@ def default_path() -> Path:
 
 DEFAULT_PATH = default_path()
 
+
+# ---------------------------------------------------------------------------
+# "Is a daemon using this ledger?"
+#
+# A running daemon keeps the ledger in memory and rewrites the whole file after
+# every decision, so deleting the file under it achieves nothing: the next
+# device plugged in writes the old history straight back. The daemon is also
+# deliberately NOT made to re-read the file when it changes (unlike the trust
+# store): under --privsep this directory belongs to the shared `nobody`
+# account, and a daemon that reloads it would let any process running as
+# `nobody` wipe a device's drift baseline moments before that device is
+# plugged in. So removal has to happen while no daemon is running, and the
+# daemon says it is running by holding a shared lock on the ledger's
+# directory. Nothing else is locked: the lock only answers that question.
+# ---------------------------------------------------------------------------
+
+class InUse(Exception):
+    """A running daemon holds this ledger in memory."""
+
+
+def claim(path) -> Optional[int]:
+    """
+    Mark the ledger at `path` as in use for the life of this process.
+
+    Returns the descriptor holding the lock; the caller keeps it open. Never
+    blocks for long and never fails the caller: a daemon that cannot take the
+    lock (another process holding it exclusively) runs anyway, since refusing
+    to start would hand that process a way to keep the gate open.
+    """
+    import fcntl
+    import os
+    from .securefs import open_directory
+    try:
+        # create=True: the same directory the first save would create anyway.
+        # Claiming only once it exists would leave the first run unmarked.
+        fd = open_directory(Path(path).parent, create=True)
+    except OSError:
+        return None
+    for _ in range(20):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            time.sleep(0.05)       # a removal in progress takes milliseconds
+        except OSError:
+            break
+    os.close(fd)
+    return None
+
+
+def _open_exclusive(path) -> Optional[int]:
+    """The ledger directory, locked exclusively; None if it does not exist."""
+    import fcntl
+    import os
+    from .securefs import open_directory
+    try:
+        fd = open_directory(Path(path).parent)
+    except FileNotFoundError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise InUse(str(path)) from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def in_use(path) -> bool:
+    """True if a running daemon has claimed the ledger at `path`."""
+    import os
+    try:
+        fd = _open_exclusive(path)
+    except InUse:
+        return True
+    if fd is not None:
+        os.close(fd)
+    return False
+
+
+def remove(path) -> bool:
+    """
+    Delete the ledger file. Returns whether there was one.
+
+    Raises InUse if a daemon holds it. The check and the unlink happen under
+    one exclusive lock, so a daemon cannot start and load the file in between.
+    The unlink goes through the pinned directory descriptor, never a path
+    walked again.
+    """
+    import os
+    fd = _open_exclusive(path)
+    if fd is None:
+        return False
+    try:
+        os.unlink(Path(path).name, dir_fd=fd)
+    except FileNotFoundError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
 SCHEMA_VERSION = 1
 
 # Per-entry list bounds. The ledger is read AND rewritten on every device

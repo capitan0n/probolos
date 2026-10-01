@@ -56,7 +56,8 @@ from typing import Optional
 from . import dialogs
 from .agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_UNAVAILABLE,
                         ANSWER_YES, DEFAULT_SOCKET,
-                        MAX_MESSAGE, MSG_ANSWER, MSG_CRITICAL, MSG_DECIDE)
+                        MAX_MESSAGE, MSG_ANSWER, MSG_CRITICAL, MSG_DECIDE,
+                        STEPS_COUNTDOWN, STEPS_ONE, STEPS_TWO)
 
 APP_NAME = "Probolos"
 ICON = "drive-removable-media-usb"
@@ -268,6 +269,39 @@ def _as_text(value, fallback: str) -> str:
     return value if isinstance(value, str) else fallback
 
 
+def _from_confirm(answer) -> str:
+    """A yes/no dialog's result as an answer. Only a real True approves."""
+    if answer is None:
+        return ANSWER_UNAVAILABLE
+    return ANSWER_YES if answer is True else ANSWER_NO
+
+
+def _from_choice(choice) -> str:
+    """A three-way dialog's result as an answer. None is no decision."""
+    if choice is None:
+        return ANSWER_UNAVAILABLE
+    if choice == dialogs.CHOICE_ONCE:
+        return ANSWER_YES
+    if choice == dialogs.CHOICE_ALWAYS:
+        return ANSWER_ALWAYS
+    return ANSWER_NO
+
+
+def _countdown(value) -> float:
+    """
+    The countdown from the wire, clamped. Never below the daemon's own 10 s
+    (it would refuse an earlier yes anyway, so a shorter countdown would only
+    show an Allow button that cannot work) and never absurdly long.
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = 10.0
+    if seconds != seconds:          # NaN
+        seconds = 10.0
+    return min(max(seconds, 10.0), 30.0)
+
+
 def _dialog_timeout(value) -> float:
     """
     How long to leave the dialog up, from a field on the wire.
@@ -304,7 +338,21 @@ class Agent:
         self.log = log
         self.notifier = Notifier(log=log)
         self.dialog = dialogs.detect(log=log)
+        self.countdown_dialog = self._pick_countdown_dialog()
         self.sock: Optional[socket.socket] = None
+
+    def _pick_countdown_dialog(self):
+        """
+        tkinter can draw an "Allow anyway (9)" button that stays disabled
+        until the countdown ends; kdialog and zenity cannot, and fall back to
+        a read-first window before the question. Prefer the real thing when
+        the tk bindings are installed.
+        """
+        if self.dialog is None or isinstance(self.dialog,
+                                             dialogs.TkinterBackend):
+            return self.dialog
+        tk = dialogs.TkinterBackend()
+        return tk if tk.available() else self.dialog
 
     def connect(self) -> bool:
         try:
@@ -330,8 +378,12 @@ class Agent:
         if self.notifier.available():
             self.notifier.start()
 
+        countdown = getattr(self.countdown_dialog, "name", "none")
         self.log(f"[agent] connected to Probolos. Decisions will be asked "
-                 f"through {self.dialog.name}.")
+                 f"through {self.dialog.name}; critical ones through "
+                 f"{countdown} with a countdown"
+                 + ("" if countdown == "tkinter" else
+                    " (install tk for a countdown button)") + ".")
         buffer = b""
         try:
             while True:
@@ -400,14 +452,26 @@ class Agent:
 
     def _ask_user(self, message: dict, timeout: float) -> str:
         """
-        Announce, then ask. Two dialogs, both of which must be answered yes.
+        Announce, then ask -- with as much friction as the daemon says this
+        device earns (message["steps"]):
 
-        The notification exists so the question is not missed if it opens behind
-        something; the dialogs are where the decision actually happens.
+          one        a single dialog: Allow / Keep blocked (Allow once /
+                     Always allow / Keep blocked when remembering is possible)
+          two        that, then a differently worded "switch it on?" naming
+                     what this device will be able to do
+          countdown  CRITICAL: one window whose "Allow anyway" unlocks after
+                     the countdown; never "always"
+
+        The notification is one line. It exists so the question is not missed
+        if the dialog opens behind something, not to repeat the dialog.
         """
         title = _as_text(message.get("title"), "New USB device")
         body = _as_text(message.get("body"), "")
+        caps = _as_text(message.get("capabilities"), "")
         allow_always = bool(message.get("allow_always"))
+        steps = message.get("steps")
+        if steps not in (STEPS_ONE, STEPS_TWO, STEPS_COUNTDOWN):
+            steps = STEPS_TWO          # unknown or missing: the careful default
         # The analyzer stops listening `timeout` seconds after it asked (the
         # small margin covers the reply's trip back). The first dialog may use
         # nearly all of that, and the second one used to get a fixed 30 s on
@@ -415,27 +479,53 @@ class Agent:
         # "Yes, switch it on" after the analyzer had already given up, and the
         # device stayed blocked while they believed they had approved it.
         deadline = time.monotonic() + timeout - 1.0
+        can_do = (f"Once on, it will be able to: {caps}." if caps else
+                  "Once on, it will be able to act on your computer as "
+                  "whatever it claims to be.")
 
         announcement = None
         if self.notifier.available():
             announcement = self.notifier.notify(
-                title, f"{body}\n\nBlocked — waiting for your decision.",
+                "Dangerous USB device blocked" if steps == STEPS_COUNTDOWN
+                else "USB device blocked",
+                f"{title}\nAnswer the Probolos window.",
                 urgency=URGENCY_CRITICAL, actionable=False)
 
         try:
-            # ---- first question -------------------------------------------
+            if steps == STEPS_COUNTDOWN:
+                return self._ask_countdown(
+                    title, body, can_do,
+                    _countdown(message.get("countdown")), deadline,
+                    note=_as_text(message.get("note"), ""))
+
+            first_text = (f"{title}\n\n{body}\n\n"
+                          f"It is BLOCKED and cannot do anything.")
+            first_timeout = max(timeout - 5, 10)
+
+            if steps == STEPS_ONE:
+                text = f"{first_text}\n{can_do}\n\nAllow it?"
+                if allow_always:
+                    return _from_choice(self.dialog.choose(
+                        title="Probolos — new USB device", text=text,
+                        once_label="Allow once", always_label="Always allow",
+                        no_label="Keep blocked", timeout=first_timeout))
+                return _from_confirm(self.dialog.confirm(
+                    title="Probolos — new USB device", text=text,
+                    yes_label="Allow", no_label="Keep blocked",
+                    timeout=first_timeout))
+
+            # ---- two steps: first question ---------------------------------
             allowed = self.dialog.confirm(
                 title="Probolos — new USB device",
-                text=(f"{title}\n\n{body}\n\n"
-                      f"This device is currently BLOCKED and cannot do "
-                      f"anything.\n\nAllow it?"),
+                text=f"{first_text}\n\nAllow it?",
                 yes_label="Allow", no_label="Keep blocked",
-                timeout=max(timeout - 5, 10))
+                timeout=first_timeout)
             if allowed is None:
-                # No way to ask -- no kdialog, no zenity, no tkinter. This is
-                # NOT a refusal: the user never saw anything to refuse. Return
-                # a value the analyzer does not recognise as a decision, which
-                # it treats as "no answer" and falls back to the terminal.
+                # No way to ask -- no kdialog, no zenity, no tkinter -- or
+                # nobody answered in time. This is NOT a refusal: the user
+                # never refused anything. Return a value the analyzer does not
+                # recognise as a decision, which it treats as "no answer" and
+                # falls back to the terminal.
                 #
                 # (Returning ANSWER_NO here, as this line used to, meant that a
                 # machine without a dialog backend silently denied EVERY device
@@ -447,27 +537,23 @@ class Agent:
 
             # ---- second question, worded differently on purpose ----------
             # The wording changes so the second dialog is read rather than
-            # clicked through by momentum. One misplaced click must never be
-            # able to energise unknown hardware.
-            confirm_text = ("Switch this device on?\n\n"
-                            "It will be able to act on your computer — type, "
-                            "read and write storage, or use the network, "
-                            "depending on what it is.")
+            # clicked through by momentum, and it names what THIS device will
+            # be able to do rather than everything a device might.
+            confirm_text = f"Switch this device on?\n\n{can_do}"
 
             # Whatever is left of the analyzer's budget, never more than the
             # 30 s this dialog always had. With nothing left, an answer could
             # not be honoured anyway, so none is collected.
             remaining = min(30.0, deadline - time.monotonic())
             if remaining <= 0:
-                return ANSWER_NO
+                return ANSWER_UNAVAILABLE       # out of time: no decision
 
             if not allow_always:
-                confirmed = self.dialog.confirm(
+                return _from_confirm(self.dialog.confirm(
                     title="Probolos — confirm",
                     text=confirm_text,
-                    yes_label="Yes, switch it on", no_label="Cancel",
-                    timeout=remaining)
-                return ANSWER_YES if confirmed else ANSWER_NO
+                    yes_label="Yes, switch it on", no_label="Keep blocked",
+                    timeout=remaining))
 
             # Three outcomes, the same set the terminal offers. Without this the
             # graphical path would be MORE permissive than the terminal one:
@@ -475,22 +561,53 @@ class Agent:
             # unfamiliar stick once would silently create a permanent trust
             # entry. The convenient path must never grant more than the
             # inconvenient one.
-            choice = self.dialog.choose(
+            return _from_choice(self.dialog.choose(
                 title="Probolos — confirm",
                 text=confirm_text + "\n\nAllow it once, or remember it for "
                                     "next time as well?",
                 once_label="Just this once",
                 always_label="Always allow",
-                no_label="Cancel",
-                timeout=remaining)
-            if choice == dialogs.CHOICE_ONCE:
-                return ANSWER_YES
-            if choice == dialogs.CHOICE_ALWAYS:
-                return ANSWER_ALWAYS
-            return ANSWER_NO
+                no_label="Keep blocked",
+                timeout=remaining))
         finally:
             if announcement is not None:
                 self.notifier.close(announcement)
+
+    def _ask_countdown(self, title: str, body: str, can_do: str,
+                       countdown: float, deadline: float,
+                       note: str = "") -> str:
+        """
+        A device matching an attack pattern -- previously refused, or the same
+        identity now describing itself differently. It can be approved, since
+        it may be your own device after a firmware update, but "Allow anyway"
+        stays disabled for the countdown and "always" is never offered. The
+        daemon refuses an approval that arrives sooner, so a faster dialog or
+        a script answering for this one gains nothing.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= countdown:
+            return ANSWER_UNAVAILABLE
+        backend = getattr(self, "countdown_dialog", None) or self.dialog
+        note = note or ("This device matches an attack pattern. Allow it "
+                        "only if you know exactly why these findings appear.")
+        text = f"{title}\n\n{body}\n\n{note}\n\n{can_do}"
+        started = time.monotonic()
+        allowed = backend.confirm_countdown(
+            title="Probolos — DANGEROUS USB device", text=text,
+            yes_label="Allow anyway", no_label="Keep blocked",
+            delay=countdown, timeout=remaining)
+        if (allowed is None and backend is not self.dialog
+                and time.monotonic() - started < countdown):
+            # No answer before the countdown could even have ended: the
+            # window failed rather than timed out. Ask with the main backend.
+            self.log("[agent] countdown window failed; using "
+                     f"{self.dialog.name} instead")
+            allowed = self.dialog.confirm_countdown(
+                title="Probolos — DANGEROUS USB device", text=text,
+                yes_label="Allow anyway", no_label="Keep blocked",
+                delay=countdown,
+                timeout=deadline - time.monotonic())
+        return _from_confirm(allowed)
 
     def _reply(self, request_id, answer: str) -> None:
         if not self.sock:
@@ -540,7 +657,8 @@ def main(argv=None) -> int:
                   "Press \"Allow\" to continue to the second dialog."),
             yes_label="Allow", no_label="Cancel", timeout=60.0)
         if answer is None:
-            print("The dialog could not be shown.")
+            print("The dialog could not be shown, or was not answered "
+                  "within 60 s.")
             return 1
         if not answer:
             print("Dialog works, and you pressed Cancel. That is the safe "

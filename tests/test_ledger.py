@@ -8,11 +8,13 @@ Covers probolos.ledger and probolos.history.
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import asdict
 from pathlib import Path
 from unittest import mock
@@ -166,8 +168,16 @@ class TestDriftDetection(unittest.TestCase):
 
     def test_a_previously_rejected_device_is_flagged_on_return(self):
         self.store.record(Dev(), "user rejected")
+        found = {f.rule_id: f for f in self.analyze(Dev())}
+        self.assertIn("previously-rejected", found)
+        # CRITICAL, so the desktop prompt uses the countdown.
+        self.assertEqual(found["previously-rejected"].severity,
+                         rules.Severity.CRITICAL)
+
+    def test_an_unanswered_prompt_is_not_a_previous_refusal(self):
+        self.store.record(Dev(), "no answer")
         ids = [f.rule_id for f in self.analyze(Dev())]
-        self.assertIn("previously-rejected", ids)
+        self.assertNotIn("previously-rejected", ids)
 
     def test_no_ledger_configured_means_no_findings(self):
         result = analyzers.LedgerAnalyzer().analyze(
@@ -832,3 +842,81 @@ class DescriptorDriftSurvivesRecording(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemovalWaitsForTheDaemon(unittest.TestCase):
+    """
+    A running daemon keeps the ledger in memory and writes it all back after
+    the next decision, so deleting the file under it achieves nothing. The
+    daemon claims the ledger; removal refuses while the claim is held.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "state" / "ledger.json"
+        led = Ledger(self.path)
+        led.record(Dev(), "user approved", approved=True)
+        self.assertIsNone(led.save())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_unclaimed_ledger_is_removed(self):
+        self.assertFalse(ledger_mod.in_use(self.path))
+        self.assertTrue(ledger_mod.remove(self.path))
+        self.assertFalse(self.path.exists())
+
+    def test_claimed_ledger_is_refused_and_kept(self):
+        fd = ledger_mod.claim(self.path)
+        self.assertIsNotNone(fd)
+        try:
+            self.assertTrue(ledger_mod.in_use(self.path))
+            with self.assertRaises(ledger_mod.InUse):
+                ledger_mod.remove(self.path)
+            self.assertTrue(self.path.exists())
+        finally:
+            os.close(fd)
+
+    def test_claim_ends_with_its_descriptor(self):
+        os.close(ledger_mod.claim(self.path))
+        self.assertFalse(ledger_mod.in_use(self.path))
+
+    def test_claim_marks_the_first_run_too(self):
+        """Before any save the directory may not exist. Claiming only once it
+        did would leave a first run unmarked, and its history deletable."""
+        path = Path(self.tmp.name) / "fresh" / "ledger.json"
+        fd = ledger_mod.claim(path)
+        self.assertIsNotNone(fd)
+        try:
+            self.assertTrue(ledger_mod.in_use(path))
+        finally:
+            os.close(fd)
+
+    def test_nothing_there_is_nothing_to_remove(self):
+        path = Path(self.tmp.name) / "absent" / "ledger.json"
+        self.assertFalse(ledger_mod.in_use(path))
+        self.assertFalse(ledger_mod.remove(path))
+
+    def test_dry_run_daemon_does_not_claim(self):
+        from probolos import daemon as daemon_mod
+        with mock.patch.object(ledger_mod, "claim") as claim, \
+             mock.patch.object(daemon_mod, "pyudev", None), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                daemon_mod.serve(dry_run=True, ledger_path=self.path,
+                                 watchdog_timeout=0)
+        claim.assert_not_called()
+
+    def test_real_daemon_claims_before_loading(self):
+        from probolos import daemon as daemon_mod
+        order = []
+        with mock.patch.object(ledger_mod, "claim",
+                               side_effect=lambda p: order.append("claim")), \
+             mock.patch.object(ledger_mod.Ledger, "load",
+                               side_effect=lambda: order.append("load")), \
+             mock.patch.object(daemon_mod, "pyudev", None), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                daemon_mod.serve(dry_run=False, ledger_path=self.path,
+                                 watchdog_timeout=0)
+        self.assertEqual(order, ["claim", "load"])

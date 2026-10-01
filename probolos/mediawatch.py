@@ -228,7 +228,7 @@ class MediaWatch:
         size = storage.read_size_sectors(f"/dev/{disk}")
         if not size:
             if host.slots.get(disk) not in (None, EMPTY):
-                self.log(f"[◌] medium removed — {host.dev.label()} "
+                self.log(f"[◌] card removed — {host.dev.label()} "
                          f"LUN {lun} ({disk})")
                 self._audit(host, disk, lun, "removed")
             host.slots[disk] = EMPTY
@@ -269,9 +269,9 @@ class MediaWatch:
 
         timing = self._timing(mounted_before, inhibited)
         self.log("")
-        self.log(f"[▣] MEDIUM CHANGE — {report.one_liner(host.dev)} "
+        self.log(f"[▣] CARD CHANGE — {report.one_liner(host.dev)} "
                  f"LUN {lun} ({disk})"
-                 + (" — first medium seen in this slot" if first_sight
+                 + (" — first card seen in this slot" if first_sight
                     else ""))
         self.log(report.render_medium(medium, findings))
         self.log(f"  {timing}")
@@ -318,7 +318,7 @@ class MediaWatch:
     @staticmethod
     def _timing(mounted_before: bool, inhibited: bool) -> str:
         if mounted_before:
-            return ("automount: the medium was ALREADY MOUNTED when it was "
+            return ("automount: the card was ALREADY MOUNTED when it was "
                     "read -- this is post-hoc alerting, not prevention")
         if inhibited:
             return ("automount: inhibited for udisks on this disk, so this "

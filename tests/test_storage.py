@@ -628,7 +628,7 @@ class WatcherBehaviour(WatcherTestBase):
         w = self.watcher()
         self.change(w)
         self.assertEqual(self.inspected, ["sdz"])
-        self.assertIn("MEDIUM CHANGE", self.output())
+        self.assertIn("CARD CHANGE", self.output())
         self.assertIn("LUN 1", self.output())
         entry = json.loads(self.logfile.read_text().splitlines()[-1])
         self.assertEqual(entry["event"], "media-change")
@@ -653,13 +653,13 @@ class WatcherBehaviour(WatcherTestBase):
         self.change(w)
         self.size = 0
         self.change(w)
-        self.assertIn("medium removed", self.output())
+        self.assertIn("card removed", self.output())
 
     def test_repeated_change_for_the_same_medium_is_reported_once(self):
         w = self.watcher()
         self.change(w)
         w.handle("change", str(self.disk), {"DEVTYPE": "disk"})  # rescan
-        self.assertEqual(self.output().count("MEDIUM CHANGE"), 1)
+        self.assertEqual(self.output().count("CARD CHANGE"), 1)
 
     def test_a_different_card_is_drift_against_the_first(self):
         w = self.watcher()
@@ -667,7 +667,7 @@ class WatcherBehaviour(WatcherTestBase):
         self.card = medium(partitions=[(0x07, 2048, 1000000, False)],
                            signatures={0: "exFAT"})
         self.change(w)
-        self.assertIn("A medium this slot has never seen", self.output())
+        self.assertIn("A card this slot has never seen", self.output())
 
     def test_the_report_says_when_the_read_was_post_hoc(self):
         w = self.watcher()
@@ -1248,7 +1248,7 @@ class Stage4ReachesTheMedium(_TreeCase):
         self.assertIn("Input/output error", medium.error)
         findings = rules.storage_findings(medium)
         self.assertEqual([f.title for f in findings],
-                         ["The medium could not be read"])
+                         ["The drive's contents could not be read"])
 
 
 if __name__ == "__main__":

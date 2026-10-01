@@ -45,6 +45,12 @@ from . import (agentlink, analyzers, gate, ledger as ledger_mod, quarantine,
                report, rules, safety, session as session_mod, storage, sysfs,
                trust as trust_mod, usbclass)
 
+# How long a CRITICAL device's "Allow" stays disabled in the desktop prompt.
+# Enforced here as well as in the dialog: an approval that arrives sooner is
+# not honoured, whatever sent it.
+CRITICAL_COUNTDOWN = 10.0
+
+
 
 @dataclass
 class Decision:
@@ -496,13 +502,13 @@ class Probolos:
         elif (self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds
                 and has_input):
             print("  This device declares BOTH storage and an input interface.")
-            print("  Its medium will NOT be read: authorizing it to look would")
+            print("  Its contents will NOT be read: authorizing it to look would")
             print("  also switch the input half on without a grab. It is held")
             print("  for your decision on the strength of that alone.\n")
         elif (self.inspect_storage and usbclass.KIND_STORAGE in dev.kinds
                 and not storage_only):
             print("  This device declares storage AND other functions.")
-            print("  Its medium will NOT be read: authorizing it to look would")
+            print("  Its contents will NOT be read: authorizing it to look would")
             print("  also switch those functions (network, serial, vendor) on")
             print("  before you decide. It is held for your decision as is.\n")
 
@@ -548,7 +554,14 @@ class Probolos:
             # For a quarantined device this write genuinely matters: it was
             # switched on for the observation and is alive right now. For every
             # other device it is a no-op that makes the state explicit.
-            self._record(Decision(dev, False, "user rejected", time.time()),
+            # "user rejected" only when someone actually said no. A timeout,
+            # an EOF (the service's stdin is /dev/null) or an unanswered
+            # dialog denies the device just the same, but recording it as a
+            # refusal made the next plug warn "You have refused this device
+            # before" about a refusal nobody made.
+            reason = ("user rejected" if getattr(self, "_answered", True)
+                      else "no answer")
+            self._record(Decision(dev, False, reason, time.time()),
                          findings, medium)
             try:
                 sysfs.set_authorized(dev.syspath, 0)
@@ -562,26 +575,106 @@ class Probolos:
             print(f"[-] REJECTED — {report.one_liner(dev, findings)}\n")
 
     @staticmethod
-    def _agent_title(dev: sysfs.UsbDevice) -> str:
-        claims = ", ".join(dev.claims) if dev.claims else "unknown type"
-        return f"New USB device: {claims}"
+    def _interfaces(dev):
+        """(class, subclass, protocol) per interface; [] if unreadable."""
+        try:
+            return [(int(i.interface_class), int(i.interface_subclass),
+                     int(i.interface_protocol)) for i in dev.interfaces]
+        except (TypeError, ValueError, AttributeError):
+            return []
 
-    @staticmethod
-    def _agent_body(dev: sysfs.UsbDevice, findings) -> str:
+    @classmethod
+    def _agent_title(cls, dev: sysfs.UsbDevice) -> str:
+        """What it is and where, in words: "USB storage (…) · port 3-9"."""
+        names = list(dict.fromkeys(usbclass.plain_name(*i)
+                                   for i in cls._interfaces(dev)))
+        if not names:
+            names = list(dev.claims) if dev.claims else ["unknown device"]
+        return f"{' + '.join(names)} · port {dev.name}"
+
+    # Shown in the dialog, so there is room for every finding a real device
+    # produces; the cap only stops a pathological list from pushing the
+    # buttons off the screen.
+    MAX_DIALOG_FINDINGS = 8
+    _SYMBOL = {rules.Severity.CRITICAL: "\u26d4", rules.Severity.WARNING: "\u26a0",
+               rules.Severity.NOTICE: "\u2022"}
+
+    @classmethod
+    def _agent_body(cls, dev: sysfs.UsbDevice, findings) -> str:
         """
-        A few lines, not a report. A notification that has to be scrolled will
-        not be read, and an unread warning is worse than none: it trains the
-        habit of clicking through.
+        Identity, then EVERY finding, most severe first. "...and 1 more
+        finding(s)" used to hide warnings on the one screen where the decision
+        is made. Details stay in the journal; the dialog lists what was found.
         """
-        lines = [dev.label()]
+        ident = [dev.label(), f"{dev.vendor_id}:{dev.product_id}"]
         if getattr(dev, "serial", None):
-            lines.append(f"serial {dev.serial}")
-        for finding in list(findings)[:2]:
-            lines.append(f"{finding.severity.label}: {finding.title}")
-        extra = len(list(findings)) - 2
+            ident.append(f"serial {dev.serial}")
+        lines = [" \u00b7 ".join(ident)]
+        shown = sorted((f for f in findings
+                        if f.severity >= rules.Severity.NOTICE),
+                       key=lambda f: f.severity, reverse=True)
+        if shown:
+            lines.append("")
+        for finding in shown[:cls.MAX_DIALOG_FINDINGS]:
+            lines.append(f"{cls._SYMBOL[finding.severity]} {finding.title}")
+        extra = len(shown) - cls.MAX_DIALOG_FINDINGS
         if extra > 0:
-            lines.append(f"…and {extra} more finding(s)")
+            lines.append(f"\u2026and {extra} more: journalctl -u probolos")
         return "\n".join(lines)
+
+    @classmethod
+    def _agent_capabilities(cls, dev: sysfs.UsbDevice) -> str:
+        """What THIS device will be able to do, from the interfaces it
+        declared -- not a generic list of everything a device might do."""
+        classes = list(dict.fromkeys(i[0] for i in cls._interfaces(dev)))
+        if not classes:
+            return ""
+        return "; ".join(dict.fromkeys(usbclass.capability(c)
+                                       for c in classes))
+
+    # What the countdown window says above its buttons, by finding. "Matches
+    # an attack pattern" is right for storage that can type and wrong for a
+    # stick you once refused, and a warning that overstates is one people
+    # learn to skip.
+    # The finding's own title is listed just above, so these say only what
+    # to do about it.
+    _CRITICAL_NOTES = {
+        "previously-rejected":
+            "Allow it only if refusing it was a mistake.",
+        "descriptor-drift":
+            "Allow it only if you know why it changed, for example your own "
+            "device after a firmware update.",
+    }
+    _ATTACK_NOTE = ("This device matches an attack pattern. Allow it only if "
+                    "you know exactly why these findings appear.")
+
+    @classmethod
+    def _critical_note(cls, findings) -> str:
+        ids = list(dict.fromkeys(f.rule_id for f in findings
+                                 if f.severity == rules.Severity.CRITICAL))
+        if not ids:
+            return ""
+        if all(i in cls._CRITICAL_NOTES for i in ids):
+            return " ".join(cls._CRITICAL_NOTES[i] for i in ids)
+        return cls._ATTACK_NOTE
+
+    @classmethod
+    def _prompt_steps(cls, dev: sysfs.UsbDevice, findings) -> str:
+        """
+        How much friction this question earns. Two dialogs for everything
+        trains the reflex to click through both; so one dialog for a device
+        that can neither type nor carry traffic and showed nothing suspicious,
+        two when it can or did, and a countdown when it matches an attack
+        pattern.
+        """
+        worst = rules.worst(findings)
+        if worst == rules.Severity.CRITICAL:
+            return agentlink.STEPS_COUNTDOWN
+        classes = {i[0] for i in cls._interfaces(dev)}
+        if (worst < rules.Severity.WARNING and classes
+                and classes <= usbclass.ONE_STEP_CLASSES):
+            return agentlink.STEPS_ONE
+        return agentlink.STEPS_TWO
 
     def report_blocked_on_exit(self) -> None:
         """
@@ -940,6 +1033,13 @@ class Probolos:
         except (AttributeError, ValueError, OSError):
             return 0
 
+    def _can_remember(self) -> bool:
+        """
+        Whether "always" can be kept. An option whose answer would be lost is
+        not offered, and what is not offered is not accepted.
+        """
+        return self.trust is not None and self.trust.writable()
+
     def _ask(self, dev: sysfs.UsbDevice,
              findings=()) -> bool:
         """
@@ -954,39 +1054,52 @@ class Probolos:
         hard for everything would just retrain the reflex on a longer word.
         """
         critical = rules.worst(findings) == rules.Severity.CRITICAL
+        # Set to True only where a person's answer was actually received.
+        self._answered = False
 
         # ---- ask through the desktop agent, if one is listening -----------
-        # A CRITICAL device is never offered to the agent as a question. Two
-        # clicks are too cheap for something matching an attack pattern, and a
-        # person clicking a popup is not in the same state of attention as one
-        # typing a word. The agent is told to warn instead, and the decision
-        # stays in the terminal.
+        # A CRITICAL device used to be never offered to the agent: it could
+        # only be approved by typing 'authorize' in the terminal -- which the
+        # service does not have, so under the service such a device could not
+        # be approved at all, even a known one after a firmware update. It is
+        # now offered with a countdown: "Allow anyway" stays disabled for
+        # CRITICAL_COUNTDOWN seconds, long enough that approving takes a
+        # decision rather than a reflex, and never with "always".
         if self.agent is not None and self.agent.connected:
-            if critical:
-                self.agent.notify_critical(
-                    "Dangerous USB device blocked",
-                    report.one_liner(dev, findings))
-                print("  (a warning was sent to your desktop; this device "
-                      "cannot be approved from a notification)")
-            else:
-                answer = self.agent.ask(
-                    title=self._agent_title(dev),
-                    body=self._agent_body(dev, findings),
-                    severity=rules.worst(findings).label if findings else "none",
-                    allow_always=self.trust is not None,
-                    timeout=self.timeout if self.timeout else 60.0)
-                if answer == agentlink.ANSWER_ALWAYS:
-                    self._remember = True
-                    return True
-                if answer == agentlink.ANSWER_YES:
-                    return True
-                if answer == agentlink.ANSWER_NO:
-                    return False
-                # answer is None: the agent could not answer at all. That is not
-                # a decision, so it must not be treated as one -- fall through
-                # to the terminal rather than silently refusing something the
-                # user never saw.
-                print("  (no answer from the desktop agent; asking here)")
+            steps = self._prompt_steps(dev, findings)
+            asked_at = time.monotonic()
+            answer = self.agent.ask(
+                title=self._agent_title(dev),
+                body=self._agent_body(dev, findings),
+                severity=rules.worst(findings).label if findings else "none",
+                allow_always=self._can_remember() and not critical,
+                timeout=self.timeout if self.timeout else 60.0,
+                steps=steps,
+                capabilities=self._agent_capabilities(dev),
+                countdown=CRITICAL_COUNTDOWN if critical else 0,
+                note=self._critical_note(findings))
+            if (critical and answer in (agentlink.ANSWER_YES,
+                                        agentlink.ANSWER_ALWAYS)
+                    and time.monotonic() - asked_at < CRITICAL_COUNTDOWN):
+                # The dialog cannot produce this; something answered for it.
+                print("  [!] an approval arrived before the countdown ended "
+                      "and was ignored")
+                answer = None
+            if answer in (agentlink.ANSWER_ALWAYS, agentlink.ANSWER_YES,
+                          agentlink.ANSWER_NO):
+                self._answered = True
+            if answer == agentlink.ANSWER_ALWAYS and not critical:
+                self._remember = True
+                return True
+            if answer in (agentlink.ANSWER_YES, agentlink.ANSWER_ALWAYS):
+                return True
+            if answer == agentlink.ANSWER_NO:
+                return False
+            # answer is None: the agent could not answer at all. That is not
+            # a decision, so it must not be treated as one -- fall through
+            # to the terminal rather than silently refusing something the
+            # user never saw.
+            print("  (no answer from the desktop agent; asking here)")
 
         if critical:
             # No "always" option here on purpose. Remembering a device that
@@ -996,7 +1109,7 @@ class Probolos:
             prompt = ("  This device matches an attack pattern.\n"
                       "  Type the word 'authorize' to allow it, anything else "
                       "to reject: ")
-        elif self.trust is not None:
+        elif self._can_remember():
             prompt = ("  Authorize this device? "
                       "[y]es once / [a]lways / [N]o: ")
         else:
@@ -1011,7 +1124,7 @@ class Probolos:
             # admits that device silently from then on. An option that is not
             # offered must not be accepted, so it is offered.
             choices = ("[y]es once / [a]lways / [N]o"
-                       if self.trust is not None else "[y/N]")
+                       if self._can_remember() else "[y/N]")
             prompt = (f"  Authorize this device? {choices} "
                       f"({self.timeout:.0f}s, default N) ")
         # The timeout applies to critical prompts too. It expires into DENIAL,
@@ -1049,10 +1162,11 @@ class Probolos:
             print("\n  (no input — denied)")
             return False
 
+        self._answered = True
         answer = answer.strip().lower()
         if critical:
             return answer == "authorize"
-        if answer in ("a", "always") and self.trust is not None:
+        if answer in ("a", "always") and self._can_remember():
             self._remember = True
             return True
         return answer in ("y", "yes")
@@ -1172,9 +1286,16 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
         elif trust_store.devices:
             print(f"  - {len(trust_store.devices)} remembered device(s) will "
                   f"be admitted without asking")
+        if not trust_store.writable():
+            print("  - \"always\" is not offered: this process cannot write "
+                  "the trust store (expected under --privsep)")
 
     store = None
     if ledger_path is not None:
+        # Held until the process exits, and taken before the load: it is how
+        # `--remove-all` knows this process would write the history back.
+        # Not in --dry-run, which never writes the ledger.
+        ledger_claim = None if dry_run else ledger_mod.claim(ledger_path)  # noqa: F841
         store = ledger_mod.Ledger(ledger_path)
         if store.load_error:
             print(f"[!] ledger unreadable ({store.load_error}); "
