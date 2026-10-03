@@ -1,0 +1,44 @@
+name: workflow lint
+
+# Only when something under .github changes: the workflows are all it reads.
+on:
+  push:
+    paths: [".github/**"]
+  pull_request:
+    paths: [".github/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.14"
+      # Both linters at fixed versions, so a new release cannot turn CI red on
+      # its own; Dependabot does not see installs in a run step, so these move
+      # by hand. actionlint is built from source by `go install`, which checks
+      # every module against Go's public checksum database; zizmor comes from
+      # PyPI, which its authors publish to.
+      - name: Install actionlint and zizmor
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          python -m pip install zizmor==1.30.1
+      # Syntax, expressions and types in every workflow, and ShellCheck on
+      # every run: block (ShellCheck ships with the runner image).
+      - name: actionlint
+        run: |
+          "$(go env GOPATH)/bin/actionlint"
+      # Security: template injection, token permissions, credentials left in
+      # the checkout, actions not pinned to a commit. Online, with the
+      # read-only token, so it can also confirm each pinned commit really
+      # belongs to the action's repository and has no known advisory.
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --format=github .github

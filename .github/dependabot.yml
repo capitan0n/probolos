@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Keeps the commit-pinned actions in .github/workflows current, together
+  # with their "# vX.Y.Z" comments. A new major version comes as its own pull
+  # request, to be read before merging.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Nothing in its first week: a compromised release is usually caught and
+    # pulled within days, before a pin that waits would ever have taken it.
+    cooldown:
+      default-days: 7

@@ -1,0 +1,36 @@
+name: systemd units
+
+on:
+  push:
+    paths: ["systemd/**", ".github/workflows/systemd.yml"]
+  pull_request:
+    paths: ["systemd/**", ".github/workflows/systemd.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  units:
+    # A fixed release, not ubuntu-latest: the exposure score checked below is
+    # computed by this release's systemd (255), and a newer systemd scores
+    # differently. Move it on purpose, together with the threshold.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: The units parse
+        run: |
+          systemd-analyze verify systemd/probolos.service
+          # A user unit. --user wants a runtime directory, which a CI job
+          # does not have; an empty one is enough to load the file.
+          XDG_RUNTIME_DIR="$(mktemp -d)" \
+            systemd-analyze --user verify systemd/probolos-agent.service
+      # The gate runs as root, so the unit's sandboxing is part of the security
+      # design, not packaging. systemd-analyze rates it 2.4 ("OK"); the
+      # threshold is that score x10 and fails the job on anything worse. Raise
+      # it only in the same commit as the change that needs it, and say why.
+      - name: The service's sandboxing has not weakened
+        run: |
+          systemd-analyze security --offline=yes --threshold=24 \
+            systemd/probolos.service

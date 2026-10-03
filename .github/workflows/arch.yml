@@ -1,0 +1,32 @@
+name: tests on Arch Linux
+
+on:
+  push:
+  pull_request:
+  # Weekly as well: Arch moves -- a new Python, a new pyudev -- whether or not
+  # anything is pushed here, and meeting that early is what this job is for.
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arch:
+    runs-on: ubuntu-latest
+    # The rolling image on purpose: this job exists to meet the newest Python
+    # and pyudev that Arch and Manjaro ship, and a digest pin would defeat it.
+    container: archlinux:latest # zizmor: ignore[unpinned-images]
+    steps:
+      # Distribution packages, not pip: what an Arch or Manjaro user really
+      # runs, including the real pyudev, which tests.yml never installs. git
+      # first, so the checkout below is a real clone.
+      - name: Install Python, pyudev, PyYAML, ruff and git from the Arch repos
+        run: pacman -Syu --noconfirm --needed git python python-pyudev python-yaml ruff
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: ruff check .
+      # The container runs as root, so the root-only tests run here as well.
+      - run: python -m tests.run_all
