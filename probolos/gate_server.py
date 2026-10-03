@@ -639,6 +639,7 @@ class GateServer:
         """Write `authorized` relative to a held descriptor on `directory`."""
         directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY |
                                os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd: Optional[int]
         try:
             fd = os.open("authorized", os.O_WRONLY | os.O_TRUNC |
                          os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
@@ -741,6 +742,7 @@ class GateServer:
                 # found at 0: the only value that leaves the machine usable.
                 previous = 1
 
+        write_fd: Optional[int]
         try:
             write_fd = os.open("authorized_default",
                                os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW |

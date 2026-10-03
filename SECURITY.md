@@ -227,9 +227,11 @@ unlinked that path unconditionally, which is a privileged delete of whatever
 happens to be there; it now removes only a socket.
 
 What remains, deliberately: a process running as the desktop user can still
-occupy the agent slot and never answer. `ask()` times out into the terminal
-fallback, which is the safe direction, and a process with that uid can ptrace
-the real agent anyway.
+occupy the agent slot and never answer. `ask()` times out into no decision,
+which is the safe direction: the terminal is asked if there is one, and
+otherwise the device stays blocked as "no answer" (see "Holding, and answers
+that are not decisions" below). A process with that uid can ptrace the real
+agent anyway.
 
 ## State files: trust, ledger, and who may write them
 
@@ -243,13 +245,16 @@ directory regardless of the file's own owner. So while the ledger and the trust
 store shared one directory, handing it to `nobody` handed over trust as well.
 The ledger now lives in `/var/lib/probolos/state/`, which is the only directory
 given to the analyzer; `/var/lib/probolos/` itself stays root-owned and holds
-`trusted.json`. The analyzer reads trust and can neither rewrite nor replace it.
+`trusted.json`. The analyzer reads trust and can neither rewrite nor replace it;
+under `--privsep` the root gate writes "always" on its behalf (next section).
 
 **Writes never follow a symlink.** State files are written with
 `O_NOFOLLOW | O_CREAT | O_EXCL` and renamed into place. Previously a `nobody`
 process could pre-plant `trusted.tmp` as a symlink to, say, a file under
 `/etc/cron.d`, and the next root-run save (`sudo … --forget N`) would write the
-store's JSON through it. Stores are created mode `0600`.
+store's JSON through it. Stores are created mode `0600`, except a trust store
+the gate creates, which is `0644` so the analyzer can read back what was
+remembered; an existing file keeps its mode.
 
 **The launcher refuses to chown anything outside a fixed allowlist.**
 `--ledger /etc/x.json` would otherwise make `/etc` owned by an unprivileged
@@ -272,6 +277,73 @@ trusted. State readers reject non-object JSON, invalid encodings, non-finite
 timestamps, special files and inputs over 8 MiB. Reload clears previous entries
 before parsing. Trust checks apply to the opened inode and its directory chain.
 
+## The gate's one write: "always" under `--privsep` (`REQ_TRUST`)
+
+The trust store admits hardware without asking, so the one process that may
+write it under `--privsep` is the root gate, and the gate writes it only on
+terms it can check itself:
+
+- **Only the gate can write.** The request travels on the private
+  socketpair `privsep.start()` creates before `fork()`. No other process --
+  other `nobody` processes included -- can reach it, which a directory
+  writable by the analyzer could not promise. Which file is written comes from
+  the root side's command line (`trust_path`), never from the socket.
+- **Only a device it admitted.** The gate keeps its own record of final
+  admissions (`REQ_ADMIT`) on this connection. `REQ_TRUST` must name that
+  device's kernel directory instance, within `TRUST_WINDOW` (60 s), and the
+  record is spent by the first request that names it, whether or not that
+  request succeeds: a refusal is not an invitation to try another key. The
+  device must still be the same instance and still be authorized when the
+  entry is written.
+- **Only a fingerprint it measured.** Before the gate first writes
+  `authorized=1` for an instance, it hashes the device's descriptors and reads
+  `idVendor`, `idProduct` and `serial` through a pinned directory descriptor,
+  and computes the key with the same `trust.key_for` the analyzer uses. The
+  earliest fingerprint is kept: a device that changes what it presents once
+  running cannot have its later testimony trusted. The analyzer's key must
+  equal the gate's exactly; it is compared, never stored. The label is the
+  only value taken from the request, and the gate sanitises it; it decides
+  nothing.
+- **Persistence is all a compromised analyzer gains.** It can already admit
+  devices -- that is its job. Through `REQ_TRUST` it can make an admission
+  it was entitled to make permanent, for a device the gate measured, and
+  nothing else: not a device it did not admit, not a different fingerprint,
+  not a different file. The gate refuses to rewrite a store that fails its
+  own integrity checks, and caps the store at `MAX_TRUSTED` entries. A
+  CRITICAL device is never offered "always", and trust never overrides a
+  CRITICAL finding on the next plug.
+
+## Holding, and answers that are not decisions
+
+A missing answer must never become an approval, and should not become a
+refusal either: a refusal is recorded, and a recorded refusal makes the next
+plug of that device CRITICAL ("previously rejected").
+
+- **With no agent the device is held.** Under the service there is no
+  terminal (stdin is `/dev/null`). With no desktop agent connected, a new
+  device is held blocked -- before stages 3 and 4, which would switch it on
+  -- and asked about when an agent connects. A remembered device is still
+  admitted on trust; nothing else is admitted while held.
+- **The re-ask cap.** An agent that leaves mid-question holds the device
+  again. Each round can switch it on for inspection, so on the third lost
+  question for the same instance (`MAX_UNSEEN_ASKS`) it is refused as
+  unanswered instead: an agent that crashes on the question and is restarted
+  cannot have unknown hardware powered up indefinitely.
+- **A replayed "add" is ignored.** udev replays `add` events (`udevadm
+  trigger`, a settle, a rescan) for held devices too. The queue entry stands
+  unless a different kernel instance now sits at the port, so a replay can
+  neither ask twice nor skip the forced question after an unlock that would
+  otherwise let a remembered device in on trust.
+- **Dialog exit codes that are no decision.** Only the dialog's own buttons
+  are answers. kdialog killed by a signal (negative code -- Qt aborts when the
+  display goes away, as at logout), kdialog's own failures (254/255), zenity's
+  error exit (255), a Tk window that crashed, and a timeout are all no
+  decision. They used to read as "Keep blocked" and be recorded as a refusal
+  nobody made. A shown question nobody answered is recorded as "no answer",
+  is not re-queued, and the person is told to replug it. Remaining limit: GTK
+  exits 1 when it loses the display, which zenity reports exactly like
+  Cancel; that case is still read as a refusal.
+
 ## Device strings are treated as hostile input
 
 A device chooses its own manufacturer, product and serial strings, and those
@@ -287,6 +359,15 @@ is reading. *Why* a string had to be cleaned is recorded and becomes a finding
 in its own right: `crafted-strings` (WARNING), escalating to `crafted-strings-hid`
 (CRITICAL) when a device that can type also disguises its own name — two things
 no honest keyboard does.
+
+**Cutting is a prefix.** A string over its limit is cut at the first token
+that does not fit, and nothing after it is appended. The cut used to skip
+only the token that did not fit and keep adding what still did, so a long
+escape was dropped and its neighbour shown in its place (`'\x1f0'` at a limit
+of 1 came out as `0...`) -- the control character gone from the text the
+operator reads, though still counted as a finding -- and the combining-mark
+limit reset. Scanning continues past the cut, so a control character hidden
+behind 126 harmless ones is still reported.
 
 Markup is escaped separately, in the dialog backends only. `kdialog` renders Qt
 rich text and `zenity` renders Pango, so an `iProduct` of

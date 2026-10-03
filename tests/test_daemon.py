@@ -1431,6 +1431,7 @@ class _FakeAgentLink:
         self.answers = list(answers)
         self.asked = []
         self.notices = []
+        self.critical_notices = []
 
     def is_live(self):
         return self.live
@@ -1446,6 +1447,9 @@ class _FakeAgentLink:
 
     def notify(self, title, body):
         self.notices.append((title, body))
+
+    def notify_critical(self, title, body):
+        self.critical_notices.append((title, body))
 
 
 def _leaves(link):
@@ -1918,6 +1922,8 @@ class AnUnansweredQuestionIsNotADeadEnd(_NobodyToAskCase):
             "USB device still blocked",
             f"{title}\nNobody answered in time. Unplug it and plug it in "
             f"again to be asked.")])
+        self.assertEqual(self.link.critical_notices, [],
+                         "an ordinary device's notice is not critical")
         # Not re-queued: that would re-ask, forever, a person not there.
         self.assertEqual(engine.pending, {})
         self.assertEqual(self.writes, [0])
@@ -2068,7 +2074,29 @@ class ACriticalDeviceWithNoAgent(_NobodyToAskCase):
             self.after(3.0, agentlink.ANSWER_YES))
         self.admit.assert_not_called()
         self.assertEqual(self.decisions()[-1], "no answer")
-        self.assertEqual(len(self.link.notices), 1)
+        # The ignored approval is the one notice that may mean something
+        # answered for the person: it goes out at critical urgency.
+        self.assertEqual(self.link.notices, [])
+        self.assertEqual(len(self.link.critical_notices), 1)
+        self.assertEqual(self.link.critical_notices[0][0],
+                         "USB device still blocked")
+        self.assertEqual(engine.pending, {})
+
+    def test_an_unanswered_countdown_is_a_critical_notice(self):
+        """
+        notify_critical had no caller and the agent's MSG_CRITICAL handler
+        said "Use the terminal"; it is now the "still blocked" notice for a
+        CRITICAL device, and says what is true.
+        """
+        engine, _order = self.hold_then_drain(lambda _link: None)
+        self.admit.assert_not_called()
+        self.assertEqual(self.decisions()[-1], "no answer")
+        title = daemon_mod.Probolos._agent_title(self.dev)
+        self.assertEqual(self.link.critical_notices, [(
+            "USB device still blocked",
+            f"{title}\nNobody answered in time. Unplug it and plug it in "
+            f"again to be asked.")])
+        self.assertEqual(self.link.notices, [])
         self.assertEqual(engine.pending, {})
 
 

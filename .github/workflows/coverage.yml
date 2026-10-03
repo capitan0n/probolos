@@ -33,9 +33,11 @@ jobs:
       # inputs every run, so the numbers do not wander between runs.
       #
       # The floors sit about two points under what the suite reaches today
-      # (total 81%, boundary 80%) so that interpreter noise does not trip
+      # (total 85%, boundary 95%) so that interpreter noise does not trip
       # them and a real loss of tests does. Raise them as coverage grows;
-      # lowering one needs a reason in the same commit.
+      # lowering one needs a reason in the same commit. The total leaves out
+      # interrogate.py and countdown_dialog.py ([tool.coverage.run] omit in
+      # pyproject.toml says why).
       - name: Measure, report, and hold the floors
         run: |
           work="$(mktemp -d)"
@@ -47,5 +49,5 @@ jobs:
           as_root python -m coverage combine
           as_root python -m coverage report
           echo "--- privilege boundary:"
-          as_root python -m coverage report --include="$BOUNDARY" --fail-under=78
-          as_root python -m coverage report --fail-under=79 --format=total
+          as_root python -m coverage report --include="$BOUNDARY" --fail-under=93
+          as_root python -m coverage report --fail-under=83 --format=total

@@ -40,8 +40,11 @@ WHAT THE AGENT IS NOT TRUSTED WITH
 A CRITICAL finding is never approvable from a notification. Two clicks are too
 cheap for a device that matches an attack pattern, and a person clicking through
 a popup is not in the same state of attention as one typing the word
-"authorize". For those, the agent is told to display a warning and refer the
-decision to the terminal.
+"authorize". For those, the agent opens the countdown dialog (STEPS_COUNTDOWN):
+"Allow anyway" stays disabled for the countdown, "always" is never offered, and
+the analyzer refuses an approval that arrives sooner, whatever sent it. When
+such a question goes unanswered, the "still blocked" notice goes out as
+MSG_CRITICAL, which the agent shows at critical urgency.
 
 WHO IS ALLOWED TO BE THE AGENT
 ------------------------------
@@ -117,7 +120,8 @@ DEFAULT_SOCKET = Path("/run/probolos/agent.sock")
 
 # Message kinds, analyzer -> agent
 MSG_DECIDE = "decide"
-MSG_CRITICAL = "critical"       # display only; the answer must come elsewhere
+MSG_CRITICAL = "critical"       # display only, critical urgency: a CRITICAL
+                                # device's question went unanswered
 MSG_CANCEL = "cancel"           # device vanished, withdraw the notification
 MSG_NOTICE = "notice"           # display only, e.g. "still blocked, replug it"
 
@@ -713,11 +717,12 @@ class AgentLink:
 
     def notify_critical(self, title: str, body: str) -> None:
         """
-        Tell the agent to warn, without offering an answer.
+        notify(), at critical urgency. Never raises.
 
-        A CRITICAL device is not approvable by clicking; the notification exists
-        so the user knows something is waiting for them, not so they can wave it
-        through.
+        Sent when a CRITICAL device's countdown question went unanswered: the
+        device stays blocked. Like notify() it carries no id, so nothing can
+        be allowed from it; the notification only stays on screen until it is
+        dismissed, where an ordinary notice expires.
         """
         self._send_display(MSG_CRITICAL, title, body)
 

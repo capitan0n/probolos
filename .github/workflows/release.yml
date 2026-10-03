@@ -1,0 +1,90 @@
+name: release
+
+# A version tag (v0.11.0, v1.0.0b1, v1.0.0rc1, v1.0.0) builds the sdist and
+# the wheel, writes SHA256SUMS, attests where they were built, and opens a
+# DRAFT release with all of it attached. Nothing is published: the maintainer
+# reads the draft and publishes it by hand. Nothing goes to PyPI.
+on:
+  push:
+    tags: ["v*"]
+
+# Nothing by default; each job asks for exactly what it needs.
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # The build-provenance attestation: an OIDC token to sign with, and the
+      # right to store the attestation on the repository.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      # The tag must name the version the files will carry. pyproject.toml is
+      # the single source of truth (see probolos/__init__.py), and a v1.0.0
+      # tag on a tree that still says 1.0.0rc2 would publish the wrong thing
+      # under the right name.
+      - name: The tag matches pyproject.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match pyproject.toml version $version"
+            exit 1
+          fi
+          fallback="$(grep -o '"[^"]*+source"' probolos/__init__.py)"
+          if [ "$fallback" != "\"$version+source\"" ]; then
+            echo "::error::probolos/__init__.py fallback is $fallback, expected \"$version+source\""
+            exit 1
+          fi
+      - run: python -m pip install -r .github/requirements-release.txt
+      - run: python -m build
+      - name: SHA256SUMS
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dist/*"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  draft:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Creating a release; nothing else.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      # A pre-release for a/b/rc versions (PEP 440), a normal release for the
+      # final one. Draft either way.
+      - name: Open the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          kind=()
+          case "$TAG" in
+            *a[0-9]*|*b[0-9]*|*rc[0-9]*) kind=(--prerelease) ;;
+          esac
+          gh release create "$TAG" dist/* \
+            --repo "$REPO" --draft "${kind[@]}" --verify-tag \
+            --title "Probolos ${TAG#v}" \
+            --notes "See CHANGELOG.md for what changed. Verify a download with \`sha256sum -c SHA256SUMS\` and \`gh attestation verify <file> --repo $REPO\`."

@@ -1,0 +1,10 @@
+# What release.yml builds the sdist and wheel with, at exact versions so the
+# same tag always builds the same way. Dependabot proposes updates (see
+# dependabot.yml). The build backend itself (setuptools, from pyproject.toml)
+# is fetched by `build` into an isolated environment.
+build==1.6.1
+
+# build's own dependencies
+packaging==26.3
+pyproject_hooks==1.3.3
+tomli==2.4.1 ; python_version < "3.11"

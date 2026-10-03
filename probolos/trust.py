@@ -169,7 +169,7 @@ def _signature_of(st):
 
 
 class TrustStore:
-    def __init__(self, path: Path = None):
+    def __init__(self, path: Optional[Path] = None):
         self.path = Path(path) if path else default_path()
         self.devices: Dict[str, TrustedDevice] = {}
         self.load_error: Optional[str] = None

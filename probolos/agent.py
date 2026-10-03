@@ -439,20 +439,17 @@ class Agent:
             return
 
         kind = message.get("type")
-        if kind == MSG_CRITICAL:
-            # Display only. Deliberately offers no way to allow anything.
-            self.notifier.notify(
-                _as_text(message.get("title"), "Probolos"),
-                _as_text(message.get("body"), "") +
-                "\n\nThis device matches an attack pattern and cannot be "
-                "approved from here. Use the terminal.",
-                urgency=URGENCY_CRITICAL, actionable=False)
-            return
-        if kind == MSG_NOTICE:
-            # Display only, like MSG_CRITICAL: nothing is sent back, and
-            # nothing shown offers a way to allow anything.
+        if kind in (MSG_NOTICE, MSG_CRITICAL):
+            # Display only: nothing is sent back, and nothing shown offers a
+            # way to allow anything. MSG_CRITICAL is the same notice about a
+            # CRITICAL device, at an urgency that does not expire. It used to
+            # say "Use the terminal", which stopped being true when CRITICAL
+            # devices became approvable with the countdown.
             self._show_notice(_as_text(message.get("title"), "Probolos"),
-                              _as_text(message.get("body"), ""))
+                              _as_text(message.get("body"), ""),
+                              urgency=(URGENCY_CRITICAL
+                                       if kind == MSG_CRITICAL
+                                       else URGENCY_NORMAL))
             return
         if kind != MSG_DECIDE:
             return
@@ -462,13 +459,15 @@ class Agent:
         answer = self._ask_user(message, timeout)
         self._reply(request_id, answer)
 
-    def _show_notice(self, title: str, body: str) -> None:
+    def _show_notice(self, title: str, body: str,
+                     urgency: int = URGENCY_NORMAL) -> None:
         """
         Tell the person something, offering no answer -- "this device is
         still blocked; replug it to be asked".
 
-        A notification when the desktop has a notification server, at normal
-        urgency: nothing is waiting on anyone. Otherwise the dialog backend's
+        A notification when the desktop has a notification server, at the
+        given urgency (normal unless the device was CRITICAL: nothing is
+        waiting on anyone). Otherwise the dialog backend's
         one-button notice window. That blocks until it is closed, and this
         runs on the receive loop, so the window gets a thread of its own: the
         next question must not queue behind a window nobody is looking at.
@@ -477,7 +476,7 @@ class Agent:
         desktop in windows.
         """
         if self.notifier.available() and self.notifier.notify(
-                title, body, urgency=URGENCY_NORMAL,
+                title, body, urgency=urgency,
                 actionable=False) is not None:
             return
         dialog = self.dialog

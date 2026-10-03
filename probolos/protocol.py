@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # Request kinds
 REQ_AUTHORIZE = "authorize"
@@ -92,7 +92,7 @@ class Request:
     label: Optional[str] = None  # TRUST only: display name for --trusted
 
     def encode(self) -> bytes:
-        obj = {"kind": self.kind, "path": self.path}
+        obj: Dict[str, Any] = {"kind": self.kind, "path": self.path}
         if self.value is not None:
             obj["value"] = self.value
         if self.instance is not None:

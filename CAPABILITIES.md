@@ -177,7 +177,8 @@ blocked before stages 3 and 4, and asked about when an agent connects. A
 replayed udev "add" for a held device is ignored. A device whose question was
 lost to a departing agent three times is refused as unanswered. A question
 that was shown and not answered is recorded as "no answer", not re-queued,
-and the agent shows a display-only "still blocked, replug it" notice.
+and the agent shows a display-only "still blocked, replug it" notice
+(critical urgency for a CRITICAL device).
 
 ### 1.8 Privilege separation (`--privsep`)
 

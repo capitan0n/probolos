@@ -2,6 +2,70 @@
 
 All notable changes to Probolos. Versioning is semantic.
 
+## Unreleased · road to 1.0.0
+
+The feature set is frozen at 0.11.0 (`CAPABILITIES.md` §1). Everything below
+is a fix, a security fix, testing, documentation or release work.
+
+### Fixed
+
+- **The CRITICAL notice says what is true, and is sent.** The agent's
+  `MSG_CRITICAL` handler still said "cannot be approved from here. Use the
+  terminal" -- untrue since CRITICAL devices became approvable with the
+  countdown, and the service has no terminal -- and `AgentLink.notify_critical`
+  had no caller. When a CRITICAL device's countdown question goes unanswered
+  (or an approval arrives inside the countdown and is ignored), the "still
+  blocked, replug it to be asked" notice now goes out as `MSG_CRITICAL`, which
+  the agent shows at critical urgency so it stays on screen until dismissed.
+  It is display-only like every notice: no id, nothing to answer, and it
+  falls back to the one-button window on a desktop with no notification
+  server. Ordinary devices keep the normal-urgency notice.
+
+### QA
+
+- **The privilege boundary's refusal paths are tested** (`tests/test_boundary.py`):
+  every failed step of the privilege drop (euid, egid, regained root), every
+  way the analyzer child can end (Ctrl-C, `SystemExit` with a message, a
+  crash), `privsep.start()`'s child branch (session, drop, exit status, signal
+  dispositions put back) and parent branch (a gate that raises, a child
+  already reaped, signal forwarding and the pre-fork window), every refused
+  `GateClient` operation and broken exchange, and the gate's refusal and
+  error paths for paths, interfaces, root hubs, input and block opens,
+  fingerprints and its serve loop. `privsep.start()` is driven in-process with
+  fork and `_exit` mocked, because its pty-forked children report no coverage.
+  Boundary coverage went from 80% to 95% (`privsep.py` 67% → 98%,
+  `gate_client.py` 71% → 94%, `gate_server.py` 81% → 95%).
+- **Coverage leaves out what no unit test can reach**: `interrogate.py` (a
+  research instrument, not on the daemon's path) and `countdown_dialog.py` (a
+  Tk window in its own interpreter), with the reason next to the setting in
+  `pyproject.toml`. Floors re-baselined: boundary 93%, total 83%.
+- **mypy on the root side** (`mypy.yml`): the six boundary modules, with
+  `check_untyped_defs`, configured in `[tool.mypy]` so `python -m mypy` checks
+  the same thing locally. Clean after annotation-only changes in
+  `protocol.py`, `gate_server.py`, `privsep.py` and `trust.py` (an implicit
+  `Optional`); no behaviour changed.
+- **`docs/QA-LOG.md`**: one row per defect found from the freeze on, with how
+  it was found, plus the boundary coverage table.
+
+### Documentation
+
+- **`SECURITY.md`**: the threat model of the gate-side trust write
+  (`REQ_TRUST`); holding with no agent, the re-ask cap and replayed "add"
+  events; the `textsafe` cut; dialog exit codes that are no decision. Two statements that were no longer true are corrected: an
+  unanswered agent question does not fall back to a terminal the service does
+  not have, and a trust store the gate creates is `0644`, not `0600`.
+- **`CAPABILITIES.md`** §1.7 names the critical-urgency notice.
+- **`docs/GITHUB-SETUP.md`**: the labels, milestones, repository settings and
+  Phase 1 issues to apply by hand.
+
+### Release engineering
+
+- **`release.yml`**: on a `v*` tag, checks the tag against `pyproject.toml`
+  and the `__init__.py` fallback, builds the sdist and wheel with a pinned
+  `build`, writes `SHA256SUMS`, attests build provenance, and opens a
+  **draft** release (a pre-release for a/b/rc tags) for the maintainer to
+  publish. Nothing goes to PyPI.
+
 ## [0.11.0] — 2026-10-03 · feature freeze
 
 The feature-complete snapshot: what 1.0 will ship, and what the thesis

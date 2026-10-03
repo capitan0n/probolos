@@ -278,7 +278,7 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     # a signal in that instant is dropped rather than fatal; the child puts back
     # the dispositions it inherited before it does anything else.
     import signal
-    analyzer = []
+    analyzer: list = []
 
     def _forward(signum, _frame):
         if not analyzer:
@@ -288,7 +288,7 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
         except OSError:
             pass
 
-    inherited = {}
+    inherited: dict = {}
     for _sig, _handler in ((signal.SIGINT, _forward),
                            (signal.SIGHUP, _forward),
                            (signal.SIGQUIT, _forward),

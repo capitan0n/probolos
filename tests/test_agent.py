@@ -197,11 +197,15 @@ class TestAgentLink(LinkTestCase):
 
     def test_critical_notification_offers_no_answer(self):
         self.connect()
-        self.link.notify_critical("Dangerous", "storage that types")
-        time.sleep(0.3)
-        kinds = [m["type"] for m in self.agent.received]
-        self.assertIn(agentlink.MSG_CRITICAL, kinds)
-        self.assertNotIn(agentlink.MSG_DECIDE, kinds)
+        self.link.notify_critical("USB device still blocked", "port 3-9")
+        for _ in range(50):
+            if self.agent.received:
+                break
+            time.sleep(0.02)
+        self.assertEqual(self.agent.received, [{
+            "type": agentlink.MSG_CRITICAL,
+            "title": "USB device still blocked", "body": "port 3-9"}])
+        self.assertTrue(self.link.is_live())
 
     def test_a_notice_is_display_only(self):
         """No id, so there is nothing to answer and nothing to approve."""
@@ -1749,6 +1753,33 @@ class AgentShowsNoticesWithoutOfferingAnAnswer(unittest.TestCase):
         self.assertEqual(args, ("Probolos — USB device still blocked",
                                 "port 3-9"))
         self.assertEqual(kwargs["timeout"], agent_mod.NOTICE_TIMEOUT)
+        self.assert_offered_nothing(instance)
+
+    def test_a_critical_notice_is_the_same_notice_at_critical_urgency(self):
+        """
+        MSG_CRITICAL used to append "cannot be approved from here. Use the
+        terminal." -- untrue since CRITICAL devices got the countdown, and the
+        service has no terminal. It is now the "still blocked" notice.
+        """
+        instance = self.build()
+        instance._handle(json.dumps({
+            "type": agentlink.MSG_CRITICAL, "title": "USB device still blocked",
+            "body": "port 3-9\nNobody answered in time."}).encode())
+        instance.notifier.notify.assert_called_once_with(
+            "USB device still blocked", "port 3-9\nNobody answered in time.",
+            urgency=agent_mod.URGENCY_CRITICAL, actionable=False)
+        self.assertNotIn("terminal",
+                         instance.notifier.notify.call_args.args[1])
+        self.assert_offered_nothing(instance)
+
+    def test_a_critical_notice_without_notifications_is_a_window(self):
+        instance = self.build(notifications=False)
+        instance.dialog.notice.return_value = True
+        instance._handle(json.dumps({
+            "type": agentlink.MSG_CRITICAL, "title": "t",
+            "body": "b"}).encode())
+        self.assertTrue(self.window_closed(instance))
+        instance.dialog.notice.assert_called_once()
         self.assert_offered_nothing(instance)
 
     def test_a_failed_notification_falls_back_to_the_window(self):

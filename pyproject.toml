@@ -54,7 +54,7 @@ dependencies = [
 agent = []
 # coverage[toml]: Python 3.10 has no tomllib, and without the extra coverage
 # would ignore [tool.coverage] below without a word.
-dev = ["coverage[toml]>=7.10", "hypothesis", "pyyaml", "ruff"]
+dev = ["coverage[toml]>=7.10", "hypothesis", "mypy", "pyyaml", "ruff"]
 
 [project.urls]
 Homepage = "https://github.com/capitan0n/probolos"
@@ -105,6 +105,28 @@ ignore = [
 # and test helpers that build real disk images with tools run by name (S607).
 "tests/**" = ["S101", "S103", "S607"]
 
+[tool.mypy]
+# The code that runs as root, and the contract it is driven through: the
+# modules coverage.yml calls the privilege boundary. Imports are followed, so
+# what they use (trust, textsafe, ...) is checked as far as these reach it.
+# The rest of the tree is not held to this yet.
+files = [
+    "probolos/protocol.py",
+    "probolos/gate_server.py",
+    "probolos/gate_client.py",
+    "probolos/privsep.py",
+    "probolos/securefs.py",
+    "probolos/atomicio.py",
+]
+python_version = "3.10"
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# pyudev ships no type information.
+[[tool.mypy.overrides]]
+module = ["pyudev", "pyudev.*"]
+ignore_missing_imports = true
+
 [tool.coverage.run]
 branch = true
 source = ["probolos"]
@@ -114,6 +136,20 @@ source = ["probolos"]
 # children's lines would simply be missing from the count.
 parallel = true
 patch = ["fork", "_exit"]
+# Left out of the count, because no unit test can reach what they do:
+#
+#   interrogate.py        a research instrument (CAPABILITIES.md 1.11), not
+#                         on any execution path of the daemon. It issues raw
+#                         control transfers to real hardware; its numbers
+#                         come from interrogation_study.py on a bench.
+#   countdown_dialog.py   a Tk window run in an interpreter of its own
+#                         (dialogs.TkinterBackend). What it draws needs a
+#                         display; what matters to the boundary -- its exit
+#                         codes, and that anything else is no decision -- is
+#                         tested from the caller's side in test_agent.py.
+#
+# Both are checked on real hardware and desktops instead (TESTING.md).
+omit = ["probolos/interrogate.py", "probolos/countdown_dialog.py"]
 
 [tool.coverage.report]
 show_missing = true

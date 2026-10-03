@@ -1,0 +1,12 @@
+# The type checker mypy.yml installs, at exact versions so a new release
+# cannot change a result on its own. Dependabot proposes updates (see
+# dependabot.yml). Kept apart from requirements-ci.txt: only one job needs it.
+mypy==2.4.0
+
+# mypy's own dependencies
+ast_serialize==0.12.1
+librt==0.16.0
+mypy_extensions==1.1.0
+pathspec==1.1.1
+typing_extensions==4.16.0
+tomli==2.4.1 ; python_version < "3.11"

@@ -1402,7 +1402,7 @@ class Probolos:
             # terminal rather than silently refusing something the user never
             # saw. Only where there IS a terminal: see _unanswered.
             if not self._has_terminal():
-                return self._unanswered(title)
+                return self._unanswered(title, critical=critical)
             print("  (no answer from the desktop agent; asking here)")
         elif agent is not None and not self._has_terminal():
             # _on_add found the agent there, and stages 3 and 4 then took
@@ -1483,7 +1483,7 @@ class Probolos:
             return True
         return answer in ("y", "yes")
 
-    def _unanswered(self, title: str) -> bool:
+    def _unanswered(self, title: str, critical: bool = False) -> bool:
         """
         The agent was asked and gave no decision, and there is no terminal to
         ask in instead. Never an approval: returns False either way.
@@ -1501,6 +1501,12 @@ class Probolos:
         brings a fresh enumeration that is gated normally -- which is what the
         notice tells them to do. Falling back to the terminal, as this used
         to, was the same denial in disguise: the service's stdin is /dev/null.
+
+        A CRITICAL device's notice goes out at critical urgency, which a
+        notification server keeps on screen until it is dismissed. Its dialog
+        was the countdown, and an approval that arrived inside the countdown
+        also ends here, so this is the one notice that may mean something
+        answered for the person.
         """
         if not self.agent.is_live():
             print("  (the desktop agent went away before answering; the "
@@ -1509,7 +1515,8 @@ class Probolos:
             return False
         print("  (no answer from the desktop agent, and no terminal to ask "
               "in; it stays blocked until it is plugged in again)")
-        self.agent.notify(
+        notify = self.agent.notify_critical if critical else self.agent.notify
+        notify(
             "USB device still blocked",
             f"{title}\nNobody answered in time. Unplug it and plug it in "
             f"again to be asked.")
