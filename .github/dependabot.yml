@@ -11,3 +11,16 @@ updates:
     # pulled within days, before a pin that waits would ever have taken it.
     cooldown:
       default-days: 7
+
+  # The exact versions CI checks with (.github/requirements-*.txt). Grouped
+  # into one weekly pull request: Hypothesis alone releases most days, and a
+  # separate request for each would be noise nobody reads.
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      ci-tools:
+        patterns: ["*"]

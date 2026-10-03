@@ -210,10 +210,19 @@ def sanitize(value, limit: int = MAX_LENGTH) -> Sanitized:
         else:
             token = char
 
-        if used + len(token) > limit:
+        if truncated or used + len(token) > limit:
             # Keep scanning rather than breaking: a control character past the
             # cut is still evidence about the device, and a device could
             # otherwise hide one behind 126 harmless characters.
+            #
+            # But nothing more is APPENDED once one token has not fitted. The
+            # cut used to skip only the token that did not fit and go on
+            # adding whatever still did, so a long escape was dropped and the
+            # characters after it shown in its place: "\x1f0" at a limit of 1
+            # came out as "0...", the control character gone from the text
+            # and its neighbour standing where it had been. It also reset the
+            # combining-mark count, letting a fourth mark stack on one base.
+            # The text is now always the start of what was sent, escaped.
             truncated = True
             continue
         out.append(token)

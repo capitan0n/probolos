@@ -42,6 +42,7 @@ ordinary enumeration come first.
 
 from __future__ import annotations
 
+import functools
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -224,7 +225,10 @@ def interrogate(dev, probes: Optional[List[Probe]] = None,
         result = ProbeResult(probe=probe.name, outcome=OUTCOME_OK)
         for _ in range(probe.repeats):
             try:
-                elapsed, value = _timed(lambda: probe.run(dev))
+                # Bound now rather than closed over: a lambda here reads
+                # `probe` when it runs, which is only correct for as long as
+                # _timed calls it at once.
+                elapsed, value = _timed(functools.partial(probe.run, dev))
                 result.latencies_ms.append(elapsed)
                 try:
                     result.payload_len = len(value)

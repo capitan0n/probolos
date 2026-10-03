@@ -1,0 +1,5 @@
+# The workflow linter workflow-lint.yml installs, at an exact version so a new
+# release cannot change a result on its own. Dependabot proposes updates (see
+# dependabot.yml). actionlint is pinned in the workflow itself: it is built
+# from source with `go install`, which pip cannot do.
+zizmor==1.30.1

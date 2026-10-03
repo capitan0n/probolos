@@ -1716,20 +1716,19 @@ class GateTrust(_GateTrustCase):
                                  repr(stored))
 
     def test_a_label_cut_short_by_textsafe_is_kept_not_refused(self):
-        """textsafe is not a fixed point on text it already truncated: a
-        dropped escape resets its combining-mark count, so a second pass
-        escapes a mark the first let through. Refusing the daemon's own
-        label for such a device would lose "always" with the admission
-        already spent."""
+        """
+        The daemon's own label for a device whose product string textsafe
+        cut short. Such a label once came back different from a second
+        cleaning -- the cut skipped an escape that did not fit and went on
+        appending -- and the gate refusing it lost "always" with the
+        admission already spent. The gate cleans and keeps it.
+        """
         product = "A" * 118 + "\u0301" * 3 + "\ufeff" + "\u0301"
         label = textsafe.sanitize(product).text
-        self.assertNotEqual(textsafe.sanitize(label).text, label,
-                            "the fixture must be one textsafe changes again")
         self.admit()
         resp = self.ask(label=label)
         self.assertTrue(resp.ok, resp.detail)
-        self.assertEqual(self.stored()[self.analyzer_key()].label,
-                         textsafe.sanitize(label, protocol.MAX_LABEL).text)
+        self.assertEqual(self.stored()[self.analyzer_key()].label, label)
 
     def test_a_label_textsafe_already_cleaned_is_accepted(self):
         """What the daemon really sends: escapes as visible text."""

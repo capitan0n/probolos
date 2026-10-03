@@ -11,6 +11,10 @@ permissions:
 jobs:
   root:
     runs-on: ubuntu-latest
+    # Generous for a suite that takes about a minute. What it bounds is a
+    # hang: a parser that never returned would otherwise hold the runner for
+    # GitHub's default of six hours before anyone was told.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -18,7 +22,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      - run: python -m pip install pyyaml
+      - run: python -m pip install -r .github/requirements-ci.txt
       # tests.yml runs as the unprivileged runner user, so every test that
       # needs root is skipped there -- privsep.start() among them, which forks
       # the root gate and drops the analyzer to `nobody`: the privilege
@@ -33,4 +37,4 @@ jobs:
           cp -r . "$work"
           chmod -R a+rX "$work"
           cd "$work"
-          sudo env "PATH=$PATH" python -B -m tests.run_all
+          sudo env "PATH=$PATH" HYPOTHESIS_PROFILE=ci python -B -m tests.run_all

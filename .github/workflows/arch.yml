@@ -18,15 +18,25 @@ jobs:
     # The rolling image on purpose: this job exists to meet the newest Python
     # and pyudev that Arch and Manjaro ship, and a digest pin would defeat it.
     container: archlinux:latest # zizmor: ignore[unpinned-images]
+    # Generous for a suite that takes about a minute. What it bounds is a
+    # hang: a parser that never returned would otherwise hold the runner for
+    # GitHub's default of six hours before anyone was told.
+    timeout-minutes: 15
     steps:
       # Distribution packages, not pip: what an Arch or Manjaro user really
       # runs, including the real pyudev, which tests.yml never installs. git
       # first, so the checkout below is a real clone.
-      - name: Install Python, pyudev, PyYAML, ruff and git from the Arch repos
-        run: pacman -Syu --noconfirm --needed git python python-pyudev python-yaml ruff
+      #
+      # No ruff here. Lint runs in tests.yml at the version pinned in
+      # .github/requirements-ci.txt; Arch's ruff is whatever was released
+      # last, and a new release adding a rule to the selected sets would turn
+      # this job red for a reason that has nothing to do with Arch.
+      - name: Install Python, pyudev, PyYAML, Hypothesis and git from the Arch repos
+        run: pacman -Syu --noconfirm --needed git python python-pyudev python-yaml python-hypothesis
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: ruff check .
       # The container runs as root, so the root-only tests run here as well.
       - run: python -m tests.run_all
+        env:
+          HYPOTHESIS_PROFILE: ci

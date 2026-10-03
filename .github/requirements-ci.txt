@@ -1,0 +1,16 @@
+# What CI installs to check Probolos -- never what Probolos needs to run (that
+# is pyudev alone, from pyproject.toml). Exact versions, dependencies included,
+# so a new release of a linter or test tool cannot change a result on its own:
+# a red build always means the code changed. Dependabot proposes updates as
+# pull requests (see dependabot.yml), each to be read before merging.
+#
+# Locally: pip install -r .github/requirements-ci.txt
+coverage==7.16.2
+hypothesis==6.168.3
+pyyaml==6.0.3
+ruff==0.16.10
+
+# hypothesis's own dependencies
+sortedcontainers==2.4.0
+exceptiongroup==1.3.1 ; python_version < "3.11"
+typing-extensions==4.16.0 ; python_version < "3.11"

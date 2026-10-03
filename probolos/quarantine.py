@@ -50,6 +50,7 @@ way for Probolos to leave a keyboard permanently captured.
 from __future__ import annotations
 
 import fcntl
+import itertools
 import os
 import struct
 import time
@@ -166,7 +167,7 @@ class Observation:
     def intervals(self) -> List[float]:
         """Gaps between consecutive key presses, in seconds."""
         stamps = [k.timestamp for k in self.key_presses]
-        return [b - a for a, b in zip(stamps, stamps[1:])]
+        return [b - a for a, b in itertools.pairwise(stamps)]
 
     def time_to_first_key(self) -> Optional[float]:
         """Seconds from the start of observation to the first keystroke."""

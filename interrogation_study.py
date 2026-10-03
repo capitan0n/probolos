@@ -85,8 +85,12 @@ def study_one(dev, label: str, intrusive: bool) -> dict:
                 if dev.is_kernel_driver_active(intf.bInterfaceNumber):
                     dev.detach_kernel_driver(intf.bInterfaceNumber)
                     detached.append(intf.bInterfaceNumber)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Not fatal, but not nothing either: the probes then run
+                # against an interface the kernel driver still owns, and the
+                # row they produce has to be read with that in mind.
+                print(f"  ! could not detach driver on interface "
+                      f"{intf.bInterfaceNumber}: {exc}", file=sys.stderr)
 
     try:
         results = interrogate.interrogate(dev, include_intrusive=intrusive)

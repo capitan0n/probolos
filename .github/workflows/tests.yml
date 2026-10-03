@@ -11,6 +11,10 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Generous for a suite that takes about a minute. What it bounds is a
+    # hang: a parser that never returned would otherwise hold the runner for
+    # GitHub's default of six hours before anyone was told.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -24,9 +28,14 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      # PyYAML lets the --rules tests run instead of skipping; ruff is the
-      # linter configured in pyproject.toml. Nothing else is needed: the suite
-      # uses only the standard library, and needs no root and no USB hardware.
-      - run: python -m pip install pyyaml ruff
+      # The QA tools, at the exact versions every job uses. PyYAML lets the
+      # --rules tests run instead of skipping and Hypothesis the property
+      # tests; ruff is the linter configured in pyproject.toml. The suite
+      # itself needs only the standard library, no root and no USB hardware.
+      - run: python -m pip install -r .github/requirements-ci.txt
       - run: ruff check .
+      # The ci profile is derandomized: the same inputs on every run, so a red
+      # build is reproducible rather than a coin toss (tests/test_properties.py).
       - run: python -m tests.run_all
+        env:
+          HYPOTHESIS_PROFILE: ci

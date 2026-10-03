@@ -28,6 +28,7 @@ finding to be either an emergency or invisible.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Dict, List, Optional, Sequence, Set
@@ -889,7 +890,7 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
 
     # -- 2. Partitions that overlap each other -------------------------------
     ordered = sorted(partitions, key=lambda p: p.start_lba)
-    for earlier, later in zip(ordered, ordered[1:]):
+    for earlier, later in itertools.pairwise(ordered):
         if later.start_lba < earlier.end_lba:
             add("overlapping-partitions", Severity.WARNING,
                 "Two partitions claim the same sectors",

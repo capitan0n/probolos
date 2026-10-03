@@ -42,13 +42,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Placeholders, kept so `pip install .[agent]` / `.[dev]` keep resolving. Both
-# are empty on purpose: the agent's dialog backends (kdialog, zenity, and the
-# tkinter fallback) are distro packages, not pip ones, and the test suite runs
-# on the standard library alone. PyYAML, needed only for --rules, is likewise
-# optional and imported on demand.
+# `agent` stays an empty placeholder, kept so `pip install .[agent]` resolves:
+# the agent's dialog backends (kdialog, zenity, and the tkinter fallback) are
+# distro packages, not pip ones.
+#
+# `dev` is what the quality checks use, never what Probolos needs to run. The
+# suite itself still runs on the standard library alone; with these installed
+# it also runs the property-based tests (Hypothesis), the --rules tests
+# (PyYAML), the lint (ruff) and the coverage measurement. CI installs the same
+# tools at the exact versions in .github/requirements-ci.txt.
 agent = []
-dev = []
+# coverage[toml]: Python 3.10 has no tomllib, and without the extra coverage
+# would ignore [tool.coverage] below without a word.
+dev = ["coverage[toml]>=7.10", "hypothesis", "pyyaml", "ruff"]
 
 [project.urls]
 Homepage = "https://github.com/capitan0n/probolos"
@@ -70,6 +76,45 @@ packages = ["probolos"]
 target-version = "py310"
 
 [tool.ruff.lint]
-# pyflakes + pycodestyle errors (ruff's defaults). The tree is clean against
-# them; `ruff check .` is meant to stay that way.
-select = ["E4", "E7", "E9", "F"]
+# pyflakes + pycodestyle errors (ruff's defaults), and two sets chosen for a
+# program that runs as root and parses what hostile hardware sends it:
+#
+#   B  flake8-bugbear: likely bugs -- closures over a loop variable, mutable
+#      default arguments, zip() silently dropping the tail, exceptions
+#      re-raised without their cause.
+#   S  flake8-bandit: security smells -- a shell anywhere, eval/exec, pickle,
+#      weak hashes or `random` where a secret is needed, world-writable
+#      permissions, hardcoded temporary paths, executables found via $PATH.
+#
+# The tree is clean against all of them; `ruff check .` is meant to stay that
+# way. Every exception below says why it is one.
+select = ["E4", "E7", "E9", "F", "B", "S"]
+ignore = [
+    # S603 flags EVERY subprocess call that does not use a shell -- that is,
+    # the safe form, which is the only form here. What this project actually
+    # holds to is stricter, and the rules that check it stay on: no shell at
+    # all (S602, S604-S606), and no executable looked up through $PATH by a
+    # literal name (S607). The one external tool root runs, loginctl, is
+    # resolved by absolute path (session._find_loginctl).
+    "S603",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The tests: bare asserts in the standalone descriptor tests (S101), files
+# made group- or world-writable on purpose to prove they are refused (S103),
+# and test helpers that build real disk images with tools run by name (S607).
+"tests/**" = ["S101", "S103", "S607"]
+
+[tool.coverage.run]
+branch = true
+source = ["probolos"]
+# The suite forks: privsep.start() runs the gate and the analyzer as child
+# processes, which leave through os._exit. Each process writes its own data
+# file (parallel) and `coverage combine` merges them; without the patches the
+# children's lines would simply be missing from the count.
+parallel = true
+patch = ["fork", "_exit"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
