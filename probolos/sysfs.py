@@ -597,6 +597,9 @@ class _DirectBackend:
     # here rather than failing at the point of use, because deferred_bind has to
     # know BEFORE it starts whether the mechanism can complete.
     supports_bus_wide = True
+    # Running as root without a gate, the daemon writes the trust store itself
+    # (TrustStore.save); there is nobody to delegate to and no need to.
+    supports_trust = False
 
     def admit(self, syspath, instance) -> None:
         # realpath + O_NOFOLLOW, for the reason spelled out on
@@ -720,6 +723,35 @@ def get_authorized_default(hub: Path) -> Optional[int]:
 def backend_supports_bus_wide() -> bool:
     """Whether the active backend will perform bus-wide driver operations."""
     return bool(getattr(_backend, "supports_bus_wide", False))
+
+
+def backend_can_trust() -> bool:
+    """
+    Whether the active backend can persist trust for this process.
+
+    True only for the gate backend under --privsep, where the root gate
+    writes the entry the analyzer cannot. `is True` rather than bool():
+    "always" is the one answer that grants something permanent, and a
+    backend that merely has some truthy attribute by that name (a test
+    double, a future backend) must not make it appear.
+    """
+    return getattr(_backend, "supports_trust", False) is True
+
+
+def remember_via_backend(dev: UsbDevice, key: str, label: str) -> None:
+    """
+    Have the active backend remember an admitted device. Raises OSError.
+
+    The daemon calls this only when it cannot write the trust store itself.
+    OSError on every failure, as admit_device: the caller reports it and the
+    device stays admitted once, which is what was approved either way.
+    """
+    if not backend_can_trust():
+        raise OSError("this process cannot write the trust store and no "
+                      "privileged gate is available to do it")
+    if dev.instance_id is None:
+        raise OSError("device instance is unavailable; trust refused")
+    _backend.trust(dev.syspath, dev.instance_id, key, label)
 
 
 def get_drivers_autoprobe() -> Optional[int]:

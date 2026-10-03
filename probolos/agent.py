@@ -57,7 +57,7 @@ from . import dialogs
 from .agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_UNAVAILABLE,
                         ANSWER_YES, DEFAULT_SOCKET,
                         MAX_MESSAGE, MSG_ANSWER, MSG_CRITICAL, MSG_DECIDE,
-                        STEPS_COUNTDOWN, STEPS_ONE, STEPS_TWO)
+                        MSG_NOTICE, STEPS_COUNTDOWN, STEPS_ONE, STEPS_TWO)
 
 APP_NAME = "Probolos"
 ICON = "drive-removable-media-usb"
@@ -253,6 +253,10 @@ MIN_DIALOG_TIMEOUT = 10.0
 MAX_DIALOG_TIMEOUT = 600.0
 DEFAULT_DIALOG_TIMEOUT = 60.0
 
+# How long a notice window stays up when there is no notification server to
+# carry it. It approves nothing, so this only bounds how long it is in the way.
+NOTICE_TIMEOUT = 120.0
+
 
 def _as_text(value, fallback: str) -> str:
     """
@@ -340,6 +344,8 @@ class Agent:
         self.dialog = dialogs.detect(log=log)
         self.countdown_dialog = self._pick_countdown_dialog()
         self.sock: Optional[socket.socket] = None
+        # Held while a notice WINDOW is on screen; see _show_notice.
+        self._notice_window = threading.Lock()
 
     def _pick_countdown_dialog(self):
         """
@@ -442,6 +448,12 @@ class Agent:
                 "approved from here. Use the terminal.",
                 urgency=URGENCY_CRITICAL, actionable=False)
             return
+        if kind == MSG_NOTICE:
+            # Display only, like MSG_CRITICAL: nothing is sent back, and
+            # nothing shown offers a way to allow anything.
+            self._show_notice(_as_text(message.get("title"), "Probolos"),
+                              _as_text(message.get("body"), ""))
+            return
         if kind != MSG_DECIDE:
             return
 
@@ -449,6 +461,47 @@ class Agent:
         timeout = _dialog_timeout(message.get("timeout"))
         answer = self._ask_user(message, timeout)
         self._reply(request_id, answer)
+
+    def _show_notice(self, title: str, body: str) -> None:
+        """
+        Tell the person something, offering no answer -- "this device is
+        still blocked; replug it to be asked".
+
+        A notification when the desktop has a notification server, at normal
+        urgency: nothing is waiting on anyone. Otherwise the dialog backend's
+        one-button notice window. That blocks until it is closed, and this
+        runs on the receive loop, so the window gets a thread of its own: the
+        next question must not queue behind a window nobody is looking at.
+        One window at a time; a notice that arrives while one is up is logged
+        rather than stacked, so whatever occupies the socket cannot bury the
+        desktop in windows.
+        """
+        if self.notifier.available() and self.notifier.notify(
+                title, body, urgency=URGENCY_NORMAL,
+                actionable=False) is not None:
+            return
+        dialog = self.dialog
+        if dialog is None:
+            self.log(f"[agent] {title}: {body}")
+            return
+        guard = getattr(self, "_notice_window", None)
+        if guard is None:
+            guard = self._notice_window = threading.Lock()
+        if not guard.acquire(blocking=False):
+            self.log(f"[agent] a notice is already on screen; not showing "
+                     f"another: {title}")
+            return
+
+        def show() -> None:
+            try:
+                dialog.notice(f"Probolos — {title}", body,
+                              timeout=NOTICE_TIMEOUT)
+            except Exception as exc:   # noqa: BLE001 -- a window, not the agent
+                self.log(f"[agent] could not show a notice: {exc!r}")
+            finally:
+                guard.release()
+
+        threading.Thread(target=show, daemon=True).start()
 
     def _ask_user(self, message: dict, timeout: float) -> str:
         """
@@ -524,8 +577,8 @@ class Agent:
                 # No way to ask -- no kdialog, no zenity, no tkinter -- or
                 # nobody answered in time. This is NOT a refusal: the user
                 # never refused anything. Return a value the analyzer does not
-                # recognise as a decision, which it treats as "no answer" and
-                # falls back to the terminal.
+                # recognise as a decision, which it records as "no answer"
+                # (asking on its terminal instead, if it has one).
                 #
                 # (Returning ANSWER_NO here, as this line used to, meant that a
                 # machine without a dialog backend silently denied EVERY device

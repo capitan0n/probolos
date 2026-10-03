@@ -677,19 +677,23 @@ def main(argv=None) -> None:
             # replace any file in it, so handing over the trust store's
             # directory would let a hostile process running as the same shared
             # `nobody` account forge an entry that admits its own device with
-            # no prompt. The analyzer reads trust and cannot rewrite it; the
-            # cost is that "always" cannot be persisted from the unprivileged
-            # half, which serve() reports plainly when it happens.
+            # no prompt. The analyzer reads trust and cannot rewrite it.
+            # "Always" is persisted by the ROOT GATE instead (REQ_TRUST): the
+            # analyzer asks over the private socketpair, and the gate writes
+            # the entry itself, only for a device it just admitted and under
+            # a fingerprint it measured itself.
             # Trust is read-only to the analyzer: readable file, root-owned
             # directory. Done before the drop, while we still can.
             if not args.no_trust and trust_path:
                 privsep.prepare_trust_readable(trust_path)
             # --watch-media widens what the gate will open (whole disks of
             # admitted storage hosts), so the gate learns it from the root
-            # side here and never from the analyzer.
+            # side here and never from the analyzer. The trust path likewise:
+            # it names the one file the gate writes.
             rc = privsep.start(analyzer_main, drop_to=args.privsep_user,
                                state_paths=[p for p in (ledger_path,) if p],
-                               watch_media=args.watch_media and not args.dry_run)
+                               watch_media=args.watch_media and not args.dry_run,
+                               trust_path=None if args.no_trust else trust_path)
         except privsep.PrivsepError as exc:
             sys.exit(f"privsep: {exc}")
         sys.exit(rc)

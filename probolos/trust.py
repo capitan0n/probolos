@@ -226,7 +226,16 @@ class TrustStore:
         # Taken BEFORE reading: if the file changes between the two, the
         # recorded signature is the older one and the next refresh reads again.
         self._disk_sig = self._signature()
-        if not self.path.exists():
+        try:
+            if not self.path.exists():
+                return
+        except OSError as exc:
+            # Path.exists() swallows only "not there"; EACCES -- a directory
+            # this process cannot traverse, the analyzer as `nobody` under a
+            # restrictive umask -- raised out of the constructor, which ended
+            # the analyzer at startup and took the gate with it. Fail closed
+            # instead: nothing is trusted, and the reason is reported.
+            self.load_error = f"cannot reach the trust store: {exc}"
             return
 
         # C3: the trust store is an admission list. Anything in it skips the
@@ -364,7 +373,16 @@ class TrustStore:
 
         return None
 
-    def save(self) -> Optional[str]:
+    def save(self, readable: bool = False) -> Optional[str]:
+        """
+        Write the store; None on success, else the error (reported once).
+
+        `readable` asks for 0644 when the file does not exist yet. The root
+        gate passes it: under --privsep it is the gate that writes "always",
+        and a store it created 0600 would be one the analyzer (`nobody`) could
+        not read back -- the device remembered on disk and asked about anyway.
+        An existing file keeps the read bits it has, whatever this says.
+        """
         import os
         # Keep the read bits the file already has, never any write bits.
         # Under --privsep the launcher makes this file 0644 so the analyzer
@@ -372,6 +390,8 @@ class TrustStore:
         # would lock a running analyzer out of the whole store until restart.
         try:
             mode = 0o600 | (os.stat(self.path).st_mode & 0o044)
+        except FileNotFoundError:
+            mode = 0o644 if readable else 0o600
         except OSError:
             mode = 0o600
         try:
@@ -397,6 +417,10 @@ class TrustStore:
         trust and can never write it. "Always allow" was offered there anyway,
         and clicking it admitted the device once and lost the trust entry,
         with one line in the journal to say so.
+
+        False here no longer means "always" is impossible: under --privsep the
+        root gate writes the entry instead (protocol REQ_TRUST), and
+        daemon._can_remember asks the backend about that separately.
         """
         import os
         directory = str(self.path.parent)

@@ -178,8 +178,8 @@ class KDialogBackend(DialogBackend):
     def confirm(self, title: str, text: str, yes_label: str,
                 no_label: str, timeout: float) -> Optional[bool]:
         # --warningyesno gives a warning icon and two labelled buttons. Exit
-        # code 0 means the first (yes) button; anything else is a refusal,
-        # including the window being closed.
+        # code 0 means the first (yes) button and 1 the second, which is also
+        # what closing the window gives.
         # kdialog renders the body as Qt rich text, so the device-controlled
         # text is escaped; the title is our own string but escaped too for
         # uniformity and in case a device name is ever folded into it.
@@ -193,7 +193,14 @@ class KDialogBackend(DialogBackend):
             return None         # left unanswered: no decision
         except OSError:
             return None         # could not ask at all
-        return result.returncode == 0
+        # Only the two buttons are answers. A negative code is kdialog killed
+        # by a signal -- Qt aborts when the display goes away, as it does at
+        # logout -- and 254/255 are kdialog failing on its own. Both used to
+        # read as "Keep blocked", so a dialog that died under nobody's hand
+        # was recorded as "user rejected", and the next plug got the
+        # previously-rejected countdown for a refusal nobody made. They are
+        # no decision (None), like a timeout.
+        return {0: True, 1: False}.get(result.returncode)
 
     def choose(self, title: str, text: str, once_label: str,
                always_label: str, no_label: str,
@@ -215,11 +222,10 @@ class KDialogBackend(DialogBackend):
             return None
         except OSError:
             return None
-        if result.returncode == 0:
-            return CHOICE_ONCE
-        if result.returncode == 1:
-            return CHOICE_ALWAYS
-        return CHOICE_NO
+        # 2 is the cancel button, and closing the window. Anything else is
+        # no decision, as for confirm().
+        return {0: CHOICE_ONCE, 1: CHOICE_ALWAYS,
+                2: CHOICE_NO}.get(result.returncode)
 
     def notice(self, title: str, text: str, timeout: float) -> Optional[bool]:
         # --sorry: a warning icon and one "OK" button, which the text says
@@ -264,7 +270,12 @@ class ZenityBackend(DialogBackend):
             return None
         except OSError:
             return None
-        return result.returncode == 0
+        # 0 is OK and 1 is Cancel or the window closed. Anything else -- a
+        # signal (negative), zenity's own error exit (255) -- is not a button
+        # and so no decision, for the reason given in KDialogBackend.confirm.
+        # GTK exits 1 when it loses the display, which stays
+        # indistinguishable from Cancel; that much cannot be told apart here.
+        return {0: True, 1: False}.get(result.returncode)
 
     def choose(self, title: str, text: str, once_label: str,
                always_label: str, no_label: str,
@@ -285,6 +296,8 @@ class ZenityBackend(DialogBackend):
             return None
         if result.returncode == 0:
             return CHOICE_ONCE
+        if result.returncode != 1:
+            return None         # not a button: see confirm()
         if (result.stdout or "").strip() == always_label:
             return CHOICE_ALWAYS
         return CHOICE_NO
@@ -391,6 +404,32 @@ class TkinterBackend(DialogBackend):
         if result.returncode == self._NO:
             return CHOICE_NO
         return None
+
+    def notice(self, title: str, text: str, timeout: float) -> Optional[bool]:
+        # One OK button that approves nothing, like kdialog --sorry and
+        # zenity --warning. The base class's notice() raised
+        # NotImplementedError here, so a tkinter-only desktop with no
+        # notification server could not be told anything at all. Under -I,
+        # like the countdown, so neither the environment nor the current
+        # directory decides what code draws it.
+        script = (
+            "import sys, tkinter as tk\n"
+            "from tkinter import messagebox\n"
+            "root = tk.Tk(); root.withdraw()\n"
+            "root.attributes('-topmost', True)\n"
+            "messagebox.showwarning(sys.argv[1], sys.argv[2])\n"
+            f"sys.exit({self._NO})\n")
+        try:
+            result = subprocess.run(
+                [self._python(), "-I", "-c", script, title, text],
+                timeout=timeout, capture_output=True)
+        except subprocess.TimeoutExpired:
+            return False        # left open for the whole time: closed for them
+        except OSError:
+            return None
+        # The script ends on _NO, the one code that never approves anything;
+        # any other exit is a tk that crashed before drawing the window.
+        return True if result.returncode == self._NO else None
 
     def confirm_countdown(self, title: str, text: str, yes_label: str,
                           no_label: str, delay: float,

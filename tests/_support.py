@@ -306,3 +306,27 @@ class _TreeCase(unittest.TestCase):
         with self.assertRaises(OSError) as caught:
             os.close(sysfs._DirectBackend().open_block(path))
         return str(caught.exception)
+
+
+# ---------------------------------------------------------------------------
+# The service's stdin
+# ---------------------------------------------------------------------------
+
+class ServiceStdin:
+    """
+    What systemd gives the service as stdin: /dev/null -- not a terminal, and
+    EOF to every read. Every attribute looked up on it is recorded, so a test
+    can say the terminal was never consulted at all, while code that does
+    consult it still gets exactly what the service would get.
+    """
+
+    def __init__(self):
+        self._null = open(os.devnull)
+        self.touches = []
+
+    def release(self):
+        self._null.close()
+
+    def __getattr__(self, name):
+        self.touches.append(name)
+        return getattr(self._null, name)

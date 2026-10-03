@@ -60,6 +60,21 @@ class Decision:
     timestamp: float
 
 
+def _gate_keeps_trust(store) -> bool:
+    """
+    Whether the privileged gate would keep "always" for this process.
+
+    Only under --privsep (a backend that can trust), and only where the gate
+    would not refuse anyway: it never rewrites a store that failed its checks
+    (load_error), and it never creates the store's directory (see
+    gate_server._do_trust), so offering "always" then would only lose the
+    answer. os.path.isdir rather than Path.is_dir: an EACCES must answer
+    False here, not raise.
+    """
+    return (sysfs.backend_can_trust() and not store.load_error
+            and os.path.isdir(store.path.parent))
+
+
 class Probolos:
     def __init__(self,
                  dry_run: bool = False,
@@ -99,9 +114,11 @@ class Probolos:
         # Media changes inside admitted storage hosts (mediawatch.py). None
         # unless --watch-media: a separate detection layer, not the gate.
         self.media_watch = media_watch
-        # Devices attached while the screen was locked. They are held blocked
-        # and asked about when someone returns, so nobody has to unplug and
-        # replug hardware just because they stepped away.
+        # Devices attached while the screen was locked, or while nobody could
+        # be asked at all (no desktop agent connected and no terminal). They
+        # are held blocked and asked about when someone can answer, so nobody
+        # has to unplug and replug hardware just because they stepped away or
+        # had not logged in yet.
         #
         # The value is (syspath, instance_id), not the path alone. A held
         # device is identified by the kernel directory INSTANCE it had when it
@@ -120,6 +137,14 @@ class Probolos:
         self._was_locked = False
         self._stream_failing = False    # udev event stream overflowed
         self.known: Set[str] = set()    # devices present at startup
+        # Device name -> (instance, reason) of the last decision recorded for
+        # it, so a device held again for the reason it is already held under
+        # is not recorded again (see _hold).
+        self._last_recorded: dict = {}
+        # Device name -> (instance, count): how often a held device was
+        # inspected and then not asked because the agent went away first
+        # (see _may_hold_again).
+        self._unseen_asks: dict = {}
 
     # ------------------------------------------------------------------
     # startup
@@ -161,7 +186,7 @@ class Probolos:
             for dev in stranded:
                 print(f"      {report.one_liner(dev)}")
                 self.pending[dev.name] = (dev.syspath, dev.instance_id)
-            print("    You will be asked about them now, without unplugging "
+            print("    You will be asked about them without unplugging "
                   "anything.\n")
 
     # ------------------------------------------------------------------
@@ -190,7 +215,10 @@ class Probolos:
 
         # Devices found blocked at startup are decided immediately -- unless
         # the screen is locked, in which case they simply stay queued until
-        # someone is back, exactly like a device attached while away.
+        # someone is back, exactly like a device attached while away. A
+        # service starting at boot has no agent and no terminal yet; they
+        # then stay queued until one connects, instead of being "asked" on a
+        # stdin that reads EOF and denied.
         if self.pending and not self.dry_run:
             if (self.lock_policy == session_mod.POLICY_IGNORE
                     or not self.monitor.is_locked()):
@@ -214,12 +242,24 @@ class Probolos:
             # about. Polling once a second is plenty: this is a human-timescale
             # event, and polling avoids depending on a session bus the
             # unprivileged analyzer cannot reach.
+            drained = False
             if self.lock_policy == session_mod.POLICY_QUEUE and not self.dry_run:
                 locked = self.monitor.is_locked()
                 if locked is not None:
                     if self._was_locked and not locked:
-                        self._drain_pending()
+                        self._drain_pending("Screen unlocked")
+                        drained = True
                     self._was_locked = bool(locked)
+
+            # Devices held because nobody could be asked are asked about once
+            # a desktop agent is there to ask. Polled like the lock: the agent
+            # connects on the accept thread, whenever its owner logs in. One
+            # drain per pass, and it cannot spin -- _drain_pending empties the
+            # queue before it starts, and whatever _on_add puts back is held
+            # for a reason (agent gone again, screen locked) that also stops
+            # the next pass from draining.
+            if not drained and self._agent_can_take_held():
+                self._drain_pending("Desktop agent connected")
 
             # The event stream itself can fail, and that must not end the gate
             # either. When the netlink receive buffer overflows -- events
@@ -328,8 +368,9 @@ class Probolos:
         Handle a device attachment.
 
         `was_held` marks a device that spent time blocked in the queue -- it
-        arrived while the screen was locked, or was left undecided by an
-        earlier run. Such a device is always asked about, even if remembered.
+        arrived while the screen was locked or while nobody could be asked,
+        or was left undecided by an earlier run. Such a device is always asked
+        about, even if remembered.
 
         The reason is that trust was granted while its owner was present and
         watching. A device that turned up while nobody was there has not earned
@@ -342,6 +383,24 @@ class Probolos:
 
         if name in self.known:
             return  # a device we deliberately ignore
+
+        # Already held? udev replays 'add' (`udevadm trigger`, a settle, a
+        # rescan) for a device that is sitting in the queue just as for one
+        # that is live, and the queue entry stands: gating the replay would
+        # ask about the device now AND again when the queue drains, and for
+        # one held behind a locked screen it would skip what was_held exists
+        # to force -- after an unlock, a remembered device would be admitted
+        # on trust without the question. Only a different device at the port
+        # (the held one left and its 'remove' was lost) makes the entry stale.
+        queued = None if was_held else self.pending.get(name)
+        if queued is not None:
+            _held_path, held_instance = queued
+            if held_instance is None or self._still_same_device(
+                    path, held_instance):
+                print(f"[*] {name}: already held; it is asked about when "
+                      f"someone can answer")
+                return
+            del self.pending[name]
 
         # Already live and already decided? Then this is a repeat 'add' for a
         # device that is past the gate, and re-running the gate on it is
@@ -406,10 +465,17 @@ class Probolos:
                 and rules.worst(findings) < rules.Severity.CRITICAL):
             try:
                 sysfs.admit_device(dev)
-                self.trust.record_admission(dev)
-                error = self.trust.save()
-                if error:
-                    print(f"[!] could not update trust store: {error}")
+                # last_seen / times_admitted / ports are bookkeeping, nothing
+                # decides on them. Under --privsep this process cannot write
+                # the store, and the gate deliberately takes no such writes --
+                # its trust surface is one entry per admission, kept small --
+                # so trying here only printed "could not update trust store"
+                # once per run, about something that was never going to work.
+                if self.trust.writable():
+                    self.trust.record_admission(dev)
+                    error = self.trust.save()
+                    if error:
+                        print(f"[!] could not update trust store: {error}")
                 print(f"[=] TRUSTED — {report.one_liner(dev, findings)}\n")
                 self.known.add(dev.name)
                 self._record(Decision(dev, True, "trusted", time.time()),
@@ -417,6 +483,22 @@ class Probolos:
                 self._watch_if_storage(dev, "trusted")
             except OSError as exc:
                 print(f"[!] failed to authorize trusted device: {exc}")
+            return
+
+        # ---- nobody can be asked ------------------------------------------
+        # The service has no terminal: its stdin is /dev/null. With no desktop
+        # agent connected -- before anyone has logged in, after a logout,
+        # while the agent restarts -- the terminal fallback read EOF and
+        # denied the device on the spot, so a keyboard plugged in at the login
+        # screen was dead by the time its owner could have been asked, and
+        # the only way to get the question was to unplug and replug it. It is
+        # held instead, like a device attached behind a locked screen, and
+        # for the same reason BEFORE stages 3 and 4: both switch it on, and
+        # powering up unknown hardware that nobody can be asked about is what
+        # the screen-lock hold exists to avoid. After the trust fast path, so
+        # a remembered keyboard at the login screen is still just admitted.
+        if self._nobody_can_be_asked():
+            self._hold_for_agent(dev, findings)
             return
 
         print()
@@ -518,11 +600,25 @@ class Probolos:
             print("  anyway.\n")
 
         self._remember = False
+        # Set by _ask when nobody saw the question at all: a reason to hold
+        # the device, not to refuse it. Reset here so a stale value from an
+        # earlier device can never decide this one.
+        self._hold_instead = False
         if self.watchdog:
             with self.watchdog.paused():
                 approved = self._ask(dev, findings)
         else:
             approved = self._ask(dev, findings)
+        if not approved and self._hold_instead:
+            if self._may_hold_again(dev):
+                self._hold_for_agent(dev, findings, medium, inspected=True)
+                return
+            # Falls through to the refusal below: _answered is False, so it
+            # is recorded as "no answer", never as a refusal.
+            print(f"  The desktop agent went away {self.MAX_UNSEEN_ASKS} "
+                  f"times before this device could be decided; it is no "
+                  f"longer held and stays blocked. Replug it to be asked "
+                  f"again.")
         if approved:
             if (self.stop_event is not None and self.stop_event.is_set()):
                 print("[!] Safety stop active; approval discarded.")
@@ -542,37 +638,23 @@ class Probolos:
             self._record(Decision(dev, True, "user approved", time.time()),
                          findings, medium)
             if getattr(self, "_remember", False) and self.trust is not None:
-                entry = self.trust.trust(dev)
-                if entry is not None:
-                    self.trust.record_admission(dev)
-                    error = self.trust.save()
-                    print(f"  trust could not be saved: {error}" if error
-                          else "  remembered for future admissions")
+                self._remember_admitted(dev)
             print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
             self._watch_if_storage(dev, "approved")
         else:
-            # For a quarantined device this write genuinely matters: it was
-            # switched on for the observation and is alive right now. For every
-            # other device it is a no-op that makes the state explicit.
             # "user rejected" only when someone actually said no. A timeout,
             # an EOF (the service's stdin is /dev/null) or an unanswered
             # dialog denies the device just the same, but recording it as a
             # refusal made the next plug warn "You have refused this device
-            # before" about a refusal nobody made.
-            reason = ("user rejected" if getattr(self, "_answered", True)
-                      else "no answer")
+            # before" about a refusal nobody made. The journal line says the
+            # same thing the record does.
+            answered = getattr(self, "_answered", True)
+            reason = "user rejected" if answered else "no answer"
             self._record(Decision(dev, False, reason, time.time()),
                          findings, medium)
-            try:
-                sysfs.set_authorized(dev.syspath, 0)
-            except OSError as exc:
-                # Never swallowed. Failing to switch off a device that just
-                # typed at you is the most dangerous outcome in this program.
-                print(f"\n[!!] COULD NOT DEAUTHORIZE {dev.name}: {exc}")
-                print("[!!] The device may still be live. Unplug it now, or "
-                      "run as root:")
-                print(f"[!!]   echo 0 > {dev.syspath}/authorized\n")
-            print(f"[-] REJECTED — {report.one_liner(dev, findings)}\n")
+            self._switch_off(dev)
+            verdict = "REJECTED" if answered else "DENIED, NOT ANSWERED"
+            print(f"[-] {verdict} — {report.one_liner(dev, findings)}\n")
 
     @staticmethod
     def _interfaces(dev):
@@ -695,27 +777,170 @@ class Probolos:
               "will be asked,")
         print("    or release them now with:  sudo python -m probolos --release")
 
+    def _hold(self, dev: sysfs.UsbDevice, reason: str, findings=(),
+              medium: Optional["storage.MediumReport"] = None, *,
+              inspected: bool = False) -> None:
+        """
+        Keep a device blocked and queue it, to be asked about once someone
+        can be. Shared by every reason a question is put off -- the screen is
+        locked, or nobody can be asked at all -- so they cannot drift apart
+        in how a held device is identified or recorded.
+
+        The reason always starts "held:", and it is recorded with approved
+        False: a held device is neither endorsed (the drift baseline does not
+        move) nor refused (the previously-rejected rule matches only "user
+        rejected"), because nobody has decided anything about it yet.
+
+        `inspected` says stages 3 or 4 may have switched the device on before
+        it came to this, so the write that keeps it blocked is checked as
+        loudly as a refusal's. Otherwise the device has never been switched on
+        and the write only makes the state explicit.
+        """
+        # Instance recorded alongside the path: the entry is about THIS
+        # device, not about whatever later occupies this port.
+        self.pending[dev.name] = (dev.syspath, dev.instance_id)
+        if inspected:
+            self._switch_off(dev)
+        else:
+            try:
+                sysfs.set_authorized(dev.syspath, 0)
+            except OSError:
+                pass
+        # Recorded once per device and reason. A held device goes back
+        # through _on_add when the queue drains, and is held again if the
+        # agent leaves before answering. That is not news, and each record
+        # costs one of the ledger's MAX_DECISIONS: enough of them would push
+        # a real "user rejected" out of the history, and the
+        # previously-rejected countdown with it, without anyone having
+        # decided anything.
+        if self._last_recorded.get(dev.name) != (dev.instance_id, reason):
+            self._record(Decision(dev, False, reason, time.time()),
+                         findings, medium)
+
+    # How often one held device may be put through inspection and then lose
+    # its question because the desktop agent went away, before it is refused
+    # as unanswered instead of held again. Each round can switch it on for
+    # stages 3 and 4; an agent that crashes on the question and is restarted
+    # by systemd would otherwise power up the same unknown hardware every few
+    # seconds, for as long as the crash lasts.
+    MAX_UNSEEN_ASKS = 3
+
+    def _may_hold_again(self, dev: sysfs.UsbDevice) -> bool:
+        """Count one lost question for this instance; False once at the cap."""
+        instance, count = self._unseen_asks.get(dev.name, (None, 0))
+        if instance != dev.instance_id:
+            count = 0
+        count += 1
+        self._unseen_asks[dev.name] = (dev.instance_id, count)
+        return count < self.MAX_UNSEEN_ASKS
+
     def _hold_until_unlocked(self, dev: sysfs.UsbDevice) -> None:
         """Keep a device blocked and remember to ask about it later."""
         if self.lock_policy == session_mod.POLICY_QUEUE:
-            # Instance recorded alongside the path: the entry is about THIS
-            # device, not about whatever later occupies this port.
-            self.pending[dev.name] = (dev.syspath, dev.instance_id)
             print(f"[⏸] SCREEN LOCKED — holding {report.one_liner(dev)}")
             print("    It stays blocked. You will be asked when you unlock.\n")
-            reason = "held: screen locked"
-        else:
-            print(f"[-] SCREEN LOCKED — denied {report.one_liner(dev)}\n")
-            reason = "denied: screen locked"
+            self._hold(dev, "held: screen locked")
+            return
+        print(f"[-] SCREEN LOCKED — denied {report.one_liner(dev)}\n")
         try:
             sysfs.set_authorized(dev.syspath, 0)
         except OSError:
             pass
-        self._record(Decision(dev, False, reason, time.time()))
+        self._record(Decision(dev, False, "denied: screen locked", time.time()))
 
-    def _drain_pending(self) -> None:
+    def _hold_for_agent(self, dev: sysfs.UsbDevice, findings=(),
+                        medium: Optional["storage.MediumReport"] = None, *,
+                        inspected: bool = False) -> None:
+        """Nobody can be asked about this device yet: hold it until someone
+        can. The run loop asks about it once a desktop agent connects."""
+        print(f"[⏸] NO DESKTOP AGENT — holding "
+              f"{report.one_liner(dev, findings)}")
+        print("    No desktop agent is connected and there is no terminal, so "
+              "nobody can be asked.")
+        print("    It stays blocked. You will be asked when the agent "
+              "connects.\n")
+        self._hold(dev, "held: no desktop agent", findings, medium,
+                   inspected=inspected)
+
+    @staticmethod
+    def _switch_off(dev: sysfs.UsbDevice) -> None:
         """
-        Someone unlocked the screen: put the held questions now.
+        Block a device a question has just ended for without admitting it.
+
+        For a quarantined device this write genuinely matters: it was switched
+        on for the observation and is alive right now if quarantine could not
+        put it back. For every other device it is a no-op that makes the state
+        explicit.
+        """
+        try:
+            sysfs.set_authorized(dev.syspath, 0)
+        except OSError as exc:
+            # Never swallowed. Failing to switch off a device that just
+            # typed at you is the most dangerous outcome in this program.
+            print(f"\n[!!] COULD NOT DEAUTHORIZE {dev.name}: {exc}")
+            print("[!!] The device may still be live. Unplug it now, or "
+                  "run as root:")
+            print(f"[!!]   echo 0 > {dev.syspath}/authorized\n")
+
+    @staticmethod
+    def _has_terminal() -> bool:
+        """
+        Whether a person could answer on this process's stdin.
+
+        The service has none -- systemd gives it /dev/null -- and there a
+        terminal prompt is not a fallback at all: it reads EOF at once and
+        the device is denied, a refusal in everything but name. Anything that
+        is not a terminal (a closed or replaced stdin included) counts as
+        none. Tests replace this.
+        """
+        try:
+            return os.isatty(sys.stdin.fileno())
+        except (AttributeError, ValueError, OSError):
+            return False
+
+    def _nobody_can_be_asked(self) -> bool:
+        """
+        True when a desktop agent is configured but not there, and there is
+        no terminal either: a question put now would have no one to see it.
+
+        With no agent configured at all this stays False and the terminal is
+        used exactly as before -- that is the setup someone chose to answer
+        in a terminal, and an EOF there is theirs to arrange.
+        """
+        if self.dry_run or self.agent is None:
+            return False
+        return not self.agent.is_live() and not self._has_terminal()
+
+    def _agent_can_take_held(self) -> bool:
+        """
+        Whether the held queue can be put to the desktop agent now: something
+        is held, an agent is connected and alive, and the screen is not
+        holding questions back.
+
+        Not drained while the screen is locked under ANY lock policy that
+        looks at it, not only "queue": under "deny" a drain then would deny,
+        as "screen locked", a device that did not arrive behind a locked
+        screen and that nobody has been asked about. It waits for the unlock.
+
+        Cheapest first, since this runs every pass while anything is held:
+        under "queue" the loop has just read the lock state, then the socket
+        probe, and only under "deny" a lock lookup of its own.
+        """
+        if not self.pending or self.dry_run or self.agent is None:
+            return False
+        if self.lock_policy == session_mod.POLICY_QUEUE and self._was_locked:
+            return False
+        if not self.agent.is_live():
+            return False
+        if self.lock_policy in (session_mod.POLICY_QUEUE,
+                                session_mod.POLICY_IGNORE):
+            return True
+        return not self.monitor.is_locked()
+
+    def _drain_pending(self, cause: str = "") -> None:
+        """
+        Someone can be asked again -- the screen unlocked, a desktop agent
+        connected, or a new run started: put the held questions now.
 
         Each device is re-read from sysfs rather than replayed from the earlier
         snapshot. It has been blocked the whole time so nothing about it can
@@ -735,8 +960,21 @@ class Probolos:
         """
         if not self.pending:
             return
-        print(f"\n[▶] Screen unlocked — {len(self.pending)} device(s) were "
-              f"held while you were away.\n")
+        # Nobody can be asked yet (an agent is expected, none is there, no
+        # terminal): putting the queue through _on_add now would only hold
+        # every device again, after re-reading it, at each unlock and each
+        # restart. It stays queued as it is, and the run loop drains it when
+        # an agent connects.
+        if self._nobody_can_be_asked():
+            print(f"[⏸] {len(self.pending)} held device(s) stay blocked "
+                  f"until the desktop agent connects.\n")
+            return
+        what = f"{len(self.pending)} held device(s)"
+        print(f"\n[▶] {cause} — asking about {what} now.\n" if cause
+              else f"\n[▶] Asking about {what} now.\n")
+        # Swapped out before the first question, so a device _on_add holds
+        # again during this pass lands in the NEW queue and is not drained a
+        # second time by the very pass that re-held it.
         held, self.pending = self.pending, OrderedDict()
         for name, (syspath, instance) in held.items():
             if not syspath.exists():
@@ -756,7 +994,7 @@ class Probolos:
             if instance is not None and not self._still_same_device(
                     syspath, instance):
                 print(f"[!] {name}: a DIFFERENT device now occupies this port "
-                      f"than the one held while you were away.")
+                      f"than the one that was held.")
                 print("    It stays blocked and is not being asked about "
                       "under the old entry. Replug it to have it gated "
                       "normally.\n")
@@ -983,6 +1221,10 @@ class Probolos:
         if name in self.pending:
             del self.pending[name]
             print(f"[*] {name} removed while held; question withdrawn")
+        # Whatever is plugged in next at this port is a new device: it gets
+        # its own hold record and its own count of lost questions.
+        self._last_recorded.pop(name, None)
+        self._unseen_asks.pop(name, None)
         self.known.discard(name)
         if self.media_watch is not None:
             self.media_watch.unregister(name)
@@ -1037,8 +1279,58 @@ class Probolos:
         """
         Whether "always" can be kept. An option whose answer would be lost is
         not offered, and what is not offered is not accepted.
+
+        Either this process writes the store, or (under --privsep) the gate
+        does it for us -- see _gate_keeps_trust for when it would refuse.
         """
-        return self.trust is not None and self.trust.writable()
+        if self.trust is None:
+            return False
+        return self.trust.writable() or _gate_keeps_trust(self.trust)
+
+    def _remember_admitted(self, dev: sysfs.UsbDevice) -> None:
+        """
+        Keep "always" for a device that has just been admitted.
+
+        Called only after admit_device() succeeded: the device is admitted
+        once whatever happens here, and every failure is printed rather than
+        raised, because the person who clicked "always" needs to know their
+        answer was not kept.
+        """
+        if self.trust.writable():
+            entry = self.trust.trust(dev)
+            if entry is not None:
+                self.trust.record_admission(dev)
+                error = self.trust.save()
+                print(f"  trust could not be saved: {error}" if error
+                      else "  remembered for future admissions")
+            return
+
+        # Under --privsep: the analyzer cannot write the store, so the root
+        # gate does, against a fingerprint it took itself. The key sent is
+        # only what this side believes; the gate refuses it unless it equals
+        # its own.
+        key = trust_mod.key_for(dev)
+        if key is None:
+            print("  trust could not be saved: this device's descriptors "
+                  "could not be read, so there is nothing to pin it to")
+            return
+        try:
+            sysfs.remember_via_backend(dev, key, dev.label())
+        except OSError as exc:
+            print(f"  trust could not be saved: {exc}")
+            return
+        # The gate replaced the file; refresh() sees the new inode and reads
+        # it, so the next plug of this device is admitted without a question.
+        # Checked rather than assumed: a store the gate wrote but this process
+        # cannot read back (permissions, an integrity refusal) would otherwise
+        # be reported as remembered and then ask again anyway.
+        self.trust.refresh()
+        if key in self.trust.devices:
+            print("  remembered for future admissions")
+        else:
+            why = self.trust.load_error or "the new entry is not there"
+            print(f"  trust was saved by the gate but cannot be read back "
+                  f"here ({why}); this device will be asked about again")
 
     def _ask(self, dev: sysfs.UsbDevice,
              findings=()) -> bool:
@@ -1056,6 +1348,9 @@ class Probolos:
         critical = rules.worst(findings) == rules.Severity.CRITICAL
         # Set to True only where a person's answer was actually received.
         self._answered = False
+        # Set when nobody could see the question at all: _on_add then holds
+        # the device rather than refusing it.
+        self._hold_instead = False
 
         # ---- ask through the desktop agent, if one is listening -----------
         # A CRITICAL device used to be never offered to the agent: it could
@@ -1065,11 +1360,18 @@ class Probolos:
         # now offered with a countdown: "Allow anyway" stays disabled for
         # CRITICAL_COUNTDOWN seconds, long enough that approving takes a
         # decision rather than a reflex, and never with "always".
-        if self.agent is not None and self.agent.connected:
+        #
+        # is_live(), not `connected`: an agent whose session ended leaves a
+        # connection object behind, and a question sent into it only comes
+        # back as "no answer" -- which the paths below must tell apart from a
+        # question somebody saw.
+        agent = self.agent
+        if agent is not None and agent.is_live():
+            title = self._agent_title(dev)
             steps = self._prompt_steps(dev, findings)
             asked_at = time.monotonic()
-            answer = self.agent.ask(
-                title=self._agent_title(dev),
+            answer = agent.ask(
+                title=title,
                 body=self._agent_body(dev, findings),
                 severity=rules.worst(findings).label if findings else "none",
                 allow_always=self._can_remember() and not critical,
@@ -1096,10 +1398,20 @@ class Probolos:
             if answer == agentlink.ANSWER_NO:
                 return False
             # answer is None: the agent could not answer at all. That is not
-            # a decision, so it must not be treated as one -- fall through
-            # to the terminal rather than silently refusing something the
-            # user never saw.
+            # a decision, so it must not be treated as one -- ask in the
+            # terminal rather than silently refusing something the user never
+            # saw. Only where there IS a terminal: see _unanswered.
+            if not self._has_terminal():
+                return self._unanswered(title)
             print("  (no answer from the desktop agent; asking here)")
+        elif agent is not None and not self._has_terminal():
+            # _on_add found the agent there, and stages 3 and 4 then took
+            # seconds in which it went away. The terminal would only read EOF
+            # and deny; nobody has seen this question, so the device is held.
+            print("  (the desktop agent went away before it could be asked; "
+                  "the device is held until it is back)")
+            self._hold_instead = True
+            return False
 
         if critical:
             # No "always" option here on purpose. Remembering a device that
@@ -1171,6 +1483,38 @@ class Probolos:
             return True
         return answer in ("y", "yes")
 
+    def _unanswered(self, title: str) -> bool:
+        """
+        The agent was asked and gave no decision, and there is no terminal to
+        ask in instead. Never an approval: returns False either way.
+
+        Two cases look alike here. If the agent went away mid-question --
+        logout, crash -- nobody saw the question, and the device is HELD
+        (_on_add queues it) to be asked when an agent is back. If the agent
+        is still there, the question was on screen and nobody answered it in
+        time: the device is denied, recorded as "no answer" and never as a
+        refusal, and the agent is told that it is still blocked.
+
+        It is not put back in the queue. Re-queueing would re-ask, forever, a
+        person who is not there, and keep a question open indefinitely. A
+        replug is a deliberate physical act by someone at the machine, and it
+        brings a fresh enumeration that is gated normally -- which is what the
+        notice tells them to do. Falling back to the terminal, as this used
+        to, was the same denial in disguise: the service's stdin is /dev/null.
+        """
+        if not self.agent.is_live():
+            print("  (the desktop agent went away before answering; the "
+                  "device is held until it is back)")
+            self._hold_instead = True
+            return False
+        print("  (no answer from the desktop agent, and no terminal to ask "
+              "in; it stays blocked until it is plugged in again)")
+        self.agent.notify(
+            "USB device still blocked",
+            f"{title}\nNobody answered in time. Unplug it and plug it in "
+            f"again to be asked.")
+        return False
+
     def _record(self, decision: Decision, findings=(),
                 medium: Optional["storage.MediumReport"] = None) -> None:
         """
@@ -1181,6 +1525,10 @@ class Probolos:
         method had none, and `help()` showed nothing for the one function that
         writes both persistent stores.)
         """
+        # What _hold compares against, so that holding a device again for the
+        # reason it is already held under writes nothing new.
+        self._last_recorded[decision.device.name] = (
+            getattr(decision.device, "instance_id", None), decision.reason)
         # In dry-run we change nothing that persists, and the ledger is
         # persistent state. Recording a decision that was never actually made
         # would also poison the history with dry-run noise.
@@ -1286,9 +1634,17 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
         elif trust_store.devices:
             print(f"  - {len(trust_store.devices)} remembered device(s) will "
                   f"be admitted without asking")
+        # serve() runs inside the analyzer, after __main__ installed the gate
+        # backend, so the backend can be asked. Under --privsep the root gate
+        # writes "always"; saying it is not offered there was true until the
+        # gate learned to (REQ_TRUST), and is not now.
         if not trust_store.writable():
-            print("  - \"always\" is not offered: this process cannot write "
-                  "the trust store (expected under --privsep)")
+            if _gate_keeps_trust(trust_store):
+                print("  - \"always\" is saved by the privileged gate (this "
+                      "process cannot write the trust store itself)")
+            else:
+                print("  - \"always\" is not offered: this process cannot "
+                      "write the trust store")
 
     store = None
     if ledger_path is not None:

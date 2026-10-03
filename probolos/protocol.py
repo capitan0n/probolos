@@ -14,11 +14,17 @@ short the list of things it will do is. That list is here:
     SET_DEFAULT    set authorized_default on one root hub
     OPEN_INPUT     open an input node read-only and pass back the fd
     OPEN_BLOCK     open a block device read-only and pass back the fd
+    TRUST          add one entry to the trust store: only for a device this
+                   gate admitted moments ago on this connection, and only
+                   under the fingerprint the gate itself measured before it
+                   first switched that device on
     PING           liveness check
 
 Nothing else. The gate refuses anything not on this list. In particular it
 never runs a rule, never reads keystrokes, never touches the ledger -- those
-live entirely on the unprivileged side.
+live entirely on the unprivileged side. TRUST is the one write to persistent
+state, and the analyzer supplies none of what it pins: the key must equal the
+gate's own measurement, and the label is display text only.
 
 FRAMING
 -------
@@ -52,6 +58,10 @@ REQ_OPEN_BLOCK = "open_block"
 # Interface-level authorization: bind/unbind a driver for ONE interface of a
 # device rather than the whole device. Used by the deferred-bind path.
 REQ_AUTHORIZE_INTERFACE = "authorize_interface"
+# Remember one admitted device in the root-owned trust store. Exists because
+# the analyzer, running as `nobody`, cannot write that file by design, and
+# "always" was otherwise impossible under --privsep.
+REQ_TRUST = "trust"
 REQ_PING = "ping"
 
 # Response status
@@ -61,6 +71,16 @@ DENIED = "denied"          # request was well-formed but refused by policy
 
 MAX_MESSAGE = 8192         # one datagram; requests are tiny, this is generous
 
+# Bounds on the two TRUST strings, in characters. An honest key is
+# vendor:product:serial (the serial already capped by textsafe) plus '#' and
+# 64 hex digits, far under 512. The label is display text; two maximum-length
+# device strings joined can just exceed 256, so GateClient.trust trims it
+# rather than lose "always" for that device. Even with every character escaped
+# by json.dumps (up to 12 bytes each), an honest request stays inside
+# MAX_MESSAGE; one that does not is refused by _load like any other.
+MAX_KEY = 512
+MAX_LABEL = 256
+
 
 @dataclass
 class Request:
@@ -68,6 +88,8 @@ class Request:
     path: str = ""             # device or node path the request concerns
     value: Optional[int] = None  # for authorize / set_default
     instance: Optional[tuple] = None
+    key: Optional[str] = None    # TRUST only: the analyzer's trust key
+    label: Optional[str] = None  # TRUST only: display name for --trusted
 
     def encode(self) -> bytes:
         obj = {"kind": self.kind, "path": self.path}
@@ -75,6 +97,10 @@ class Request:
             obj["value"] = self.value
         if self.instance is not None:
             obj["instance"] = self.instance
+        if self.key is not None:
+            obj["key"] = self.key
+        if self.label is not None:
+            obj["label"] = self.label
         return json.dumps(obj).encode()
 
     @staticmethod
@@ -82,7 +108,8 @@ class Request:
         obj = _load(data)
         kind = obj.get("kind")
         if kind not in (REQ_AUTHORIZE, REQ_ADMIT, REQ_SET_DEFAULT, REQ_OPEN_INPUT,
-                        REQ_OPEN_BLOCK, REQ_AUTHORIZE_INTERFACE, REQ_PING):
+                        REQ_OPEN_BLOCK, REQ_AUTHORIZE_INTERFACE, REQ_TRUST,
+                        REQ_PING):
             raise ValueError(f"unknown request kind: {kind!r}")
         value = obj.get("value")
         if value is not None and type(value) is not int:
@@ -96,7 +123,26 @@ class Request:
                     or any(type(n) is not int or n < 0 for n in instance)):
                 raise ValueError("invalid device instance")
             instance = tuple(instance)
-        return Request(kind=kind, path=path, value=value, instance=instance)
+        # Shape only, here: the gate decides whether the key is the right one
+        # and whether the label is clean enough to store. What is refused at
+        # this layer is anything that is not even a bounded string -- a
+        # number, a list, an embedded NUL -- so the handler never has to ask.
+        texts = {}
+        for name, limit in (("key", MAX_KEY), ("label", MAX_LABEL)):
+            text = obj.get(name)
+            if text is not None:
+                if not isinstance(text, str) or "\x00" in text:
+                    raise ValueError(f"{name} must be a string")
+                if len(text) > limit:
+                    raise ValueError(f"{name} is longer than {limit} characters")
+            texts[name] = text
+        if kind == REQ_TRUST and (not path or instance is None
+                                  or texts["key"] is None
+                                  or texts["label"] is None):
+            raise ValueError("trust needs a path, a device instance, a key "
+                             "and a label")
+        return Request(kind=kind, path=path, value=value, instance=instance,
+                       key=texts["key"], label=texts["label"])
 
 
 @dataclass

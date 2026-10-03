@@ -34,6 +34,7 @@ from probolos.agentlink import (
     AgentLink,
     peer_credentials,
 )
+from tests._support import ServiceStdin
 
 
 class FakeAgent:
@@ -202,6 +203,73 @@ class TestAgentLink(LinkTestCase):
         self.assertIn(agentlink.MSG_CRITICAL, kinds)
         self.assertNotIn(agentlink.MSG_DECIDE, kinds)
 
+    def test_a_notice_is_display_only(self):
+        """No id, so there is nothing to answer and nothing to approve."""
+        self.connect()
+        self.link.notify("USB device still blocked",
+                         "USB storage · port 3-9\nNobody answered in time.")
+        for _ in range(50):
+            if self.agent.received:
+                break
+            time.sleep(0.02)
+        self.assertEqual(self.agent.received, [{
+            "type": agentlink.MSG_NOTICE, "title": "USB device still blocked",
+            "body": "USB storage · port 3-9\nNobody answered in time."}])
+        self.assertTrue(self.link.is_live(), "a notice costs nothing")
+
+    # ---- liveness: `connected` is not "someone is there" ----
+
+    def test_nobody_connected_is_not_live(self):
+        self.assertFalse(self.link.is_live())
+
+    def test_a_connected_agent_is_live(self):
+        self.connect()
+        self.assertTrue(self.link.is_live())
+        self.assertTrue(self.link.connected, "probing must not drop it")
+        self.assertEqual(self.link.ask("t", "b", "none", False, timeout=3),
+                         agentlink.ANSWER_YES)
+
+    def test_an_agent_that_logged_out_is_dropped_and_replaceable(self):
+        """
+        A logged-out agent leaves its connection object behind: `connected`
+        stayed True, and the daemon sent questions into a dead socket.
+        """
+        self.connect()
+        # What the agent's process exiting does to its end. close() alone
+        # would wait for the fake's reader thread, which is blocked in recv()
+        # on the same socket, before the peer saw anything.
+        self.agent.sock.shutdown(socket.SHUT_RDWR)
+        self.agent.stop()
+        time.sleep(SETTLE)
+        self.assertTrue(self.link.connected, "the dead object is still there")
+        self.assertFalse(self.link.is_live())
+        self.assertFalse(self.link.connected, "is_live() frees the slot")
+        self.connect()
+        self.assertTrue(self.link.is_live())
+
+    def test_a_question_in_flight_is_never_probed(self):
+        """
+        ask() is in recv() on the socket, and the probe switches its blocking
+        mode -- the race that let a connection attempt cancel a question.
+        """
+        self.connect(silent=True)
+        box = {}
+        asking = threading.Thread(target=lambda: box.setdefault(
+            "answer", self.link.ask("t", "b", "none", False, timeout=1.0)))
+        probed = AssertionError("probed a socket ask() is reading")
+        with mock.patch.object(agentlink, "_still_connected",
+                               side_effect=probed) as probe:
+            asking.start()
+            for _ in range(200):
+                if self.link._asking:
+                    break
+                time.sleep(0.005)
+            self.assertTrue(self.link._asking, "the question never went out")
+            self.assertTrue(self.link.is_live())
+            asking.join(5)
+        probe.assert_not_called()
+        self.assertIsNone(box["answer"], "the silent agent never answered")
+
     def test_socket_is_not_world_accessible(self):
         """
         Anyone who can open this socket can approve hardware, so it must not be
@@ -339,17 +407,65 @@ class TestDaemonUsesTheAgent(unittest.TestCase):
     def test_no_answer_falls_back_to_the_terminal(self):
         """
         An agent that could not answer has not made a decision. Treating its
-        silence as a refusal would reject devices the user never saw.
+        silence as a refusal would reject devices the user never saw. Where
+        there IS a terminal, the question goes there, exactly as before.
         """
         link = mock.Mock()
         link.connected = True
         link.ask.return_value = None
         engine = daemon_mod.Probolos(agent=link, observe=0)
 
-        with mock.patch("sys.stdin", io.StringIO("y\n")):
+        with mock.patch("sys.stdin", io.StringIO("y\n")), \
+                mock.patch.object(engine, "_has_terminal", return_value=True):
             self.assertTrue(engine._ask(self.device(), []),
                             "a missing agent answer must fall through to the "
                             "terminal, not become a refusal")
+        link.notify.assert_not_called()
+
+    def test_no_answer_without_a_terminal_is_not_read_from_stdin(self):
+        """
+        The service's stdin is /dev/null: "asking here" read EOF and denied,
+        a refusal in all but name. Without a terminal the device is denied as
+        unanswered, the agent is told so, and stdin is never touched.
+        """
+        link = mock.Mock()
+        link.is_live.return_value = True
+        link.ask.return_value = None
+        engine = daemon_mod.Probolos(agent=link, observe=0)
+        stdin = ServiceStdin()
+        self.addCleanup(stdin.release)
+
+        with mock.patch("sys.stdin", stdin), \
+                mock.patch("sys.stdout", io.StringIO()), \
+                mock.patch.object(engine, "_has_terminal", return_value=False):
+            self.assertFalse(engine._ask(self.device(), []))
+        self.assertEqual(stdin.touches, [], "the terminal was read")
+        self.assertFalse(engine._answered, "nobody answered")
+        self.assertFalse(engine._hold_instead, "the agent is still there")
+        title, body = link.notify.call_args.args
+        self.assertEqual(title, "USB device still blocked")
+        self.assertEqual(body.splitlines(), [
+            "Mass Storage (SCSI) · port 3-9",
+            "Nobody answered in time. Unplug it and plug it in again to be "
+            "asked."])
+
+    def test_an_agent_that_left_mid_question_means_hold_not_deny(self):
+        link = mock.Mock()
+        link.ask.return_value = None
+        # Live when asked, gone once the question came back empty.
+        link.is_live.side_effect = [True, False]
+        engine = daemon_mod.Probolos(agent=link, observe=0)
+        stdin = ServiceStdin()
+        self.addCleanup(stdin.release)
+
+        with mock.patch("sys.stdin", stdin), \
+                mock.patch("sys.stdout", io.StringIO()), \
+                mock.patch.object(engine, "_has_terminal", return_value=False):
+            self.assertFalse(engine._ask(self.device(), []))
+        self.assertTrue(engine._hold_instead)
+        self.assertFalse(engine._answered)
+        link.notify.assert_not_called()
+        self.assertEqual(stdin.touches, [])
 
     def test_a_refusal_from_the_agent_is_respected(self):
         link = mock.Mock()
@@ -596,6 +712,31 @@ class CountdownDialogs(unittest.TestCase):
                 self.assertIs(b.notice("t", "x", 10), expected)
         with mock.patch.object(run, "run", return_value=mock.Mock(returncode=0)):
             self.assertIs(b.notice("t", "x", 10), True)
+
+    def test_tkinter_notice_outcomes(self):
+        """The base class raised NotImplementedError for tkinter, so a
+        tkinter-only desktop with no notification server was told nothing."""
+        from probolos import dialogs
+        b = dialogs.TkinterBackend()
+        with mock.patch.object(dialogs.subprocess, "run",
+                               return_value=mock.Mock(returncode=11)) as run:
+            self.assertIs(b.notice("t", "x", 10), True)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[1:3], ["-I", "-c"], "isolated from env and cwd")
+        self.assertEqual(argv[-2:], ["t", "x"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
+        # A crashed tk (exit 1, say) never drew the window: not shown.
+        for code in (0, 1, 2, 10, 12):
+            with mock.patch.object(dialogs.subprocess, "run",
+                                   return_value=mock.Mock(returncode=code)):
+                self.assertIsNone(b.notice("t", "x", 10), f"exit {code}")
+        with mock.patch.object(dialogs.subprocess, "run",
+                               side_effect=dialogs.subprocess.TimeoutExpired(
+                                   cmd="python", timeout=10)):
+            self.assertIs(b.notice("t", "x", 10), False)
+        with mock.patch.object(dialogs.subprocess, "run",
+                               side_effect=OSError("no python")):
+            self.assertIsNone(b.notice("t", "x", 10))
 
     def test_tkinter_countdown_outcomes(self):
         from probolos import dialogs
@@ -888,6 +1029,76 @@ class TestKdialogThreeWayMapping(unittest.TestCase):
             self.assertIsNone(
                 self.backend().choose("t", "x", "once", "always", "no", 1))
 
+
+class ADialogThatDiesIsNotAnAnswer(unittest.TestCase):
+    """
+    kdialog and zenity mapped every exit code that was not "yes" to "Keep
+    blocked". A dialog killed under nobody's hand -- Qt aborts (-6) when the
+    display goes away at logout, SIGTERM is -15, a tool failing on its own
+    exits 254/255 -- was therefore sent back as "no", recorded as "user
+    rejected", and the next plug got the previously-rejected countdown for a
+    refusal nobody made. Only a button is an answer.
+    """
+
+    NOT_BUTTONS = (-6, -15, -9, 254, 255, 5)
+
+    def _backend(self, cls):
+        backend = cls()
+        backend._binary = "/usr/bin/dialog-tool"
+        return backend
+
+    def _run(self, code, stdout=""):
+        from probolos import dialogs
+        return mock.patch.object(
+            dialogs.subprocess, "run",
+            return_value=mock.Mock(returncode=code, stdout=stdout))
+
+    def test_confirm_answers_only_for_a_button(self):
+        from probolos import dialogs
+        for cls in (dialogs.KDialogBackend, dialogs.ZenityBackend):
+            backend = self._backend(cls)
+            for code, expected in ((0, True), (1, False)):
+                with self.subTest(cls=cls.name, code=code), self._run(code):
+                    self.assertIs(backend.confirm("t", "x", "y", "n", 1.0),
+                                  expected)
+            for code in self.NOT_BUTTONS:
+                with self.subTest(cls=cls.name, code=code), self._run(code):
+                    self.assertIsNone(backend.confirm("t", "x", "y", "n", 1.0))
+
+    def test_choose_answers_only_for_a_button(self):
+        from probolos import dialogs
+        kdialog = self._backend(dialogs.KDialogBackend)
+        zenity = self._backend(dialogs.ZenityBackend)
+        for code in self.NOT_BUTTONS:
+            with self.subTest(code=code), self._run(code, stdout="always"):
+                self.assertIsNone(
+                    kdialog.choose("t", "x", "once", "always", "no", 1.0))
+                self.assertIsNone(
+                    zenity.choose("t", "x", "once", "always", "no", 1.0))
+        cases = ((0, "", dialogs.CHOICE_ONCE),
+                 (1, "always\n", dialogs.CHOICE_ALWAYS),
+                 (1, "", dialogs.CHOICE_NO))
+        for code, stdout, expected in cases:
+            with self.subTest(code=code, stdout=stdout), \
+                    self._run(code, stdout=stdout):
+                self.assertEqual(
+                    zenity.choose("t", "x", "once", "always", "no", 1.0),
+                    expected)
+
+    def test_a_dead_dialog_reaches_the_analyzer_as_no_decision(self):
+        from probolos import agent as agent_mod
+        from probolos import dialogs
+        from probolos.agentlink import ANSWER_UNAVAILABLE
+        agent = agent_mod.Agent.__new__(agent_mod.Agent)
+        agent.log = lambda *a: None
+        agent.notifier = mock.Mock(**{"available.return_value": False})
+        agent.dialog = self._backend(dialogs.KDialogBackend)
+        with self._run(-6):
+            self.assertEqual(
+                agent._ask_user({"title": "t", "body": "b", "steps": "one"},
+                                30),
+                ANSWER_UNAVAILABLE)
+
     def test_an_unanswered_dialog_reaches_the_analyzer_as_no_decision(self):
         """Both dialogs, both ways they can go unanswered."""
         from probolos import agent as agent_mod
@@ -1088,6 +1299,22 @@ class AgentSocketHardening(unittest.TestCase):
         """
         link = self.server()
         first = self.client(link)
+        first.close()
+        time.sleep(SETTLE)
+
+        second = self.client(link)
+        self._agent_thread(second, ANSWER_YES)
+        self.assertEqual(link.ask("dev", "body", "INFO", True, 3.0), ANSWER_YES)
+
+    def test_a_dead_agent_with_unread_bytes_is_still_replaced(self):
+        """
+        It closed AFTER sending -- a late answer, then a logout. The peek
+        that judged liveness saw that byte rather than the EOF behind it, so
+        the dead agent kept the slot and its successor was refused.
+        """
+        link = self.server()
+        first = self.client(link)
+        first.sendall(b'{"type": "answer", "id": 1, "answer": "no"}\n')
         first.close()
         time.sleep(SETTLE)
 
@@ -1441,6 +1668,106 @@ class AgentTimeoutIsValidated(unittest.TestCase):
         agent.dialog = mock.Mock()
         agent._handle(b'["not", "an", "object"]')
         agent.dialog.confirm.assert_not_called()
+
+
+class AgentShowsNoticesWithoutOfferingAnAnswer(unittest.TestCase):
+    """
+    MSG_NOTICE: "this device is still blocked; replug it to be asked". It is
+    shown, never answered, and nothing it shows can allow anything.
+    """
+
+    def build(self, notifications=True, notify_result=7):
+        instance = agent_mod.Agent.__new__(agent_mod.Agent)
+        instance.log = lambda *_a: None
+        instance.notifier = mock.Mock(**{
+            "available.return_value": notifications,
+            "notify.return_value": notify_result})
+        instance.dialog = mock.Mock()
+        instance.countdown_dialog = mock.Mock()
+        instance.sock = mock.Mock()
+        return instance
+
+    @staticmethod
+    def send(instance, **fields):
+        instance._handle(json.dumps(
+            {"type": agentlink.MSG_NOTICE, **fields}).encode())
+
+    def assert_offered_nothing(self, instance):
+        for method in ("confirm", "choose", "confirm_countdown"):
+            getattr(instance.dialog, method).assert_not_called()
+        self.assertEqual(instance.countdown_dialog.mock_calls, [])
+        instance.sock.sendall.assert_not_called()
+
+    @staticmethod
+    def window_closed(instance):
+        """Wait for the notice window's thread to let go of the slot."""
+        for _ in range(200):
+            if not instance._notice_window.locked():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_it_is_a_plain_notification(self):
+        instance = self.build()
+        self.send(instance, title="USB device still blocked",
+                  body="USB storage · port 3-9\nNobody answered in time.")
+        instance.notifier.notify.assert_called_once_with(
+            "USB device still blocked",
+            "USB storage · port 3-9\nNobody answered in time.",
+            urgency=agent_mod.URGENCY_NORMAL, actionable=False)
+        instance.dialog.notice.assert_not_called()
+        self.assert_offered_nothing(instance)
+
+    def test_fields_that_are_not_text_do_not_crash_the_agent(self):
+        instance = self.build()
+        self.send(instance, title={"not": "text"}, body=["nor", "this"])
+        self.assertEqual(instance.notifier.notify.call_args.args,
+                         ("Probolos", ""))
+        self.assert_offered_nothing(instance)
+
+    def test_without_notifications_a_window_shows_it_off_the_receive_loop(self):
+        instance = self.build(notifications=False)
+        shown, release = threading.Event(), threading.Event()
+
+        def window(*_args, **_kwargs):
+            shown.set()
+            release.wait(5)
+            return True
+
+        instance.dialog.notice.side_effect = window
+        started = time.monotonic()
+        self.send(instance, title="USB device still blocked", body="port 3-9")
+        self.assertLess(time.monotonic() - started, 1.0,
+                        "the receive loop waited for the window")
+        self.assertTrue(shown.wait(2), "the window was never shown")
+        # While it is up, another is not stacked on top of it.
+        self.send(instance, title="again", body="port 3-10")
+        release.set()
+        self.assertTrue(self.window_closed(instance))
+        instance.dialog.notice.assert_called_once()
+        args, kwargs = instance.dialog.notice.call_args
+        self.assertEqual(args, ("Probolos — USB device still blocked",
+                                "port 3-9"))
+        self.assertEqual(kwargs["timeout"], agent_mod.NOTICE_TIMEOUT)
+        self.assert_offered_nothing(instance)
+
+    def test_a_failed_notification_falls_back_to_the_window(self):
+        instance = self.build(notify_result=None)
+        instance.dialog.notice.return_value = True
+        self.send(instance, title="t", body="b")
+        self.assertTrue(self.window_closed(instance))
+        instance.dialog.notice.assert_called_once()
+
+    def test_a_backend_that_cannot_show_it_does_not_take_the_agent_down(self):
+        instance = self.build(notifications=False)
+        instance.dialog.notice.side_effect = NotImplementedError
+        self.send(instance, title="t", body="b")
+        self.assertTrue(self.window_closed(instance))
+        # The slot was given back: the next notice is still shown.
+        instance.dialog.notice.side_effect = None
+        self.send(instance, title="t", body="b")
+        self.assertTrue(self.window_closed(instance))
+        self.assertEqual(instance.dialog.notice.call_count, 2)
 
 
 class NotificationBodyIsNotMarkup(unittest.TestCase):
@@ -1822,6 +2149,77 @@ class AgentUnavailableReturnsImmediately(unittest.TestCase):
         answer, elapsed = self._answer_with("maybe")
         self.assertIsNone(answer)
         self.assertGreater(elapsed, 7.0, "kept waiting for a real answer")
+
+
+class LivenessAndNoticesOverASocketPair(unittest.TestCase):
+    """
+    is_live() and notify() against a connection whose far end is gone --
+    what a logged-out agent leaves behind.
+    """
+
+    def _pair(self):
+        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        link = agentlink.AgentLink(Path("/nonexistent/agent.sock"), log=_quiet)
+        link._conn = ours
+        return link, theirs
+
+    def test_a_closed_peer_is_dropped(self):
+        link, theirs = self._pair()
+        self.assertTrue(link.is_live())
+        theirs.close()
+        self.assertFalse(link.is_live())
+        self.assertFalse(link.connected)
+
+    def test_a_peer_that_closed_after_sending_is_dropped(self):
+        """
+        A late answer, then a logout. A one-byte MSG_PEEK saw the answer, not
+        the EOF behind it, so the dead agent counted as there: a device would
+        be switched on for inspection with nobody to ask, and the held queue
+        drained into a socket nobody reads.
+        """
+        link, theirs = self._pair()
+        theirs.sendall(b'{"type": "answer", "id": 7, "answer": "yes"}\n')
+        theirs.close()
+        self.assertFalse(link.is_live())
+        self.assertFalse(link.connected)
+
+    def test_an_open_peer_with_data_waiting_is_live_and_nothing_is_eaten(self):
+        link, theirs = self._pair()
+        theirs.sendall(b"x")
+        self.assertTrue(link.is_live())
+        link._conn.settimeout(1.0)
+        self.assertTrue(link.is_live())
+        self.assertEqual(link._conn.gettimeout(), 1.0)
+        self.assertEqual(link._conn.recv(1, socket.MSG_PEEK), b"x")
+
+    def test_an_open_question_short_circuits_the_probe(self):
+        link, theirs = self._pair()
+        theirs.close()                      # dead -- but a question is open
+        link._asking = 1
+        with mock.patch.object(agentlink, "_still_connected",
+                               wraps=agentlink._still_connected) as probe:
+            self.assertTrue(link.is_live())
+            probe.assert_not_called()
+            link._asking = 0
+            self.assertFalse(link.is_live())
+            probe.assert_called_once()
+
+    def test_notify_reaches_a_live_agent_as_a_notice(self):
+        link, theirs = self._pair()
+        link.notify("USB device still blocked", "port 3-9")
+        theirs.settimeout(2.0)
+        self.assertEqual(json.loads(theirs.recv(4096).decode()), {
+            "type": agentlink.MSG_NOTICE,
+            "title": "USB device still blocked", "body": "port 3-9"})
+
+    def test_notify_never_raises_and_drops_a_dead_connection(self):
+        link, theirs = self._pair()
+        theirs.close()
+        link.notify("USB device still blocked", "port 3-9")    # EPIPE inside
+        self.assertFalse(link.connected)
+        link.notify("t", "b")           # nobody connected: nothing to do
 
 
 class NotificationCleanupNeverCostsAnAnswer(unittest.TestCase):

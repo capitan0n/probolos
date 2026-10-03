@@ -29,8 +29,11 @@ from probolos import (
     privsep,
     protocol,
     sysfs,
+    textsafe,
+    trust,
 )
 from probolos.gate_client import GateClient
+from tests._support import descriptor_blob
 
 
 @unittest.skipUnless(os.geteuid() == 0, "privsep.start() needs root")
@@ -576,15 +579,18 @@ class GateMediaScope(unittest.TestCase):
         seen = {}
 
         class Recorder:
-            def __init__(self, sock, log, watch_media):
+            def __init__(self, sock, log, watch_media, trust_path=None):
                 seen["watch_media"] = watch_media
+                seen["trust_path"] = trust_path
 
             def serve_forever(self):
                 pass
 
         with mock.patch.object(gate_server, "GateServer", Recorder):
-            gate_server.run_gate(None, watch_media=True)
+            gate_server.run_gate(None, watch_media=True,
+                                 trust_path="/var/lib/probolos/trusted.json")
         self.assertTrue(seen["watch_media"])
+        self.assertEqual(seen["trust_path"], "/var/lib/probolos/trusted.json")
 
 
 # ---------------------------------------------------------------------------
@@ -1333,6 +1339,612 @@ class MalformedMessages(unittest.TestCase):
             for thread in threads:
                 thread.join()
         self.assertEqual(max_active, 1)
+
+
+# ---------------------------------------------------------------------------
+# REQ_TRUST: "always" under --privsep, written by the root gate
+# ---------------------------------------------------------------------------
+
+class TrustRequestShape(unittest.TestCase):
+    """protocol.decode refuses anything that is not a bounded TRUST request."""
+
+    GOOD = {"kind": "trust", "path": "/sys/bus/usb/devices/1-1",
+            "instance": [1, 2], "key": "0951:1666:S#ab", "label": "Stick"}
+
+    def _decode(self, **changes):
+        import json
+        obj = dict(self.GOOD)
+        for name, value in changes.items():
+            if value is _MISSING:
+                obj.pop(name)
+            else:
+                obj[name] = value
+        return protocol.Request.decode(json.dumps(obj).encode())
+
+    def test_a_trust_request_round_trips(self):
+        req = protocol.Request(protocol.REQ_TRUST, path="/x", instance=(1, 2),
+                               key="k#h", label="Stick")
+        back = protocol.Request.decode(req.encode())
+        self.assertEqual((back.kind, back.path, back.instance, back.key,
+                          back.label),
+                         (protocol.REQ_TRUST, "/x", (1, 2), "k#h", "Stick"))
+
+    def test_key_and_label_must_be_strings(self):
+        for name in ("key", "label"):
+            for bad in (5, ["a"], True, {"a": 1}, 1.5):
+                with self.subTest(field=name, value=bad), \
+                        self.assertRaises(ValueError):
+                    self._decode(**{name: bad})
+
+    def test_nul_is_refused_in_key_and_label(self):
+        for name in ("key", "label"):
+            with self.subTest(field=name), self.assertRaises(ValueError):
+                self._decode(**{name: "a\x00b"})
+
+    def test_key_and_label_are_bounded(self):
+        self.assertEqual(len(self._decode(key="k" * protocol.MAX_KEY).key),
+                         protocol.MAX_KEY)
+        self.assertEqual(
+            len(self._decode(label="l" * protocol.MAX_LABEL).label),
+            protocol.MAX_LABEL)
+        with self.assertRaises(ValueError):
+            self._decode(key="k" * (protocol.MAX_KEY + 1))
+        with self.assertRaises(ValueError):
+            self._decode(label="l" * (protocol.MAX_LABEL + 1))
+
+    def test_every_field_is_required_for_trust(self):
+        for name in ("path", "instance", "key", "label"):
+            with self.subTest(missing=name), self.assertRaises(ValueError):
+                self._decode(**{name: _MISSING})
+        with self.assertRaises(ValueError):
+            self._decode(path="")
+
+    def test_an_honest_worst_case_request_fits_in_one_datagram(self):
+        """Longest cleaned serial and label, every character escaped on the
+        wire: still one datagram the gate will accept."""
+        serial = textsafe.sanitize("\U0001f600" * 500).text
+        key = f"0951:1666:{serial}#{'f' * 64}"
+        req = protocol.Request(
+            protocol.REQ_TRUST,
+            path="/sys/devices/pci0000:00/0000:00:14.0/usb3/3-10/3-10.4/3-10.4.1",
+            instance=(2 ** 63, 2 ** 63), key=key,
+            label="\U0001f600" * protocol.MAX_LABEL)
+        data = req.encode()
+        self.assertLessEqual(len(data), protocol.MAX_MESSAGE)
+        self.assertEqual(protocol.Request.decode(data).key, key)
+
+    def test_the_contract_lists_the_operation(self):
+        """The module docstring is the auditable list of what root will do."""
+        self.assertRegex(protocol.__doc__, r"\n\s+TRUST\s")
+
+    def test_a_long_label_is_cut_by_the_client_not_refused_by_the_gate(self):
+        """Two maximum-length device strings joined exceed MAX_LABEL."""
+        client = GateClient(mock.Mock())
+        sent = []
+        with mock.patch.object(
+                client, "_exchange",
+                side_effect=lambda req, _fd=False: sent.append(req) or
+                (protocol.Response(protocol.OK), None)):
+            client.trust("/x", (1, 2), "k", "x" * 300)
+        label = protocol.Request.decode(sent[0].encode()).label
+        self.assertEqual(len(label), protocol.MAX_LABEL)
+        self.assertTrue(label.endswith("..."))
+
+
+_MISSING = object()
+
+
+class _GateTrustCase(unittest.TestCase):
+    """
+    A blocked USB device with the attributes load_device reads, linked from a
+    bus view, and a trust store path in a directory the test owns.
+    """
+
+    SERIAL = "AABBCC"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.devices = root / "sys/devices"
+        self.busview = root / "sys/bus/usb/devices"
+        self.busview.mkdir(parents=True)
+        self.usb = self.devices / "pci0/usb1/1-1"
+        self._populate(self.usb, descriptor_blob((0x08, 0x06, 0x50)))
+        os.symlink(self.usb, self.busview / "1-1")
+        state = root / "state"
+        state.mkdir(mode=0o755)
+        self.trust_path = state / "trusted.json"
+        for attr, value in (("USB_REAL_PREFIX", str(self.devices) + "/"),
+                            ("USB_LINK_PREFIX", str(self.busview) + "/")):
+            p = mock.patch.object(gate_server, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.gate = self._gate(self.trust_path)
+
+    def _populate(self, directory, blob, serial=None):
+        directory.mkdir(parents=True)
+        (directory / "authorized").write_text("0\n")
+        (directory / "idVendor").write_text("0951\n")
+        (directory / "idProduct").write_text("1666\n")
+        (directory / "descriptors").write_bytes(blob)
+        serial = self.SERIAL if serial is None else serial
+        if serial is not _MISSING:
+            (directory / "serial").write_text(serial + "\n")
+
+    def _gate(self, trust_path):
+        return gate_server.GateServer(sock=None, log=lambda *_a: None,
+                                      trust_path=trust_path)
+
+    def instance(self):
+        st = self.usb.stat()
+        return (st.st_dev, st.st_ino)
+
+    def analyzer_key(self):
+        """What the daemon sends: trust.key_for over sysfs.load_device."""
+        return trust.key_for(sysfs.load_device(self.busview / "1-1"))
+
+    def temporary(self, value):
+        resp = self.gate._do_authorize(protocol.Request(
+            protocol.REQ_AUTHORIZE, path=str(self.usb), value=value))
+        self.assertTrue(resp.ok, resp.detail)
+
+    def admit(self):
+        resp = self.gate._do_admit(protocol.Request(
+            protocol.REQ_ADMIT, path=str(self.usb), value=1,
+            instance=self.instance()))
+        self.assertTrue(resp.ok, resp.detail)
+
+    def ask(self, key=None, label="Kingston DataTraveler", instance=None,
+            path=None):
+        """One TRUST request, through the wire format's own validation."""
+        req = protocol.Request(
+            protocol.REQ_TRUST, path=str(path or self.usb),
+            instance=instance or self.instance(),
+            key=self.analyzer_key() if key is None else key, label=label)
+        return self.gate._do_trust(protocol.Request.decode(req.encode()))
+
+    def stored(self):
+        store = trust.TrustStore(self.trust_path)
+        self.assertIsNone(store.load_error)
+        return store.devices
+
+
+class GateFingerprintIsTheAnalyzersKey(_GateTrustCase):
+    """
+    The gate never takes the key from the analyzer; it computes its own and
+    only compares. That is worth nothing unless an honest analyzer's key and
+    the gate's are equal to the byte -- including the serial, which the
+    analyzer passes through textsafe before it ever reaches the key.
+    """
+
+    def _gate_key(self):
+        self.temporary(1)          # the snapshot is taken by the first switch-on
+        return self.gate._fingerprints[str(self.usb)][1]
+
+    def test_the_mirrored_bound_agrees_with_sysfs(self):
+        self.assertEqual(gate_server.MAX_DESCRIPTOR_BYTES,
+                         sysfs.MAX_DESCRIPTOR_BYTES)
+
+    def test_equal_for_an_ordinary_device(self):
+        key, identity, digest = self._gate_key()
+        dev = sysfs.load_device(self.busview / "1-1")
+        self.assertEqual(key, trust.key_for(dev))
+        self.assertEqual(identity, trust.identity_of(dev))
+        self.assertEqual(digest, trust.descriptor_hash(dev))
+
+    def test_equal_when_textsafe_rewrites_the_serial(self):
+        raw = "SN\x1b[2J\x07\x7f42"
+        (self.usb / "serial").write_text(f"  {raw}  \n")
+        self.assertNotEqual(textsafe.sanitize(raw).text, raw,
+                            "the fixture must be a serial textsafe changes")
+        key = self._gate_key()[0]
+        self.assertEqual(key, trust.key_for(sysfs.load_device(self.usb)))
+        self.assertIn(textsafe.sanitize(raw).text, key)
+        self.assertNotIn("\x1b", key)
+
+    def test_equal_when_there_is_no_serial(self):
+        (self.usb / "serial").unlink()
+        key = self._gate_key()[0]
+        self.assertEqual(key, trust.key_for(sysfs.load_device(self.usb)))
+        self.assertTrue(key.startswith("0951:1666:-#"))
+
+    def test_no_descriptors_means_no_key_on_either_side(self):
+        (self.usb / "descriptors").unlink()
+        self.assertIsNone(self._gate_key())
+        self.assertIsNone(trust.key_for(sysfs.load_device(self.usb)))
+
+    def test_a_symlinked_attribute_is_not_followed(self):
+        decoy = Path(self.tmp.name) / "decoy"
+        decoy.write_text("DECOY\n")
+        (self.usb / "serial").unlink()
+        (self.usb / "serial").symlink_to(decoy)
+        key = self._gate_key()[0]
+        self.assertNotIn("DECOY", key)
+
+
+class GateTrust(_GateTrustCase):
+
+    # -- the round of a legitimate "always" ------------------------------
+
+    def test_an_admitted_device_is_remembered(self):
+        self.admit()
+        resp = self.ask(label="My stick")
+        self.assertTrue(resp.ok, resp.detail)
+        entry = self.stored()[self.analyzer_key()]
+        import hashlib
+        self.assertEqual(entry.identity, f"0951:1666:{self.SERIAL}")
+        self.assertEqual(entry.descriptor_hash, hashlib.sha256(
+            (self.usb / "descriptors").read_bytes()).hexdigest())
+        self.assertEqual(entry.label, "My stick")
+        self.assertEqual((entry.times_admitted, entry.ports, entry.note),
+                         (1, ["1-1"], ""))
+        self.assertEqual(entry.trusted_at, entry.last_seen)
+        self.assertLess(abs(entry.trusted_at - time.time()), 60)
+
+    def test_a_new_store_is_readable_by_the_analyzer_and_never_writable(self):
+        self.admit()
+        self.assertTrue(self.ask().ok)
+        self.assertEqual(self.trust_path.stat().st_mode & 0o777, 0o644)
+
+    def test_the_fingerprint_is_the_one_from_before_the_first_switch_on(self):
+        """A device that changes its story once running is not re-measured."""
+        before = self.analyzer_key()
+        self.temporary(1)          # quarantine / storage scan
+        (self.usb / "descriptors").write_bytes(
+            descriptor_blob((0x03, 0x01, 0x01)))
+        self.temporary(0)          # re-blocked for the question
+        after = self.analyzer_key()
+        self.assertNotEqual(before, after)
+        self.admit()
+        self.assertEqual(self.ask(key=after).status, protocol.DENIED)
+        self.write_authorized("0")
+        self.admit()
+        self.assertTrue(self.ask(key=before).ok)
+
+    def test_a_new_device_at_the_port_is_measured_afresh(self):
+        self.temporary(1)
+        self.temporary(0)
+        self.usb.rename(self.usb.with_name("gone"))   # keep the old inode
+        self._populate(self.usb, descriptor_blob((0x03, 0x01, 0x02)),
+                       serial="OTHER")
+        self.admit()
+        self.assertTrue(self.ask().ok)
+        self.assertIn(self.analyzer_key(), self.stored())
+
+    def write_authorized(self, value):
+        (self.usb / "authorized").write_text(value + "\n")
+
+    # -- scope: only what this gate admitted, now, once -------------------
+
+    def test_a_device_this_gate_never_admitted_is_refused(self):
+        self.write_authorized("1")
+        resp = self.ask()
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertIn("not admitted", resp.detail)
+        self.assertFalse(self.trust_path.exists())
+
+    def test_a_temporary_switch_on_is_not_an_admission(self):
+        self.temporary(1)
+        self.assertEqual(self.ask().status, protocol.DENIED)
+
+    def test_a_wrong_instance_is_refused_without_spending_the_admission(self):
+        self.admit()
+        self.assertEqual(self.ask(instance=(0, 0)).status, protocol.DENIED)
+        self.assertTrue(self.ask().ok)
+
+    def test_a_device_replaced_since_admission_is_refused(self):
+        self.admit()
+        admitted = self.instance()
+        self.usb.rename(self.usb.with_name("gone"))
+        self._populate(self.usb, descriptor_blob((0x08, 0x06, 0x50)))
+        self.write_authorized("1")
+        resp = self.ask(instance=admitted)
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertIn("changed", resp.detail)
+        self.assertFalse(self.trust_path.exists())
+
+    def test_the_window_closes(self):
+        self.admit()
+        instance, _at = self.gate._admitted[str(self.usb)]
+        self.gate._admitted[str(self.usb)] = (
+            instance, time.monotonic() - gate_server.TRUST_WINDOW - 1)
+        resp = self.ask()
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertFalse(self.trust_path.exists())
+
+    def test_it_is_one_shot(self):
+        self.admit()
+        self.assertTrue(self.ask().ok)
+        self.assertEqual(self.ask().status, protocol.DENIED)
+
+    def test_a_refused_attempt_spends_it_too(self):
+        """A failure is not an invitation to try other keys."""
+        self.admit()
+        self.assertEqual(self.ask(key="0951:1666:x#00").status, protocol.DENIED)
+        self.assertEqual(self.ask().status, protocol.DENIED)
+        self.assertFalse(self.trust_path.exists())
+
+    def test_a_device_switched_off_since_admission_is_refused(self):
+        self.admit()
+        self.write_authorized("0")
+        resp = self.ask()
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertIn("no longer authorized", resp.detail)
+
+    def test_a_re_block_through_the_gate_ends_the_admission(self):
+        self.admit()
+        self.gate._media_hosts[str(self.usb)] = self.instance()
+        self.gate.watch_media = True
+        with mock.patch.object(self.gate, "_storage_only", return_value=True):
+            self.temporary(0)      # a media-policy hit
+        self.assertNotIn(str(self.usb), self.gate._admitted)
+
+    def test_a_path_outside_the_usb_tree_is_refused(self):
+        self.admit()
+        self.assertEqual(self.ask(path="/etc/shadow").status, protocol.DENIED)
+
+    # -- what is stored is the gate's own measurement ---------------------
+
+    def test_a_key_that_is_not_the_gates_is_refused(self):
+        self.admit()
+        identity = f"0951:1666:{self.SERIAL}"
+        resp = self.ask(key=f"{identity}#{'0' * 64}")
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertIn("fingerprint does not match", resp.detail)
+        self.assertFalse(self.trust_path.exists())
+
+    def test_an_unmeasurable_device_cannot_be_trusted(self):
+        (self.usb / "descriptors").unlink()
+        self.admit()
+        resp = self.ask(key=f"0951:1666:{self.SERIAL}#{'0' * 64}")
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertFalse(self.trust_path.exists())
+
+    def test_control_characters_in_the_label_never_reach_the_store(self):
+        """Cleaned by the gate itself, whatever the analyzer sent."""
+        for label in ("evil\x1b[2J", "bell\x07", "del\x7f", "c1\x85",
+                      "line\u2028break", "bidi\u202e"):
+            with self.subTest(label=label):
+                self.write_authorized("0")
+                self.admit()
+                self.assertTrue(self.ask(label=label).ok)
+                stored = self.stored()[self.analyzer_key()].label
+                self.assertEqual(stored, textsafe.sanitize(label).text)
+                self.assertFalse(any(ord(c) < 0x20 or 0x7f <= ord(c) < 0xa0
+                                     or c in "\u2028\u202e" for c in stored),
+                                 repr(stored))
+
+    def test_a_label_cut_short_by_textsafe_is_kept_not_refused(self):
+        """textsafe is not a fixed point on text it already truncated: a
+        dropped escape resets its combining-mark count, so a second pass
+        escapes a mark the first let through. Refusing the daemon's own
+        label for such a device would lose "always" with the admission
+        already spent."""
+        product = "A" * 118 + "\u0301" * 3 + "\ufeff" + "\u0301"
+        label = textsafe.sanitize(product).text
+        self.assertNotEqual(textsafe.sanitize(label).text, label,
+                            "the fixture must be one textsafe changes again")
+        self.admit()
+        resp = self.ask(label=label)
+        self.assertTrue(resp.ok, resp.detail)
+        self.assertEqual(self.stored()[self.analyzer_key()].label,
+                         textsafe.sanitize(label, protocol.MAX_LABEL).text)
+
+    def test_a_label_textsafe_already_cleaned_is_accepted(self):
+        """What the daemon really sends: escapes as visible text."""
+        label = textsafe.sanitize("Acme\x1b[2J").text + " Widget é"
+        self.admit()
+        self.assertTrue(self.ask(label=label).ok)
+        self.assertEqual(self.stored()[self.analyzer_key()].label, label)
+
+    # -- the store -------------------------------------------------------
+
+    def test_trust_disabled_is_refused(self):
+        self.gate = self._gate(None)
+        self.admit()
+        resp = self.ask()
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertIn("disabled", resp.detail)
+
+    def test_a_missing_directory_is_not_created(self):
+        """Made here, its mode would be root's umask's to decide, and a 0700
+        directory is one the analyzer can read nothing back from."""
+        missing = Path(self.tmp.name) / "absent" / "trusted.json"
+        self.gate = self._gate(missing)
+        self.admit()
+        resp = self.ask()
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertIn("does not exist", resp.detail)
+        self.assertFalse(missing.parent.exists())
+
+    def test_a_store_that_cannot_be_vouched_for_is_not_rewritten(self):
+        for text, mode in (('{"schema": 1, "devices": {}}', 0o664),
+                           ("{not json", 0o600)):
+            with self.subTest(mode=oct(mode)):
+                self.trust_path.write_text(text)
+                os.chmod(self.trust_path, mode)
+                self.write_authorized("0")
+                self.admit()
+                resp = self.ask()
+                self.assertEqual(resp.status, protocol.DENIED)
+                self.assertEqual(self.trust_path.read_text(), text)
+                self.assertEqual(self.trust_path.stat().st_mode & 0o777, mode)
+
+    def _fill(self, keys):
+        store = trust.TrustStore(self.trust_path)
+        for key in keys:
+            store.devices[key] = trust.TrustedDevice(
+                key=key, identity="v:p:s", label="filler",
+                descriptor_hash="ab", trusted_at=1.0, last_seen=1.0)
+        self.assertIsNone(store.save())
+
+    def test_the_store_has_a_ceiling(self):
+        self._fill(["a#1", "b#2"])
+        self.admit()
+        with mock.patch.object(gate_server, "MAX_TRUSTED", 2):
+            resp = self.ask()
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertEqual(set(self.stored()), {"a#1", "b#2"})
+
+    def test_re_trusting_a_key_already_there_is_allowed_at_the_ceiling(self):
+        self._fill(["a#1", self.analyzer_key()])
+        self.admit()
+        with mock.patch.object(gate_server, "MAX_TRUSTED", 2):
+            resp = self.ask(label="Renamed")
+        self.assertTrue(resp.ok, resp.detail)
+        devices = self.stored()
+        self.assertEqual(len(devices), 2)
+        self.assertEqual(devices[self.analyzer_key()].label, "Renamed")
+
+    def test_an_existing_store_keeps_its_entries_and_mode(self):
+        self._fill(["a#1"])
+        os.chmod(self.trust_path, 0o600)
+        self.admit()
+        self.assertTrue(self.ask().ok)
+        self.assertEqual(set(self.stored()), {"a#1", self.analyzer_key()})
+        self.assertEqual(self.trust_path.stat().st_mode & 0o777, 0o600)
+
+    def test_the_handler_answers_rather_than_raises(self):
+        self.admit()
+        with mock.patch.object(gate_server.trust_mod, "TrustStore",
+                               side_effect=OSError("disk on fire")):
+            resp = self.ask()
+        self.assertEqual(resp.status, protocol.ERROR)
+
+    def test_the_serve_loop_routes_the_request(self):
+        self.admit()
+        req = protocol.Request(protocol.REQ_TRUST, path=str(self.usb),
+                               instance=self.instance(),
+                               key=self.analyzer_key(), label="Stick")
+        sock = mock.Mock()
+        sock.recv.side_effect = [req.encode(), b""]
+        self.gate.sock = sock
+        self.gate.serve_forever()
+        reply = protocol.Response.decode(sock.sendmsg.call_args.args[0][0])
+        self.assertTrue(reply.ok, reply.detail)
+
+
+class GateTrustRoundTrip(_GateTrustCase):
+    """
+    The whole path the daemon takes under --privsep, over a real socketpair:
+    sysfs.admit_device and sysfs.remember_via_backend through an installed
+    GateBackend, and a store that a FRESH TrustStore -- the next run of the
+    analyzer -- reads back as trusting this exact device.
+    """
+
+    def setUp(self):
+        super().setUp()
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        a.settimeout(2)
+        self.gate.sock = b
+        thread = threading.Thread(target=self.gate.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            a.close()
+            thread.join(2)
+            b.close()
+        self.addCleanup(stop)
+        self.client = GateClient(a)
+        previous = sysfs._backend
+        sysfs.install_backend(gate_client.GateBackend(self.client))
+        self.addCleanup(sysfs.install_backend, previous)
+        # Read at the uevent, while blocked, as the daemon does.
+        self.dev = sysfs.load_device(self.busview / "1-1")
+
+    def test_always_survives_a_restart(self):
+        self.assertTrue(sysfs.backend_can_trust())
+        sysfs.admit_device(self.dev)
+        sysfs.remember_via_backend(self.dev, trust.key_for(self.dev),
+                                   self.dev.label())
+        fresh = trust.TrustStore(self.trust_path)
+        self.assertIsNone(fresh.load_error)
+        self.assertTrue(fresh.is_trusted(sysfs.load_device(self.usb)))
+        self.assertEqual(self.trust_path.stat().st_mode & 0o777, 0o644)
+
+    def test_a_refusal_reaches_the_daemon_as_an_oserror(self):
+        sysfs.admit_device(self.dev)
+        with self.assertRaises(OSError) as caught:
+            sysfs.remember_via_backend(self.dev, "0951:1666:x#00", "Stick")
+        self.assertIsInstance(caught.exception, gate_client.GateError)
+        self.assertIn("fingerprint", str(caught.exception))
+        self.assertFalse(self.trust_path.exists())
+
+    def test_a_second_request_for_one_admission_is_refused(self):
+        sysfs.admit_device(self.dev)
+        key = trust.key_for(self.dev)
+        sysfs.remember_via_backend(self.dev, key, "Stick")
+        with self.assertRaises(gate_client.GateError):
+            sysfs.remember_via_backend(self.dev, key, "Stick")
+
+    def test_the_direct_backend_does_not_claim_to_trust(self):
+        sysfs.install_backend(sysfs._DirectBackend())
+        self.assertFalse(sysfs.backend_can_trust())
+        with self.assertRaises(OSError):
+            sysfs.remember_via_backend(self.dev, "k#h", "Stick")
+
+    def test_a_backend_with_a_merely_truthy_flag_does_not_claim_to_trust(self):
+        sysfs.install_backend(mock.Mock())
+        self.assertFalse(sysfs.backend_can_trust())
+
+
+class TrustPathComesFromTheRootSide(unittest.TestCase):
+    """__main__ -> privsep.start -> run_gate -> GateServer, never the socket."""
+
+    def _main(self, argv):
+        from probolos import __main__ as cli
+        captured = {}
+
+        def fake_start(analyzer_main, **kwargs):
+            captured.update(kwargs)
+            return 0
+
+        with mock.patch.object(cli, "require_usb"), \
+                mock.patch.object(cli, "require_root"), \
+                mock.patch.object(cli, "claim_the_gate"), \
+                mock.patch.object(privsep, "prepare_trust_readable"), \
+                mock.patch.object(privsep, "start", fake_start), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(SystemExit):
+                cli.main(argv)
+        return captured
+
+    def test_the_cli_hands_the_trust_path_to_the_gate(self):
+        captured = self._main(["--privsep", "--no-ledger", "--trust-file",
+                               "/var/lib/probolos/t.json"])
+        self.assertEqual(str(captured["trust_path"]),
+                         "/var/lib/probolos/t.json")
+
+    def test_no_trust_means_no_trust_path(self):
+        captured = self._main(["--privsep", "--no-ledger", "--no-trust"])
+        self.assertIsNone(captured["trust_path"])
+
+    def test_start_forwards_it_to_the_gate(self):
+        seen = {}
+
+        def fake_run_gate(sock, log, watch_media, trust_path=None):
+            seen["trust_path"] = trust_path
+
+        with mock.patch.object(privsep.os, "getuid", return_value=0), \
+                mock.patch.object(privsep, "resolve_user",
+                                  return_value=(65534, 65534)), \
+                mock.patch.object(privsep.os, "fork", return_value=4242), \
+                mock.patch.object(privsep.os, "waitpid",
+                                  return_value=(4242, 0)), \
+                mock.patch("signal.signal"), \
+                mock.patch.object(privsep.gate_server, "run_gate",
+                                  fake_run_gate):
+            rc = privsep.start(lambda _c: 0, log=lambda *_a: None,
+                               trust_path="/var/lib/probolos/trusted.json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["trust_path"], "/var/lib/probolos/trusted.json")
+
+    def test_the_gate_keeps_it(self):
+        gate = gate_server.GateServer(sock=None, log=lambda *_a: None,
+                                      trust_path="/var/lib/probolos/t.json")
+        self.assertEqual(gate.trust_path, Path("/var/lib/probolos/t.json"))
+        self.assertIsNone(gate_server.GateServer(sock=None).trust_path)
 
 
 if __name__ == "__main__":

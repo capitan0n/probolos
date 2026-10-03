@@ -16,7 +16,10 @@ So there are three parts, each knowing as little as possible about the others:
 
 The agent connects inward over a Unix socket and answers questions. If no agent
 is connected, the analyzer falls back to the terminal exactly as before -- the
-notification path is an interface, not a dependency.
+notification path is an interface, not a dependency. Where there is no terminal
+either (the service: stdin is /dev/null), the device is held blocked and asked
+about once an agent connects, rather than "asked" on a terminal that can only
+answer EOF.
 
 THE PROPERTY THAT MAKES A CLICKABLE PROMPT SAFE
 -----------------------------------------------
@@ -79,7 +82,8 @@ notification can be treated as a human decision:
        real agent and returning None. So merely CONNECTING repeatedly was
        enough to cancel every question and evict the agent, which is the thing
        this check exists to prevent. A question in flight is now itself proof
-       of life: the probe is skipped entirely while one is open.
+       of life: the probe is skipped entirely while one is open. The probe
+       itself no longer touches the blocking mode either (it asks poll()).
 
     3. An answer cannot precede its question. Request ids counting from 1 let
        a client put replies into the buffer before anything is asked, so the
@@ -89,10 +93,11 @@ notification can be treated as a human decision:
 
 What remains, deliberately: a process running as the desktop user can occupy
 the agent slot and never answer. That is not a bypass -- ask() times out and
-the daemon falls back to the terminal, which is the safe direction -- and it
-cannot be closed here, because a process with that uid can ptrace the real
-agent anyway. The trust boundary is the uid, and it is now enforced by the
-kernel rather than only by file permissions.
+the device stays blocked (asked on the terminal if there is one, otherwise
+denied as unanswered), which is the safe direction -- and it cannot be closed
+here, because a process with that uid can ptrace the real agent anyway. The
+trust boundary is the uid, and it is now enforced by the kernel rather than
+only by file permissions.
 """
 
 from __future__ import annotations
@@ -100,6 +105,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import select
 import socket
 import struct
 import threading
@@ -113,6 +119,7 @@ DEFAULT_SOCKET = Path("/run/probolos/agent.sock")
 MSG_DECIDE = "decide"
 MSG_CRITICAL = "critical"       # display only; the answer must come elsewhere
 MSG_CANCEL = "cancel"           # device vanished, withdraw the notification
+MSG_NOTICE = "notice"           # display only, e.g. "still blocked, replug it"
 
 # Message kinds, agent -> analyzer
 MSG_ANSWER = "answer"
@@ -123,8 +130,8 @@ ANSWER_ALWAYS = "always"
 ANSWER_NO = "no"
 # Not a decision. Sent by the agent when it has no way to show a dialog at all,
 # or when nobody answered the dialog in time, so the analyzer can tell "the
-# user refused" apart from "the user never answered" and fall back to the
-# terminal instead of silently denying everything.
+# user refused" apart from "the user never answered": it asks on its terminal
+# if it has one, and otherwise records "no answer", never a refusal.
 ANSWER_UNAVAILABLE = "unavailable"
 
 # How the agent asks, from least to most friction. Chosen by the daemon per
@@ -157,38 +164,37 @@ def _still_connected(conn) -> bool:
     """
     True while the peer's end is still open.
 
-    MSG_PEEK looks without consuming, so a real answer already in flight is not
-    swallowed by the liveness check. An idle live connection has nothing to
-    read and raises BlockingIOError; a peer that has gone away returns b"".
-    Data waiting to be read also counts as alive, which is correct: something
-    is there, and if it turns out not to be a real agent the question put to it
-    simply times out into the terminal fallback.
+    Asked of the kernel with poll(), which reports a closed peer as a hang-up
+    whatever is still buffered. The probe used to be a one-byte recv with
+    MSG_PEEK, and a peer that closed AFTER sending -- an agent whose late
+    answer arrived, then logged out -- peeked as that byte, not as EOF, so
+    the dead agent counted as there: a restarted agent was refused the slot
+    as a "second agent", and a device plugged in at the login screen would
+    be switched on for inspection with nobody to ask, found out only by the
+    question sent into the dead socket afterwards. Data waiting from a peer
+    that IS still open counts as alive, as before: something is there, and
+    if it is not a real agent the question put to it simply times out.
 
-    The socket is switched to non-blocking explicitly rather than relying on
-    MSG_DONTWAIT. On a socket that has a timeout set -- which every accepted
-    connection here does -- CPython waits for readability BEFORE calling recv,
-    so MSG_DONTWAIT never gets a chance to take effect and the call blocks for
-    the full timeout and then raises socket.timeout. socket.timeout is an
-    OSError, so a perfectly healthy idle agent would be reported dead, and the
-    connection it is holding would be handed to whoever asked next -- turning
-    the fix for connection hijacking back into the hijack itself.
+    poll() also leaves the socket's blocking mode alone. The peek had to
+    switch it to non-blocking -- with a timeout set, CPython waits for
+    readability before recv and MSG_DONTWAIT never takes effect -- and that
+    switch, made while ask() was in recv() on the same socket, is the race
+    the module header describes.
     """
     try:
-        previous = conn.gettimeout()
-        conn.setblocking(False)
-    except OSError:
+        fd = conn.fileno()
+    except (OSError, ValueError):
         return False
+    if fd < 0:
+        return False            # closed on our side already
+    poller = select.poll()
+    poller.register(fd, select.POLLIN | select.POLLRDHUP)
     try:
-        return bool(conn.recv(1, socket.MSG_PEEK))
-    except (BlockingIOError, InterruptedError):
-        return True
+        events = poller.poll(0)
     except OSError:
         return False
-    finally:
-        try:
-            conn.settimeout(previous)
-        except OSError:
-            pass
+    gone = select.POLLHUP | select.POLLRDHUP | select.POLLERR | select.POLLNVAL
+    return not any(revents & gone for _fd, revents in events)
 
 
 def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
@@ -533,6 +539,37 @@ class AgentLink:
         with self._lock:
             return self._conn is not None
 
+    def is_live(self) -> bool:
+        """
+        Is an agent connected AND still there?
+
+        `connected` only says a connection object exists. An agent whose
+        session ended -- logout, crash, a restart in progress -- leaves exactly
+        that behind until something next uses it, so the daemon could not tell
+        "nobody is there to ask" from "somebody is" without first sending a
+        question into a dead socket. This looks, and frees the slot when the
+        peer has closed its end, so the next agent can take it.
+
+        A question in flight is itself proof of life, and while one is open
+        the socket is NOT probed: ask() is inside recv() on it. The probe no
+        longer switches its blocking mode -- the race the module header
+        describes -- but ask() is the one reading that socket, and it finds
+        out for itself if the agent goes.
+        """
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return False
+            if self._asking > 0:
+                return True
+            if _still_connected(conn):
+                return True
+            self._conn = None
+            self._peer = None
+        self._close(conn)
+        self.log("[agent] desktop agent disconnected")
+        return False
+
     @property
     def peer(self) -> Optional[tuple]:
         """(pid, uid, gid) of the connected agent, or None."""
@@ -550,9 +587,10 @@ class AgentLink:
 
         Returns "yes", "always", "no", or None when the agent could not answer
         (not connected, disconnected mid-question, or silent past the timeout).
-        None means "fall back", not "no" -- the caller decides what a missing
-        answer means, and the daemon treats it as a reason to use the terminal
-        rather than as a decision nobody made.
+        None means "no decision", not "no" -- the caller decides what a missing
+        answer means. The daemon asks on its terminal if it has one; without
+        one it holds the device when the agent has gone (is_live() tells the
+        two apart) and records "no answer" when the agent is still there.
         """
         with self._lock:
             conn = self._conn
@@ -681,16 +719,39 @@ class AgentLink:
         so the user knows something is waiting for them, not so they can wave it
         through.
         """
+        self._send_display(MSG_CRITICAL, title, body)
+
+    def notify(self, title: str, body: str) -> None:
+        """
+        Tell the agent something it can only display. Never raises.
+
+        Used when a question went unanswered: the device stays blocked, and
+        the person who comes back to the machine is told so and how to be
+        asked again. The message carries no id, so there is nothing to answer
+        and no way to allow anything from it.
+        """
+        self._send_display(MSG_NOTICE, title, body)
+
+    def _send_display(self, kind: str, title: str, body: str) -> None:
+        """
+        One display-only message. A dead connection is dropped, not raised.
+
+        The send happens under the lock, so the accept thread's liveness probe
+        cannot switch this socket to non-blocking halfway through it: sendall
+        would then fail on a full buffer and drop a perfectly live agent.
+        """
+        payload = (json.dumps({"type": kind, "title": title, "body": body})
+                   + "\n").encode()
         with self._lock:
             conn = self._conn
-        if conn is None:
-            return
-        try:
-            conn.sendall((json.dumps({
-                "type": MSG_CRITICAL, "title": title, "body": body,
-            }) + "\n").encode())
-        except OSError:
-            self._drop(conn)
+            if conn is None:
+                return
+            try:
+                conn.sendall(payload)
+                return
+            except OSError:
+                pass
+        self._drop(conn)
 
     # ---- internals ----
 

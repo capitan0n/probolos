@@ -436,6 +436,24 @@ class TrustStoreIntegrity(unittest.TestCase):
         self.assertIsNone(store.load_error)
         self.assertEqual(store.devices, {})
 
+    def test_a_store_that_cannot_be_reached_fails_closed_not_loudly(self):
+        """The analyzer runs as `nobody`. A trust directory it cannot traverse
+        -- made 0700 under a restrictive umask -- made Path.exists() raise
+        EACCES out of the constructor, which ended the analyzer at startup
+        and the gate with it. Nothing trusted, reason given, no exception."""
+        writer = trust.TrustStore(self.path)
+        writer.trust(Dev())
+        self.assertIsNone(writer.save())
+        denied = PermissionError(13, "Permission denied", str(self.path))
+        with mock.patch.object(Path, "exists", side_effect=denied):
+            store = trust.TrustStore(self.path)
+            self.assertIn("cannot reach the trust store", store.load_error)
+            self.assertEqual(store.devices, {})
+            # What every plug calls; it must not raise either, and the
+            # device the file does trust is not trusted from a store that
+            # could not be read.
+            self.assertFalse(store.is_trusted(Dev()))
+
 
 # ---------------------------------------------------------------------------
 # 2. State files: valid JSON that is not an object
@@ -608,6 +626,31 @@ class SaveKeepsReadBitsNeverWriteBits(unittest.TestCase):
         os.chmod(self.path, 0o666)
         self.store.save()
         self.assertEqual(self._mode(), 0o644)
+
+    # The root gate writes "always" under --privsep, and the analyzer that
+    # must read it back is `nobody`. A store the gate CREATED 0600 would
+    # remember the device on disk and ask about it on every plug anyway.
+
+    def test_a_new_store_can_be_created_readable(self):
+        self.assertIsNone(self.store.save(readable=True))
+        self.assertEqual(self._mode(), 0o644)
+
+    def test_readable_does_not_widen_an_existing_private_store(self):
+        self.store.save()
+        self.store.save(readable=True)
+        self.assertEqual(self._mode(), 0o600)
+
+    def test_readable_never_brings_write_bits(self):
+        self.store.save()
+        os.chmod(self.path, 0o666)
+        self.store.save(readable=True)
+        self.assertEqual(self._mode(), 0o644)
+
+    def test_a_readable_store_reloads_cleanly(self):
+        self.store.save(readable=True)
+        fresh = trust.TrustStore(self.path)
+        self.assertIsNone(fresh.load_error)
+        self.assertTrue(fresh.is_trusted(Dev()))
 
 
 class WritableSaysWhetherAlwaysCanBeKept(unittest.TestCase):

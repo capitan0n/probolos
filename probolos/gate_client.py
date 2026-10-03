@@ -111,6 +111,25 @@ class GateClient:
         if not resp.ok:
             raise GateError(f"set_default failed: {resp.status}: {resp.detail}")
 
+    def trust(self, syspath, instance, key: str, label: str) -> None:
+        """
+        Ask the gate to remember a device it has just admitted.
+
+        The gate checks `key` against its own fingerprint of the device and
+        refuses on any difference; this side cannot make it trust anything
+        the gate did not measure. The label is display text, cut to the
+        protocol's bound here: two maximum-length device strings joined can
+        exceed it, and losing the tail of a display name is better than
+        losing "always" for that device altogether.
+        """
+        if len(label) > protocol.MAX_LABEL:
+            label = label[:protocol.MAX_LABEL - 3] + "..."
+        resp, _ = self._round_trip(protocol.Request(
+            protocol.REQ_TRUST, path=str(syspath), instance=instance,
+            key=key, label=label))
+        if not resp.ok:
+            raise GateError(f"trust failed: {resp.status}: {resp.detail}")
+
     def open_block(self, device_path) -> int:
         """Ask the gate to open a whole disk read-only and return the fd."""
         resp, fd = self._round_trip(protocol.Request(
@@ -149,6 +168,10 @@ class GateBackend:
     # declines to start, rather than discovering the problem halfway through
     # with autoprobe already switched off.
     supports_bus_wide = False
+    # The analyzer cannot write the trust store under --privsep; the gate can,
+    # for a device it just admitted. sysfs.backend_can_trust() reads this so
+    # the daemon offers "always" without knowing which backend is installed.
+    supports_trust = True
 
     def __init__(self, client: "GateClient"):
         self.client = client
@@ -173,6 +196,9 @@ class GateBackend:
 
     def open_block(self, device_path) -> int:
         return self.client.open_block(device_path)
+
+    def trust(self, syspath, instance, key: str, label: str) -> None:
+        self.client.trust(syspath, instance, key, label)
 
     # ---- deliberately NOT available under privilege separation ----
     #

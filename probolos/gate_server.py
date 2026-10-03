@@ -12,6 +12,12 @@ switched OFF, never on, for as long as the same kernel directory instance is
 there. That is what lets the analyzer inspect a card inserted into an already
 trusted reader, and drop the reader on a policy hit.
 
+One write reaches persistent state: TRUST, which adds a device to the
+root-owned trust store so "always" works under --privsep. It is scoped as
+tightly as the rest: a device this gate admitted on this connection, asked
+for within TRUST_WINDOW of that admission, once, under the fingerprint this
+gate took itself before it first switched the device on.
+
 This module plus its protocol and privileged startup/cleanup dependencies form
 the userspace privilege boundary. It is not an independent human-approval
 service: the analyzer still controls admission policy for unknown devices.
@@ -25,10 +31,22 @@ import re as _re
 import socket
 import stat
 import time
+import types
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
 from . import protocol
+# Two more imports into the root process, both for TRUST and both chosen so
+# the gate does not carry a second copy of a rule that must agree with the
+# analyzer's byte for byte. textsafe is pure string handling (no I/O): the
+# serial in a trust key is the textsafe-cleaned one, so the gate cleans it the
+# same way or its key never matches. trust holds the key formula and the
+# store, whose integrity checks then run here, as root, before every write.
+# sysfs is still NOT imported: it would bring the descriptor parser in with it,
+# and the gate hashes descriptors without ever parsing them.
+from . import textsafe
+from . import trust as trust_mod
 
 # The only paths the gate will ever touch. Requests outside these are refused
 # regardless of what the analyzer says, because the analyzer is not trusted.
@@ -66,6 +84,28 @@ _ROOT_HUB_NAME = _re.compile(r"^usb\d+$")
 _INTERFACE_NAME = _re.compile(r"^[0-9]+-[0-9.]+:[0-9]+\.[0-9]+$")
 _MASS_STORAGE_CLASS = "08"
 
+# ---- TRUST ----
+# How long after admission the analyzer may ask for the device to be
+# remembered. The daemon asks immediately after admit_device() returns; the
+# window only has to cover the ledger write in between. Anything later is not
+# the "always" that came with that decision.
+TRUST_WINDOW = 60.0
+# Most entries the gate will grow the store to. Each REQ_TRUST needs a fresh
+# admission, so this is not reachable by an honest user; it bounds what a
+# compromised analyzer, admitting and trusting in a loop, can make every later
+# load() read. Re-trusting a key already present is always allowed.
+MAX_TRUSTED = 1024
+# Mirrors sysfs.MAX_DESCRIPTOR_BYTES; duplicated rather than imported for the
+# reason given above the imports. The analyzer refuses a larger blob (its key
+# is then None), so the gate refusing it too keeps the two in agreement.
+MAX_DESCRIPTOR_BYTES = 1024 * 1024
+# A sysfs text attribute is at most one page. The analyzer reads idVendor,
+# idProduct and serial unbounded; the gate must not. A bound this size still
+# covers everything the key keeps (textsafe caps the serial at 126 characters),
+# and an attribute that differs past it can only make the keys disagree, which
+# refuses.
+_ATTR_LIMIT = 4096
+
 
 class GateServer:
     """
@@ -79,12 +119,30 @@ class GateServer:
     only by this process, from values read out of sysfs; nothing on the wire
     can add to either. They are per-connection, so a restarted analyzer starts
     with no accumulated permission.
+
+    TRUST adds two more of the same kind: the fingerprint of each device as
+    the gate found it before switching it on, and which devices it admitted
+    and when. Both are filled from sysfs by this process, and an admission
+    record is spent by the first TRUST that names its instance.
     """
 
     def __init__(self, sock: socket.socket, log=print,
-                 watch_media: bool = False):
+                 watch_media: bool = False, trust_path=None):
         self.sock = sock
         self.log = log
+        # Where "always" is written, or None under --no-trust. Comes from the
+        # root side's command line, like watch_media: the analyzer cannot
+        # point the gate's one persistent write at a file of its choosing.
+        self.trust_path = Path(trust_path) if trust_path else None
+        # Resolved device path -> (instance, fingerprint), the fingerprint
+        # being (key, identity, descriptor_hash) or None if it could not be
+        # taken. Taken before the first authorized=1 this gate writes to that
+        # instance, so it is what the analyzer read at the uevent -- not
+        # whatever the device presents once it is running.
+        self._fingerprints: dict = {}
+        # Resolved device path -> (instance, monotonic time) for each final
+        # admission. What REQ_TRUST may act on, once.
+        self._admitted: dict = {}
         # Storage hosts whose media the analyzer may watch: resolved path ->
         # kernel directory instance. Filled only from sysfs, by this process,
         # and only when the operator started it with --watch-media.
@@ -456,6 +514,12 @@ class GateServer:
                          and self._media_host(devpath))
             if not blocked and (req.value == 1 or not (owned or media_off)):
                 return protocol.Response(protocol.DENIED, "device is outside quarantine")
+            if req.value == 1:
+                # Only reachable while the device reads 0, through the same
+                # pinned directory the write below uses. This is the last
+                # moment its descriptors are the ones the analyzer judged, so
+                # it is the moment the trust fingerprint is taken.
+                self._remember_fingerprint(devpath, directory_fd, instance)
             fd = os.open("authorized", os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
                          dir_fd=directory_fd)
             with os.fdopen(fd, "w") as fh:
@@ -468,6 +532,13 @@ class GateServer:
                 self._authorized_here.discard(str(devpath))
                 self._instances.pop(str(devpath), None)
                 self._open_leases.pop(str(devpath), None)
+            # Only a final admission may be followed by TRUST. Any other
+            # write -- a temporary switch-on, a re-block -- means the device
+            # is not in the state the decision left it in, so the record goes.
+            if req.value == 1 and not temporary:
+                self._admitted[str(devpath)] = (instance, time.monotonic())
+            else:
+                self._admitted.pop(str(devpath), None)
             if req.value == 1 and not temporary and self.watch_media:
                 # Admitted by a decision. Whether it is a storage host is
                 # judged from its interfaces at every use, not here.
@@ -783,6 +854,243 @@ class GateServer:
                 os.close(fd)
             return protocol.Response(protocol.ERROR, str(exc)), None
 
+    # ---- trust: keeping "always" under privilege separation ----
+
+    @staticmethod
+    def _read_text_at(directory_fd: int, name: str) -> Optional[str]:
+        """
+        One sysfs text attribute, read as sysfs.read_attr reads it.
+
+        Text mode with the default decoding, then strip(), so the value is the
+        one the analyzer got -- but relative to a pinned directory, with
+        O_NOFOLLOW, and bounded. None when it cannot be read, as read_attr
+        answers. Text that does not decode raises ValueError, as it does in
+        read_attr: the analyzer then has no device and no key, so the caller
+        must not produce one either.
+        """
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=directory_fd)
+        except OSError:
+            return None
+        try:
+            with os.fdopen(fd) as fh:
+                return fh.read(_ATTR_LIMIT).strip()
+        except OSError:
+            return None
+
+    @classmethod
+    def _fingerprint_at(cls, directory_fd: int) -> Optional[tuple]:
+        """
+        (key, identity, descriptor_hash) of the device behind directory_fd.
+
+        trust.key_for is given the same four values sysfs.load_device would
+        give it -- the raw descriptor bytes, idVendor and idProduct as read,
+        the serial passed through textsafe -- so the formula exists once and
+        the two halves cannot drift apart. The descriptors are hashed and
+        never parsed: the root process has no use for what they say, only
+        for whether they are the same bytes. None when there is nothing to
+        pin trust to, which is exactly when the analyzer's key_for is None.
+        """
+        try:
+            fd = os.open("descriptors", os.O_RDONLY | os.O_NOFOLLOW |
+                         os.O_CLOEXEC, dir_fd=directory_fd)
+            with os.fdopen(fd, "rb") as fh:
+                raw = fh.read(MAX_DESCRIPTOR_BYTES + 1)
+            if len(raw) > MAX_DESCRIPTOR_BYTES:
+                return None
+            vendor = cls._read_text_at(directory_fd, "idVendor")
+            product = cls._read_text_at(directory_fd, "idProduct")
+            serial = cls._read_text_at(directory_fd, "serial")
+        except (OSError, ValueError):
+            return None
+        if vendor is None or product is None:
+            return None     # load_device returns no device at all here
+        seen = types.SimpleNamespace(
+            vendor_id=vendor, product_id=product,
+            serial=textsafe.sanitize(serial).text, raw_descriptors=raw)
+        key = trust_mod.key_for(seen)
+        if key is None:
+            return None
+        return key, trust_mod.identity_of(seen), trust_mod.descriptor_hash(seen)
+
+    def _remember_fingerprint(self, devpath: Path, directory_fd: int,
+                              instance) -> None:
+        """Keep the EARLIEST fingerprint of this instance. Never raises."""
+        held = self._fingerprints.get(str(devpath))
+        if held is not None and held[0] == instance:
+            # Already taken, before an earlier switch-on. A later snapshot
+            # would describe a device that has been running, and one that
+            # changes what it presents once running is exactly the one whose
+            # later testimony must not become what is trusted.
+            return
+        # A different instance is a different device at the same port; its
+        # predecessor's fingerprint means nothing for it.
+        self._fingerprints[str(devpath)] = (instance,
+                                            self._fingerprint_at(directory_fd))
+
+    def _do_trust(self, req: protocol.Request) -> protocol.Response:
+        """
+        Remember, in the trust store, a device this gate has just admitted.
+
+        WHY THE ROOT GATE WRITES THIS
+        -----------------------------
+        The analyzer runs as `nobody`, and the trust store's directory is
+        deliberately root-owned: `nobody` is a shared account, so a directory
+        it could write is one in which any `nobody` process could forge an
+        entry that admits its own device without a prompt. That made "always"
+        impossible under --privsep, and a service that asks about its owner's
+        own mouse on every plug is a service people switch off.
+
+        WHY THIS ADDS SO LITTLE TO A COMPROMISED ANALYZER
+        -------------------------------------------------
+        Only the gate's private socketpair can carry this request. It is
+        created by the launcher before fork(), so no other process -- other
+        `nobody` processes included -- can reach it, which is precisely what
+        a writable directory could not promise. A compromised analyzer can
+        already admit devices; that is its job. What TRUST adds is
+        persistence, and only for:
+
+          * a device this gate admitted on this connection, within
+            TRUST_WINDOW, once (the record is spent by the first request
+            that names its instance, whether or not it then succeeds);
+          * that same kernel directory instance, still authorized now;
+          * under the key this gate computed itself, from the device as it
+            was before the gate first switched it on. The analyzer's key must
+            equal it exactly, so trust cannot be pinned to anything else --
+            not to descriptors the device never presented, not to another
+            device.
+
+        The label is the only value taken from the request, and only after
+        the gate has cleaned it. It is display text for --trusted and is
+        never compared when admitting anything.
+
+        Like every handler here, this returns a Response and never raises:
+        the gate's restore records must outlive any one request.
+        """
+        if self.trust_path is None:
+            return protocol.Response(protocol.DENIED,
+                                     "trust store disabled (--no-trust)")
+        devpath = self._safe_usb_path(req.path)
+        if (devpath is None or ":" in devpath.name
+                or _ROOT_HUB_NAME.fullmatch(devpath.name)):
+            return protocol.Response(protocol.DENIED,
+                                     "not a peripheral USB device")
+        record = self._admitted.get(str(devpath))
+        if record is None:
+            return protocol.Response(
+                protocol.DENIED,
+                "this gate has not admitted that device on this connection")
+        admitted_instance, admitted_at = record
+        if req.instance != admitted_instance:
+            return protocol.Response(
+                protocol.DENIED, "not the device instance this gate admitted")
+        # Spent from here on, whatever the outcome. One admission, one chance
+        # to remember it: a failure is not an invitation to try other keys.
+        self._admitted.pop(str(devpath), None)
+        if time.monotonic() - admitted_at > TRUST_WINDOW:
+            return protocol.Response(
+                protocol.DENIED,
+                f"admitted more than {TRUST_WINDOW:.0f}s ago; trust must come "
+                f"with the decision that admitted it")
+
+        # The live directory, pinned: the instance must still be the admitted
+        # one (a port recycled since then is different hardware) and it must
+        # still be switched on (a device dropped since then -- a media-policy
+        # hit, say -- is not one the decision still stands for).
+        directory_fd = None
+        try:
+            directory_fd = os.open(devpath, os.O_RDONLY | os.O_DIRECTORY |
+                                   os.O_NOFOLLOW | os.O_CLOEXEC)
+            st = os.fstat(directory_fd)
+            if (st.st_dev, st.st_ino) != admitted_instance:
+                return protocol.Response(protocol.DENIED,
+                                         "device changed since admission")
+            if self._read_text_at(directory_fd, "authorized") != "1":
+                return protocol.Response(protocol.DENIED,
+                                         "device is no longer authorized")
+        except (OSError, ValueError) as exc:
+            return protocol.Response(protocol.ERROR, str(exc))
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+        held = self._fingerprints.get(str(devpath))
+        if held is None or held[0] != admitted_instance or held[1] is None:
+            return protocol.Response(
+                protocol.DENIED,
+                "the gate could not fingerprint this device before switching "
+                "it on, so there is nothing to pin trust to")
+        key, identity, digest = held[1]
+        if req.key != key:
+            return protocol.Response(protocol.DENIED,
+                                     "device fingerprint does not match")
+
+        # Display text, but it ends up in a file root writes and in every
+        # terminal that runs --trusted, so the gate cleans it itself: whatever
+        # the analyzer sent, no raw ESC, C1 control, DEL or bidi override
+        # reaches the file. Cleaned, not refused. The label decides nothing --
+        # admission compares the key alone -- and textsafe is not a fixed
+        # point on text it has already cut short (a dropped escape resets its
+        # combining-mark count), so a label the daemon built from cleaned
+        # strings can come back different. Refusing it would lose the
+        # person's "always" over a cosmetic difference, with the admission
+        # already spent.
+        label = textsafe.sanitize(req.label, protocol.MAX_LABEL).text
+
+        now = time.time()
+        entry = trust_mod.TrustedDevice.from_raw(key, asdict(
+            trust_mod.TrustedDevice(
+                key=key, identity=identity, label=label,
+                descriptor_hash=digest, trusted_at=now, last_seen=now,
+                times_admitted=1, note="", ports=[devpath.name])))
+        if entry is None:
+            # from_raw is the loader's own validation: an entry it would skip
+            # on the next load must not be written in the first place.
+            return protocol.Response(protocol.ERROR,
+                                     "could not build a valid trust entry")
+
+        # The directory is not this request's to create. Under the shipped
+        # unit systemd makes it (StateDirectory=, 0755). Left to atomicio, it
+        # would be made here with whatever umask root runs under, and a 0700
+        # directory is one the analyzer can read nothing back from -- not
+        # this entry, and at its next start not the store at all.
+        if not os.path.isdir(self.trust_path.parent):
+            return protocol.Response(
+                protocol.DENIED,
+                f"the trust store's directory {self.trust_path.parent} "
+                f"does not exist")
+
+        # Loaded fresh for every request: the store may have been edited by a
+        # root-run --remove-trusted since the last one, and its integrity
+        # checks should judge the file as it is now. A fresh object also means
+        # save() reports its first error, which it otherwise only does once.
+        try:
+            store = trust_mod.TrustStore(self.trust_path)
+        except (OSError, ValueError) as exc:
+            return protocol.Response(protocol.ERROR,
+                                     f"could not read the trust store: {exc}")
+        if store.load_error:
+            # Fail closed. Rewriting a store this gate cannot vouch for would
+            # either launder what is in it (a group-writable file, a foreign
+            # owner) or throw away entries it merely failed to read.
+            return protocol.Response(
+                protocol.DENIED,
+                f"refusing to rewrite a trust store that cannot be vouched "
+                f"for: {store.load_error}")
+        if key not in store.devices and len(store.devices) >= MAX_TRUSTED:
+            return protocol.Response(
+                protocol.DENIED,
+                f"the trust store already holds {MAX_TRUSTED} devices")
+        # Replaced whole, as TrustStore.trust() does in direct mode.
+        store.devices[key] = entry
+        error = store.save(readable=True)
+        if error:
+            return protocol.Response(protocol.ERROR,
+                                     f"could not save the trust store: {error}")
+        self.log(f"[gate] remembered {devpath.name} in {self.trust_path}")
+        return protocol.Response(protocol.OK)
+
     # ---- the loop ----
 
     def serve_forever(self) -> None:
@@ -866,6 +1174,8 @@ class GateServer:
                     resp, fd_to_send = self._do_open_input(req)
                 elif req.kind == protocol.REQ_OPEN_BLOCK:
                     resp, fd_to_send = self._do_open_block(req)
+                elif req.kind == protocol.REQ_TRUST:
+                    resp = self._do_trust(req)
                 else:
                     resp = protocol.Response(protocol.ERROR, "unhandled kind")
             except Exception as exc:   # noqa: BLE001 -- see above
@@ -927,6 +1237,8 @@ class _PeerGone(Exception):
     """The analyzer is no longer reachable. Ends the serve loop, quietly."""
 
 
-def run_gate(sock: socket.socket, log=print, watch_media: bool = False) -> None:
+def run_gate(sock: socket.socket, log=print, watch_media: bool = False,
+             trust_path=None) -> None:
     """Entry point for the privileged child. Serves until the analyzer exits."""
-    GateServer(sock, log=log, watch_media=watch_media).serve_forever()
+    GateServer(sock, log=log, watch_media=watch_media,
+               trust_path=trust_path).serve_forever()

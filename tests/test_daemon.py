@@ -27,16 +27,23 @@ from unittest import mock
 
 from probolos import __main__ as cli
 from probolos import (
+    agentlink,
     daemon,
+    gate_client,
     mediawatch,
+    quarantine,
     report,
     rules,
+    safety,
     session,
     storage,
     sysfs,
+    trust,
     usbclass,
 )
 from probolos import daemon as daemon_mod
+from probolos import ledger as ledger_mod
+from tests._support import ServiceStdin
 
 
 def make_device(name="3-9", kinds=None):
@@ -1238,6 +1245,851 @@ class EveryMediumFailureTakesOnePath(unittest.TestCase):
             entry = json.loads(log.read_text().splitlines()[-1])
         self.assertFalse(entry["medium"]["examined"])
         self.assertIn(self.SYSPATH_LEAK, entry["medium"]["detail"])
+
+
+# ---------------------------------------------------------------------------
+# "Always" under --privsep: the analyzer cannot write trust, the gate can
+# ---------------------------------------------------------------------------
+
+class AlwaysUnderPrivsep(unittest.TestCase):
+    """
+    Under --privsep the analyzer runs as `nobody` and cannot write the
+    root-owned trust store, so "always" was never offered and the service
+    asked about its owner's own mouse on every plug. The gate now writes the
+    entry (REQ_TRUST); the daemon must offer "always" when that path exists,
+    use it, and pick up what the gate wrote.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "trusted.json"
+        self.store = trust.TrustStore(self.path)
+        # The analyzer's view: it can read the store, never write it.
+        patcher = mock.patch.object(self.store, "writable", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = mock.Mock()
+        self.client.trust.side_effect = self._gate_writes
+        previous = sysfs._backend
+        self.addCleanup(sysfs.install_backend, previous)
+        sysfs.install_backend(gate_client.GateBackend(self.client))
+        self.dev = _device()
+
+    def _gate_writes(self, syspath, instance, key, label):
+        """What the root gate does on success: a whole new file on disk."""
+        writer = trust.TrustStore(self.path)
+        writer.devices[key] = trust.TrustedDevice(
+            key=key, identity="0951:1665:A", label=label,
+            descriptor_hash=key.split("#")[1], trusted_at=1.0, last_seen=1.0,
+            times_admitted=1, ports=["3-9"])
+        self.assertIsNone(writer.save(readable=True))
+
+    def _engine(self):
+        return daemon_mod.Probolos(observe=0, inspect_storage=False,
+                                   monitor=session.FixedState(False),
+                                   lock_policy=session.POLICY_IGNORE,
+                                   trust_store=self.store)
+
+    def _add(self, engine, typed="a\n"):
+        """Plug the device in and answer the terminal prompt with `typed`."""
+        out = io.StringIO()
+        with mock.patch.object(daemon_mod.sysfs, "admit_device") as admit, \
+                mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+                mock.patch.object(daemon_mod.analyzers, "run", return_value=[]), \
+                mock.patch.object(engine, "_load_with_retry",
+                                  return_value=self.dev), \
+                mock.patch.object(daemon_mod.report, "render", return_value=""), \
+                mock.patch.object(daemon_mod.report, "one_liner",
+                                  return_value="x"), \
+                mock.patch("sys.stdin", io.StringIO(typed)), \
+                redirect_stdout(out):
+            engine._on_add(str(self.dev.syspath))
+        return out.getvalue(), admit
+
+    # -- whether "always" is offered ------------------------------------
+
+    def test_always_is_offered_when_the_gate_can_keep_it(self):
+        self.assertTrue(self._engine()._can_remember())
+
+    def test_not_offered_without_a_backend_that_can_trust(self):
+        sysfs.install_backend(sysfs._DirectBackend())
+        self.assertFalse(self._engine()._can_remember())
+
+    def test_not_offered_when_the_store_cannot_be_vouched_for(self):
+        """The gate refuses to rewrite such a store, so the answer would be lost."""
+        self.store.load_error = "trust store mode is 0666"
+        self.assertFalse(self._engine()._can_remember())
+
+    def test_not_offered_without_a_trust_store(self):
+        engine = self._engine()
+        engine.trust = None
+        self.assertFalse(engine._can_remember())
+
+    def test_not_offered_when_the_gate_would_have_to_create_the_directory(self):
+        """The gate does not create the store's directory, so "always"
+        clicked then would admit once and keep nothing."""
+        self.store.path = self.path.parent / "absent" / "trusted.json"
+        self.assertFalse(self._engine()._can_remember())
+
+    # -- what "always" does --------------------------------------------
+
+    def test_always_goes_through_the_gate_and_takes_effect(self):
+        engine = self._engine()
+        printed, admit = self._add(engine)
+        self.assertIn("[a]lways", printed)
+        admit.assert_called_once_with(self.dev)
+        self.client.trust.assert_called_once_with(
+            self.dev.syspath, self.dev.instance_id, trust.key_for(self.dev),
+            "K DT")
+        self.assertIn("remembered for future admissions", printed)
+        # Refreshed from the gate's write: the very next plug is not asked.
+        self.assertTrue(self.store.is_trusted(self.dev))
+        self.assertTrue(trust.TrustStore(self.path).is_trusted(self.dev))
+
+    def test_a_gate_refusal_is_reported_and_the_device_stays_admitted(self):
+        self.client.trust.side_effect = gate_client.GateError(
+            "trust failed: denied: device fingerprint does not match")
+        engine = self._engine()
+        printed, admit = self._add(engine)
+        admit.assert_called_once_with(self.dev)
+        self.assertIn("trust could not be saved: trust failed: denied: "
+                      "device fingerprint does not match", printed)
+        self.assertNotIn("remembered for future admissions", printed)
+        self.assertIn(self.dev.name, engine.known)
+        self.assertFalse(self.store.is_trusted(self.dev))
+
+    def test_a_device_with_no_fingerprint_is_not_sent(self):
+        self.dev.raw_descriptors = None
+        printed, _admit = self._add(self._engine())
+        self.client.trust.assert_not_called()
+        self.assertIn("nothing to pin it to", printed)
+
+    def test_a_write_that_cannot_be_read_back_is_not_reported_as_kept(self):
+        self.client.trust.side_effect = None      # "OK", but nothing on disk
+        printed, _admit = self._add(self._engine())
+        self.assertNotIn("remembered for future admissions", printed)
+        self.assertIn("cannot be read back", printed)
+
+    def test_yes_once_does_not_ask_the_gate(self):
+        printed, admit = self._add(self._engine(), typed="y\n")
+        admit.assert_called_once_with(self.dev)
+        self.client.trust.assert_not_called()
+
+    # -- remembered devices ----------------------------------------------
+
+    def test_a_trusted_device_is_admitted_without_a_doomed_save(self):
+        """record_admission + save() failed on every plug under --privsep and
+        printed "could not update trust store" about bookkeeping the gate
+        deliberately does not take."""
+        self._gate_writes(None, None, trust.key_for(self.dev), "K DT")
+        engine = self._engine()
+        with mock.patch.object(self.store, "save",
+                               return_value="Permission denied") as save:
+            printed, admit = self._add(engine, typed="")
+        admit.assert_called_once_with(self.dev)
+        save.assert_not_called()
+        self.assertNotIn("could not update trust store", printed)
+        self.assertIn("TRUSTED", printed)
+
+    # -- what serve() says at startup -------------------------------------
+
+    def _startup(self):
+        out = io.StringIO()
+        with mock.patch.object(daemon_mod, "pyudev", None), \
+                mock.patch.object(trust.TrustStore, "writable",
+                                  return_value=False), \
+                redirect_stdout(out), self.assertRaises(SystemExit):
+            daemon_mod.serve(dry_run=True, trust_path=self.path)
+        return out.getvalue()
+
+    def test_startup_does_not_say_always_is_unavailable_under_the_gate(self):
+        printed = self._startup()
+        self.assertNotIn("is not offered", printed)
+        self.assertIn("saved by the privileged gate", printed)
+
+    def test_startup_still_says_so_when_nothing_can_keep_it(self):
+        sysfs.install_backend(sysfs._DirectBackend())
+        self.assertIn("\"always\" is not offered", self._startup())
+
+
+# ---------------------------------------------------------------------------
+# Nobody to ask: the service before login, an agent that leaves, a dialog
+# nobody answers
+# ---------------------------------------------------------------------------
+
+class _FakeAgentLink:
+    """
+    Stands in for agentlink.AgentLink: an agent that is there or is not, and
+    answers each question from a script. A scripted answer may be a callable,
+    run at the moment the question is put -- to leave mid-question, or to let
+    a fake clock run on.
+    """
+
+    def __init__(self, live=False, answers=()):
+        self.live = live
+        self.answers = list(answers)
+        self.asked = []
+        self.notices = []
+
+    def is_live(self):
+        return self.live
+
+    @property
+    def connected(self):
+        return self.live
+
+    def ask(self, **question):
+        self.asked.append(question)
+        answer = self.answers.pop(0) if self.answers else None
+        return answer(self) if callable(answer) else answer
+
+    def notify(self, title, body):
+        self.notices.append((title, body))
+
+
+def _leaves(link):
+    """A scripted answer: the agent's session ends mid-question."""
+    link.live = False
+    return None
+
+
+class _ScriptedMonitor:
+    """Stands in for pyudev.Monitor: no events, one step per poll, then stop."""
+
+    def __init__(self, steps, stop_event):
+        self._steps = list(steps)
+        self._stop = stop_event
+
+    def filter_by(self, **_kw):
+        pass
+
+    def start(self):
+        pass
+
+    def poll(self, timeout=None):
+        if self._steps:
+            self._steps.pop(0)()
+        else:
+            self._stop.set()
+        return None
+
+
+class _NobodyToAskCase(unittest.TestCase):
+    """
+    The service before anyone has logged in: an agent socket is configured,
+    no agent is connected, and stdin is /dev/null. The device sits on a real
+    directory, so the held queue's instance check compares a real inode.
+    """
+
+    terminal = False
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.ledger = ledger_mod.Ledger(self.root / "ledger.json")
+        self.link = _FakeAgentLink(live=False)
+        self.writes = []
+        self.admit = mock.Mock()
+        # /dev/null, as under systemd. Only a terminal prompt touches it.
+        self.stdin = ServiceStdin()
+        self.addCleanup(self.stdin.release)
+        self.out = io.StringIO()
+        self.dev = make_device("3-9")
+        self.dev.syspath = self.root / "3-9"
+        self.dev.syspath.mkdir()
+        st = self.dev.syspath.stat()
+        self.dev.instance_id = (st.st_dev, st.st_ino)
+
+    def engine(self, **options):
+        settings = dict(observe=0, inspect_storage=False, ledger=self.ledger,
+                        agent=self.link, monitor=session.AlwaysUnlocked())
+        settings.update(options)
+        return daemon_mod.Probolos(**settings)
+
+    @contextlib.contextmanager
+    def patched(self, engine):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                daemon_mod.sysfs, "set_authorized",
+                side_effect=lambda _path, value: self.writes.append(value)))
+            stack.enter_context(mock.patch.object(
+                daemon_mod.sysfs, "admit_device", self.admit))
+            stack.enter_context(mock.patch.object(
+                engine, "_load_with_retry", return_value=self.dev))
+            stack.enter_context(mock.patch.object(
+                engine, "_has_terminal", return_value=self.terminal))
+            stack.enter_context(mock.patch.object(
+                daemon_mod.report, "render", return_value=""))
+            stack.enter_context(mock.patch("sys.stdin", self.stdin))
+            stack.enter_context(redirect_stdout(self.out))
+            yield
+
+    def plug(self, engine):
+        with self.patched(engine):
+            engine._on_add(str(self.dev.syspath))
+
+    def run_loop(self, engine, *steps):
+        """engine.run() over a monitor that delivers no events."""
+        stop = threading.Event()
+        engine.stop_event = stop
+        fake_pyudev = mock.Mock()
+        fake_pyudev.Monitor.from_netlink.return_value = _ScriptedMonitor(
+            steps, stop)
+        with self.patched(engine), \
+                mock.patch.object(daemon_mod, "pyudev", fake_pyudev):
+            engine.run()
+
+    def decisions(self):
+        entry = self.ledger.lookup(self.dev)
+        return entry.decisions if entry is not None else []
+
+    def held(self):
+        """The queue entry a held self.dev must have: path AND instance."""
+        return {"3-9": (self.dev.syspath, self.dev.instance_id)}
+
+
+class NobodyToAskHoldsTheDevice(_NobodyToAskCase):
+    """
+    Before login there is no agent, and the service's stdin is /dev/null, so
+    the terminal "fallback" read EOF and denied every device on the spot. A
+    keyboard plugged in at the login screen was dead by the time anyone could
+    be asked, and getting the question meant unplugging and replugging it.
+    """
+
+    def _held_before_stages_3_and_4(self, kinds):
+        self.dev.kinds = kinds
+        engine = self.engine(observe=3.0, inspect_storage=True)
+        with mock.patch.object(engine, "_quarantine") as quarantine_fn, \
+                mock.patch.object(engine, "_inspect_medium") as inspect_fn:
+            self.plug(engine)
+        quarantine_fn.assert_not_called()
+        inspect_fn.assert_not_called()
+        self.assertNotIn(1, self.writes, "switched on with nobody to ask")
+        self.admit.assert_not_called()
+        self.assertEqual(engine.pending, self.held())
+        self.assertEqual(self.decisions(), ["held: no desktop agent"])
+        self.assertEqual(self.link.asked, [])
+        self.assertEqual(self.stdin.touches, [], "the terminal was read")
+        printed = self.out.getvalue()
+        self.assertIn("NO DESKTOP AGENT — holding", printed)
+        self.assertIn("You will be asked when the agent connects", printed)
+
+    def test_an_input_device_is_held_before_quarantine(self):
+        self._held_before_stages_3_and_4([usbclass.KIND_INPUT])
+
+    def test_a_storage_device_is_held_before_its_medium_is_read(self):
+        self._held_before_stages_3_and_4([usbclass.KIND_STORAGE])
+
+    def test_a_remembered_keyboard_at_the_login_screen_is_still_admitted(self):
+        store = mock.Mock(**{"is_trusted.return_value": True,
+                             "writable.return_value": False})
+        engine = self.engine(trust_store=store)
+        self.plug(engine)
+        self.admit.assert_called_once_with(self.dev)
+        self.assertEqual(engine.pending, {})
+        self.assertEqual(self.decisions(), ["trusted"])
+
+    def test_an_allowlisted_port_is_still_admitted_without_a_question(self):
+        engine = self.engine(policy=safety.SafetyPolicy(allowed_ports=["3-9"]))
+        self.plug(engine)
+        self.admit.assert_called_once_with(self.dev)
+        self.assertEqual(engine.pending, {})
+
+    def test_with_a_terminal_the_terminal_is_asked_as_before(self):
+        self.terminal = True
+        self.stdin = io.StringIO("y\n")
+        engine = self.engine()
+        self.plug(engine)
+        self.admit.assert_called_once_with(self.dev)
+        self.assertEqual(engine.pending, {})
+        self.assertEqual(self.decisions(), ["user approved"])
+
+    def test_with_no_agent_configured_nothing_changes(self):
+        """No --agent: the operator chose to answer in a terminal."""
+        self.stdin = io.StringIO("")
+        engine = self.engine(agent=None)
+        self.plug(engine)
+        self.assertEqual(engine.pending, {})
+        self.assertEqual(self.decisions(), ["no answer"])
+
+    def test_dry_run_holds_nothing(self):
+        engine = self.engine(dry_run=True)
+        self.plug(engine)
+        self.assertEqual(engine.pending, {})
+        self.assertEqual(self.writes, [])
+        self.assertIn("[dry-run]", self.out.getvalue())
+
+    def test_startup_holds_stranded_devices_instead_of_denying_them(self):
+        """Left blocked by an earlier run, found at boot: no agent yet."""
+        self.dev.authorized = 0
+        engine = self.engine()
+        with mock.patch.object(daemon_mod.sysfs, "list_devices",
+                               return_value=[self.dev]), \
+                redirect_stdout(self.out):
+            engine.snapshot()
+        self.run_loop(engine)
+        self.assertEqual(engine.pending, self.held())
+        # Left queued as found, not re-read and held again: nothing new to
+        # record until somebody can be asked.
+        self.assertEqual(self.decisions(), [])
+        self.assertIn("stay blocked until the desktop agent connects",
+                      self.out.getvalue())
+        self.assertEqual(self.stdin.touches, [])
+        self.admit.assert_not_called()
+
+
+class HeldDevicesAreAskedWhenTheAgentConnects(_NobodyToAskCase):
+
+    def test_the_next_pass_after_the_agent_connects_asks(self):
+        engine = self.engine()
+        self.plug(engine)
+        self.link.answers = [agentlink.ANSWER_YES]
+
+        def agent_connects():
+            self.assertEqual(self.link.asked, [],
+                             "asked before anyone could answer")
+            self.link.live = True
+
+        self.run_loop(engine, agent_connects)
+
+        self.assertEqual(len(self.link.asked), 1)
+        self.admit.assert_called_once_with(self.dev)
+        self.assertIn("3-9", engine.known)
+        self.assertEqual(engine.pending, {})
+        # Held once -- the startup drain, with nobody there yet, leaves the
+        # queue alone rather than holding it again -- then approved. A hold
+        # is not a refusal: the question is the ordinary one, not the
+        # countdown "you have refused this device before" gets.
+        self.assertEqual(self.decisions(), ["held: no desktop agent",
+                                            "user approved"])
+        self.assertNotEqual(self.link.asked[0]["steps"],
+                            agentlink.STEPS_COUNTDOWN)
+        self.assertIn("[▶] Desktop agent connected — asking about 1 held "
+                      "device(s) now.", self.out.getvalue())
+
+    def test_not_asked_while_the_screen_is_locked(self):
+        monitor = session.FixedState(False)
+        engine = self.engine(monitor=monitor,
+                             lock_policy=session.POLICY_QUEUE)
+        self.plug(engine)                   # held: no agent, screen unlocked
+        monitor._locked = True              # the screen locks...
+        self.link.live = True               # ...and the agent connects
+        seen = []
+        self.link.answers = [lambda _link: seen.append(monitor.is_locked())
+                             or agentlink.ANSWER_YES]
+
+        def still_locked():
+            self.assertEqual(self.link.asked, [])
+
+        def unlock():
+            still_locked()
+            monitor._locked = False
+
+        self.run_loop(engine, still_locked, still_locked, unlock)
+        self.assertEqual(seen, [False], "asked only once unlocked")
+        self.admit.assert_called_once_with(self.dev)
+        self.assertIn("[▶] Screen unlocked", self.out.getvalue())
+
+    def test_under_the_deny_policy_it_waits_for_the_unlock_too(self):
+        """
+        Drained while locked, it would be denied as "screen locked": a device
+        that did not arrive behind a locked screen and that nobody was ever
+        asked about.
+        """
+        monitor = session.FixedState(False)
+        engine = self.engine(monitor=monitor, lock_policy=session.POLICY_DENY)
+        self.plug(engine)
+        monitor._locked = True
+        self.link.live = True
+        self.link.answers = [agentlink.ANSWER_YES]
+
+        def unlock():
+            self.assertEqual(self.link.asked, [])
+            self.assertEqual(engine.pending, self.held())
+            monitor._locked = False
+
+        self.run_loop(engine, lambda: None, unlock)
+        self.assertNotIn("denied: screen locked", self.decisions())
+        self.admit.assert_called_once_with(self.dev)
+
+    def test_a_recycled_port_is_not_asked_about_under_the_old_entry(self):
+        engine = self.engine()
+        self.plug(engine)
+        self.link.answers = [agentlink.ANSWER_YES]
+
+        def swap_then_connect():
+            # The held device is pulled and something else is plugged into
+            # the same port: the same name, a different kernel directory.
+            fresh = self.root / "3-9.new"
+            fresh.mkdir()
+            self.dev.syspath.rmdir()
+            fresh.rename(self.dev.syspath)
+            self.link.live = True
+
+        self.run_loop(engine, swap_then_connect)
+        self.assertEqual(self.link.asked, [])
+        self.admit.assert_not_called()
+        self.assertEqual(engine.pending, {})
+        self.assertIn("DIFFERENT device", self.out.getvalue())
+
+    def test_an_agent_that_leaves_again_does_not_make_the_loop_spin(self):
+        engine = self.engine()
+        self.plug(engine)
+        self.link.answers = [_leaves]
+        asked_by_then = []
+
+        def agent_connects():
+            self.link.live = True
+
+        def gone_again():
+            asked_by_then.append(len(self.link.asked))
+
+        self.run_loop(engine, agent_connects, gone_again, gone_again,
+                      gone_again)
+        self.assertEqual(asked_by_then, [1, 1, 1], "asked once, not per pass")
+        self.assertEqual(self.out.getvalue().count("[▶]"), 1,
+                         "only the agent's arrival drains: the startup "
+                         "drain has nobody to ask")
+        self.assertEqual(engine.pending, self.held())
+        self.assertNotIn("no answer", self.decisions())
+        self.admit.assert_not_called()
+
+    def test_held_again_during_a_drain_waits_for_the_next_one(self):
+        engine = self.engine()
+        engine.pending.update(self.held())
+        self.link.live = True
+        calls = []
+
+        def held_again(path, was_held=False):
+            calls.append(path)
+            engine._hold(self.dev, "held: no desktop agent")
+
+        with self.patched(engine), \
+                mock.patch.object(engine, "_on_add", side_effect=held_again):
+            engine._drain_pending("Desktop agent connected")
+        self.assertEqual(calls, [str(self.dev.syspath)])
+        self.assertEqual(engine.pending, self.held())
+
+
+class HoldingDoesNotWearDownTheLedger(_NobodyToAskCase):
+    """
+    The ledger keeps a device's last MAX_DECISIONS, and previously-rejected
+    looks for "user rejected" among them. Putting a held device back through
+    _on_add at every drain -- each unlock, each restart -- and recording it
+    as held each time would let enough unlocks with no agent push a real
+    refusal out of the history, and the countdown with it, without anyone
+    deciding anything.
+    """
+
+    def drain(self, engine, cause="Screen unlocked"):
+        with self.patched(engine):
+            engine._drain_pending(cause)
+
+    def test_drains_with_nobody_to_ask_record_nothing(self):
+        self.ledger.record(self.dev, "user rejected")
+        engine = self.engine()
+        self.plug(engine)
+        for _ in range(ledger_mod.MAX_DECISIONS + 5):
+            self.drain(engine)
+        self.assertEqual(self.decisions(),
+                         ["user rejected", "held: no desktop agent"])
+        self.assertEqual(engine.pending, self.held())
+        self.link.live = True
+        self.drain(engine, "Desktop agent connected")
+        question = self.link.asked[0]
+        self.assertEqual(question["steps"], agentlink.STEPS_COUNTDOWN)
+        self.assertEqual(question["countdown"], daemon_mod.CRITICAL_COUNTDOWN)
+        self.assertFalse(question["allow_always"])
+
+    def test_held_again_for_the_same_reason_is_recorded_once(self):
+        engine = self.engine()
+        self.plug(engine)
+        self.link.live = True
+        self.link.answers = [_leaves]
+        self.drain(engine, "Desktop agent connected")
+        self.assertEqual(engine.pending, self.held())
+        self.assertEqual(self.decisions(), ["held: no desktop agent"])
+
+    def test_an_agent_that_keeps_leaving_does_not_switch_it_on_forever(self):
+        """An agent that crashes on the question and is restarted by systemd
+        would otherwise inspect -- switch on -- the same device every few
+        seconds for as long as the crash lasts."""
+        engine = self.engine()
+        self.plug(engine)
+        for _ in range(daemon_mod.Probolos.MAX_UNSEEN_ASKS + 2):
+            self.link.live = True
+            self.link.answers = [_leaves]
+            self.drain(engine, "Desktop agent connected")
+        self.assertEqual(len(self.link.asked),
+                         daemon_mod.Probolos.MAX_UNSEEN_ASKS)
+        self.assertEqual(engine.pending, {})
+        self.assertEqual(self.decisions(),
+                         ["held: no desktop agent", "no answer"])
+        self.assertNotIn("user rejected", self.decisions())
+        self.admit.assert_not_called()
+        self.assertIn("no longer held", self.out.getvalue())
+
+    def test_a_replug_starts_the_count_again(self):
+        engine = self.engine()
+        self.plug(engine)
+        engine._unseen_asks["3-9"] = (self.dev.instance_id, 2)
+        with redirect_stdout(self.out):
+            engine._on_remove(str(self.dev.syspath))
+        self.assertNotIn("3-9", engine._unseen_asks)
+        self.assertNotIn("3-9", engine._last_recorded)
+
+
+class ADuplicateAddForAHeldDevice(_NobodyToAskCase):
+    """
+    udev replays 'add' for devices already present -- `udevadm trigger`, a
+    settle, a rescan. For a device sitting in the held queue that replay was
+    gated as a new arrival: asked now and again at the drain, or, held behind
+    a locked screen and replayed after the unlock, admitted on trust without
+    the question a device that turned up while nobody was there must get.
+    """
+
+    def test_it_is_not_asked_twice(self):
+        engine = self.engine()
+        self.plug(engine)                   # held: no agent yet
+        self.link.live = True
+        self.plug(engine)                   # the replay
+        self.assertEqual(self.link.asked, [])
+        self.assertEqual(engine.pending, self.held())
+        self.assertEqual(self.decisions(), ["held: no desktop agent"])
+        self.assertIn("already held", self.out.getvalue())
+
+    def test_held_behind_the_lock_it_is_not_admitted_on_trust(self):
+        monitor = session.FixedState(True)
+        store = mock.Mock(**{"is_trusted.return_value": True,
+                             "writable.return_value": True})
+        self.link.live = True
+        self.link.answers = [agentlink.ANSWER_YES]
+        engine = self.engine(monitor=monitor, trust_store=store,
+                             lock_policy=session.POLICY_QUEUE)
+        self.plug(engine)                   # held: screen locked
+        monitor._locked = False
+        self.plug(engine)                   # replayed before the drain
+        self.admit.assert_not_called()
+        self.assertNotIn("trusted", self.decisions())
+        with self.patched(engine):
+            engine._drain_pending("Screen unlocked")
+        self.assertEqual(len(self.link.asked), 1, "asked, not waved through")
+        self.assertEqual(self.decisions()[-1], "user approved")
+
+    def test_a_different_device_at_the_port_is_gated_as_new(self):
+        """The held one left and its 'remove' was lost: the entry is stale."""
+        engine = self.engine()
+        self.plug(engine)
+        # A new kernel directory under the same name. Made before the old one
+        # goes, so it cannot simply be handed the freed inode number.
+        fresh = self.root / "3-9.new"
+        fresh.mkdir()
+        self.dev.syspath.rmdir()
+        fresh.rename(self.dev.syspath)
+        st = self.dev.syspath.stat()
+        self.dev.instance_id = (st.st_dev, st.st_ino)
+        self.link.live = True
+        self.link.answers = [agentlink.ANSWER_YES]
+        self.plug(engine)
+        self.assertEqual(len(self.link.asked), 1)
+        self.admit.assert_called_once_with(self.dev)
+        self.assertEqual(engine.pending, {})
+
+
+class AnUnansweredQuestionIsNotADeadEnd(_NobodyToAskCase):
+    """
+    The agent is there, the dialog was on screen, and nobody answered it. The
+    terminal fallback that followed was the same denial in disguise (stdin is
+    /dev/null), and the device was simply dead with nobody told why.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.link.live = True
+
+    def test_denied_as_no_answer_and_the_agent_is_told(self):
+        engine = self.engine()
+        self.plug(engine)
+        self.assertEqual(len(self.link.asked), 1)
+        self.assertEqual(self.decisions(), ["no answer"])
+        title = daemon_mod.Probolos._agent_title(self.dev)
+        self.assertEqual(self.link.notices, [(
+            "USB device still blocked",
+            f"{title}\nNobody answered in time. Unplug it and plug it in "
+            f"again to be asked.")])
+        # Not re-queued: that would re-ask, forever, a person not there.
+        self.assertEqual(engine.pending, {})
+        self.assertEqual(self.writes, [0])
+        self.admit.assert_not_called()
+        self.assertEqual(self.stdin.touches, [], "the terminal was read")
+        self.assertIn("DENIED, NOT ANSWERED", self.out.getvalue())
+        self.assertNotIn("REJECTED", self.out.getvalue())
+
+    def test_the_replug_is_not_treated_as_a_refused_device(self):
+        """
+        Recorded as "user rejected", the unanswered question would turn the
+        replug the notice asks for into the CRITICAL countdown, warning about
+        a refusal nobody made.
+        """
+        engine = self.engine()
+        self.plug(engine)
+        self.link.answers = [agentlink.ANSWER_YES]
+        self.plug(engine)                   # replugged, as the notice says
+        replug = self.link.asked[1]
+        self.assertNotEqual(replug["steps"], agentlink.STEPS_COUNTDOWN)
+        self.assertEqual(replug["countdown"], 0)
+        self.assertNotIn("user rejected", self.decisions())
+        self.admit.assert_called_once_with(self.dev)
+
+    def test_an_agent_gone_mid_question_means_held_not_denied(self):
+        self.link.answers = [_leaves]
+        engine = self.engine()
+        self.plug(engine)
+        self.assertEqual(engine.pending, self.held())
+        self.assertEqual(self.decisions(), ["held: no desktop agent"])
+        self.assertEqual(self.link.notices, [])
+        self.assertNotIn(1, self.writes)
+        self.admit.assert_not_called()
+        self.assertEqual(self.stdin.touches, [])
+
+    def test_an_agent_gone_during_inspection_means_held_not_asked(self):
+        """Stage 4 can take seconds, and the agent can leave in them."""
+        engine = self.engine(inspect_storage=True)
+
+        def agent_leaves(_dev):
+            self.link.live = False
+            return None
+
+        with mock.patch.object(engine, "_inspect_medium",
+                               side_effect=agent_leaves):
+            self.plug(engine)
+        self.assertEqual(self.link.asked, [])
+        self.assertEqual(engine.pending, self.held())
+        self.assertEqual(self.decisions(), ["held: no desktop agent"])
+        self.assertEqual(self.stdin.touches, [])
+
+    def test_with_a_terminal_the_old_fallback_is_unchanged(self):
+        self.terminal = True
+        self.stdin = io.StringIO("y\n")
+        engine = self.engine()
+        self.plug(engine)
+        self.assertIn("(no answer from the desktop agent; asking here)",
+                      self.out.getvalue())
+        self.admit.assert_called_once_with(self.dev)
+        self.assertEqual(self.link.notices, [])
+        self.assertEqual(self.decisions(), ["user approved"])
+
+
+class ACriticalDeviceWithNoAgent(_NobodyToAskCase):
+    """
+    The hold does not depend on what the identity stage found, and it comes
+    before quarantine, so behaviour is observed once someone is there to see
+    it. Drained, a CRITICAL device gets the countdown the daemon enforces
+    itself, and never "always".
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.dev.kinds = [usbclass.KIND_INPUT]
+        # Refused once before, so previously-rejected makes it CRITICAL.
+        self.ledger.record(self.dev, "user rejected")
+        self.store = mock.Mock(**{"is_trusted.return_value": False,
+                                  "writable.return_value": True})
+        self.now = 1000.0
+
+    def engine(self, **options):
+        options.setdefault("observe", 3.0)
+        options.setdefault("trust_store", self.store)
+        return super().engine(**options)
+
+    def after(self, seconds, answer):
+        """A scripted answer that arrives `seconds` after the question."""
+        def scripted(_link):
+            self.now += seconds
+            return answer
+        return scripted
+
+    def hold_then_drain(self, answer):
+        engine = self.engine()
+        order = []
+        observation = quarantine.Observation(
+            duration=3.0, error="no input nodes appeared; nothing to observe")
+
+        def observe(_dev):
+            order.append("quarantine")
+            return observation
+
+        def answered(link):
+            order.append("asked")
+            return answer(link)
+
+        with mock.patch.object(engine, "_quarantine",
+                               side_effect=observe) as quarantine_fn:
+            self.plug(engine)
+            self.assertEqual(quarantine_fn.call_count, 0,
+                             "switched on with nobody to ask")
+            self.link.live = True
+            self.link.answers = [answered]
+            with self.patched(engine), \
+                    mock.patch.object(daemon_mod.time, "monotonic",
+                                      lambda: self.now), \
+                    mock.patch.object(daemon_mod.report, "render_behaviour",
+                                      return_value=""):
+                engine._drain_pending("Desktop agent connected")
+        return engine, order
+
+    def test_held_before_quarantine_like_any_other_device(self):
+        engine = self.engine()
+        with mock.patch.object(engine, "_quarantine") as quarantine_fn:
+            self.plug(engine)
+        quarantine_fn.assert_not_called()
+        self.assertEqual(engine.pending, self.held())
+        self.assertEqual(self.decisions(),
+                         ["user rejected", "held: no desktop agent"])
+        self.assertIn("CRITICAL", self.out.getvalue())
+        self.assertEqual(self.link.asked, [])
+
+    def test_drained_it_gets_the_countdown_and_never_always(self):
+        engine, order = self.hold_then_drain(
+            self.after(12.0, agentlink.ANSWER_ALWAYS))
+        question = self.link.asked[0]
+        self.assertEqual(question["steps"], agentlink.STEPS_COUNTDOWN)
+        self.assertEqual(question["countdown"], daemon_mod.CRITICAL_COUNTDOWN)
+        self.assertTrue(engine._can_remember(), "'always' could be kept...")
+        self.assertFalse(question["allow_always"], "...and is not offered")
+        self.assertEqual(order, ["quarantine", "asked"])
+        self.admit.assert_called_once_with(self.dev)
+        self.store.trust.assert_not_called()
+        self.assertEqual(self.decisions()[-1], "user approved")
+
+    def test_an_approval_inside_the_countdown_is_still_refused(self):
+        engine, _order = self.hold_then_drain(
+            self.after(3.0, agentlink.ANSWER_YES))
+        self.admit.assert_not_called()
+        self.assertEqual(self.decisions()[-1], "no answer")
+        self.assertEqual(len(self.link.notices), 1)
+        self.assertEqual(engine.pending, {})
+
+
+class TerminalDetection(unittest.TestCase):
+    """What counts as a terminal somebody could answer on."""
+
+    def test_what_is_not_a_terminal_is_none(self):
+        with open(os.devnull) as devnull:
+            for stdin in (devnull, io.StringIO("y\n"), None):
+                with self.subTest(stdin=stdin), mock.patch("sys.stdin", stdin):
+                    self.assertFalse(daemon_mod.Probolos._has_terminal())
+
+    def test_a_pseudo_terminal_is_one(self):
+        try:
+            master, slave = pty.openpty()
+        except OSError as exc:
+            self.skipTest(f"no pseudo-terminal: {exc}")
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        with os.fdopen(os.dup(slave)) as tty, mock.patch("sys.stdin", tty):
+            self.assertTrue(daemon_mod.Probolos._has_terminal())
 
 
 if __name__ == "__main__":
