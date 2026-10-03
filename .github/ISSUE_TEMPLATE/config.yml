@@ -1,0 +1,8 @@
+# Security reports go through GitHub's private vulnerability reporting, never
+# a public issue. This link sits next to the bug report in the "New issue"
+# chooser.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/capitan0n/probolos/security/advisories/new
+    about: Privately, so it can be fixed before it is public. See SECURITY.md.

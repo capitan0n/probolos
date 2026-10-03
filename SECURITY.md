@@ -2,8 +2,16 @@
 
 ## Reporting
 
-Open a GitHub issue for anything that is already public. For anything else,
-contact the maintainer directly before disclosing.
+Report a vulnerability privately, through GitHub's private vulnerability
+reporting:
+<https://github.com/capitan0n/probolos/security/advisories/new>. Please do not
+open a public issue for it. Anything that is already public can go in an
+ordinary issue.
+
+A report is most useful with the distribution and kernel, `probolos --version`,
+whether `--privsep` was on, and the device or input that triggered it. Fixes
+go through a private advisory first and are published with the release that
+carries them.
 
 ## Scope of this document
 

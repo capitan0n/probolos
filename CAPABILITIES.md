@@ -1,5 +1,11 @@
 # Capabilities and scope
 
+> **Feature freeze.** §1 below, as of the `v0.11.0` tag, is the feature
+> contract for 1.0.0. Until 1.0.0 nothing new goes in: every change is a fix,
+> a security fix, testing, documentation or release work (`ROADMAP.md`). A
+> change that makes documented behaviour true is a fix; one that adds
+> behaviour goes on the post-1.0 list (§3.0).
+
 This document is the authoritative answer to "what does Probolos actually do?".
 It exists because a security tool that is vague about its own boundary is worse
 than one with a narrow but honest one: a user who overestimates the tool makes
@@ -31,6 +37,16 @@ Status: **alpha**. Validated largely under software emulation
 The prompt is served on an already-trusted terminal or an already-authenticated
 agent socket. A device that has just been plugged in is still unauthorized, so
 it cannot press its own "yes". This is the core invariant.
+
+The desktop agent asks with as much friction as the device earns
+(`daemon._prompt_steps`): **one dialog** for a device that can neither type
+nor carry traffic and showed nothing suspicious; **two** (a second "switch it
+on?") for keyboards/HID, network, radio, vendor-specific or unknown functions,
+or any warning; and for a CRITICAL finding the **countdown**: "Allow anyway"
+stays disabled for 10 s, "always" is never offered, and the daemon itself
+refuses an approval that arrives sooner. A dialog that closes without a
+button (killed, timed out, no display) is no decision, never a refusal. On a
+terminal a CRITICAL device needs the typed word `authorize`.
 
 ### 1.2 Stage 1 — Identity
 
@@ -155,6 +171,14 @@ Screen-lock handling (`session.py`): devices arriving while the session is
 locked are queued or denied per `--lock-policy`, and a queued device is re-asked
 on unlock. Deferral never becomes silent approval.
 
+With no one to ask at all -- the service has no terminal, and no desktop agent
+is connected (login screen, logout, agent restart) -- a device is **held**
+blocked before stages 3 and 4, and asked about when an agent connects. A
+replayed udev "add" for a held device is ignored. A device whose question was
+lost to a departing agent three times is refused as unanswered. A question
+that was shown and not answered is recorded as "no answer", not re-queued,
+and the agent shows a display-only "still blocked, replug it" notice.
+
 ### 1.8 Privilege separation (`--privsep`)
 
 A minimal root gate (`gate_server.py`) performs the only privileged operations —
@@ -169,6 +193,12 @@ state or an unexpired temporary permission for the same device instance. Final
 admission gives no continued read/deauthorization permission. Whole-device
 requests cannot target interfaces. See `SECURITY.md` for the limits of this
 boundary; the analyzer still controls admission policy.
+
+"Always" under `--privsep` is written by the gate (`REQ_TRUST`), never by the
+analyzer: only for a device the gate admitted on this connection, within
+60 s, once, and only under the fingerprint the gate took itself before first
+switching the device on. The trust file's path comes from the root side's
+command line.
 
 ### 1.9 Lockout safety
 
@@ -297,12 +327,26 @@ store — have been fixed; see §1.12.
   their length. Reaching the report descriptor itself requires the device to be
   authorized and `usbhid` bound, i.e. the quarantine stage. Not yet wired to
   anything; see §3.2.
-- **Deferred binding remains experimental.** It does not guarantee a zero
-  exposure window. The systemd unit needs live integration testing too.
+- **Deferred binding remains experimental** (`--close-race-window`). It does
+  not guarantee a zero exposure window, it is not available under
+  `--privsep`, and it is outside the 1.0 guarantees (§3.0).
 
 ---
 
 ## 3. What may be built
+
+### 3.0 Deferred past 1.0
+
+Decided at the feature freeze (`v0.11.0`), so the absence reads as a decision.
+None of these is in 1.0.0; each is a post-1.0 candidate.
+
+| Deferred | Note |
+|---|---|
+| A GUI for history and trust | `--history`, `--trusted` and `--remove-*` stay command-line |
+| `--remove-history N\|PATTERN`, numbered `--history` | |
+| A configurable dialog timeout | 60 s stays the default |
+| HID report-descriptor analysis | §3.2 |
+| `--close-race-window` (deferred binding) | Stays in the tree, **experimental, outside the 1.0 guarantees** (§2.2) |
 
 ### 3.1 Validate the existing scope before adding features
 

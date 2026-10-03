@@ -1,0 +1,77 @@
+name: Bug report
+description: Probolos did something it should not have, or did not do something it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **A security problem?** Do not file it here: use
+        [private vulnerability reporting](https://github.com/capitan0n/probolos/security/advisories/new)
+        instead (see SECURITY.md).
+
+        Device strings, serial numbers and the journal can identify your
+        hardware. Redact what you would rather not publish.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: device
+    attributes:
+      label: The device
+      description: What was plugged in (kind, make/model, VID:PID if you know it), and through what (port, hub, dock).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: probolos --version
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      placeholder: e.g. Manjaro 26.0, Arch, Debian 13
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel (uname -r)
+    validations:
+      required: true
+  - type: input
+    id: desktop
+    attributes:
+      label: Desktop and session
+      description: Desktop, Wayland or X11, and which dialog the agent used (kdialog, zenity, tkinter, terminal only).
+      placeholder: e.g. KDE Plasma 6, Wayland, kdialog
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: How it was running
+      options:
+        - systemd service (install.sh)
+        - by hand, with --privsep
+        - by hand, without --privsep
+    validations:
+      required: true
+  - type: textarea
+    id: journal
+    attributes:
+      label: journalctl -u probolos
+      description: The service's log around the event, e.g. `journalctl -u probolos --since "10 min ago"`. For the agent, `journalctl --user -u probolos-agent`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: The audit log line for the decision, a screenshot of the prompt, whether it reproduces.

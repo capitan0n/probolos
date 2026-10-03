@@ -2,6 +2,105 @@
 
 All notable changes to Probolos. Versioning is semantic.
 
+## [0.11.0] — 2026-10-03 · feature freeze
+
+The feature-complete snapshot: what 1.0 will ship, and what the thesis
+describes. From here to 1.0.0 only fixes, tests, documentation and release
+work go in (`ROADMAP.md`).
+
+### The freeze
+
+- **`CAPABILITIES.md` §1 is the 1.0 feature contract.** It opens with the
+  freeze note, and §3.0 lists what is deferred past 1.0: a GUI for history
+  and trust, `--remove-history`, a configurable dialog timeout, HID
+  report-descriptor analysis, and `--close-race-window`, which stays in the
+  tree as experimental and outside the 1.0 guarantees. §1 now also states
+  what this release added without describing it there: the three prompt
+  levels, the hold when nobody can be asked, and the gate-side "always".
+- **`ROADMAP.md`**: the plan from here to 1.0.0.
+- **Reporting.** `SECURITY.md` points to GitHub's private vulnerability
+  reporting. Issue templates: a bug report form asking for the distribution,
+  kernel, `probolos --version`, desktop and `journalctl -u probolos`; security
+  reports are routed to private reporting; blank issues are off.
+
+### Added
+
+- **"Always allow" under `--privsep`, written by the gate.** The analyzer runs
+  as `nobody` and cannot write the root-owned trust store, so "always" was
+  never offered under the service. The root gate now writes the entry itself
+  (`REQ_TRUST`), and only for a device it admitted on this connection, within
+  60 s, once, under a fingerprint it took itself from the device's
+  descriptors before it first switched it on. The analyzer's key must equal
+  the gate's exactly; the label is the only value taken from the request, and
+  the gate cleans it. The trust file's path comes from the root side's
+  command line, never from the socket. A compromised analyzer gains
+  persistence for devices it could already admit, and nothing else.
+- **Devices are held, not refused, when nobody can be asked.** Under the
+  service (stdin is `/dev/null`) a device plugged in with no desktop agent
+  connected -- at the login screen, after a logout, while the agent restarts
+  -- used to be "asked" on a terminal that reads EOF, and denied. It is now
+  held blocked, before stages 3 and 4 switch it on, and asked about when an
+  agent connects. A remembered device is still admitted on trust. An agent
+  that leaves mid-question holds the device again; on the third lost question
+  for the same device instance it is refused as unanswered instead, so an
+  agent that crashes on the question cannot have the same unknown hardware
+  switched on for inspection again and again.
+- **"Still blocked" notices.** A question the agent showed but nobody
+  answered is recorded as "no answer" (never as a refusal, so the replug does
+  not get the previously-rejected countdown), the device is not re-queued,
+  and the agent shows a display-only notice: "Unplug it and plug it in again
+  to be asked." With no notification server, a one-button window, one at a
+  time and off the agent's receive loop; tkinter-only desktops got a
+  `notice()` they lacked.
+- **CI.** Workflows for the suite as root, ShellCheck on every tracked shell
+  script, the systemd units (they parse, and the service's sandboxing has not
+  weakened), actionlint and zizmor on the workflows, the suite on Arch Linux,
+  and coverage. Every action is
+  pinned to a commit; Dependabot proposes updates.
+- **QA tooling.** ruff with flake8-bugbear (`B`) and flake8-bandit (`S`) on
+  top of the defaults, each exception justified in `pyproject.toml`;
+  Hypothesis property tests (`tests/test_properties.py`) over the parsers,
+  the protocol, `textsafe`, the state files and the agent's message loop, with
+  `ci` and `deep` profiles; branch coverage that follows forked children, with
+  a floor on the privilege boundary (`coverage.yml`); exact tool versions in
+  `.github/requirements-ci.txt`.
+
+### Fixed
+
+- **A dialog that died is no decision.** kdialog killed by a signal (Qt
+  aborts when the display goes away, as at logout) or failing on its own
+  (254/255), and zenity's error exit, used to read as "Keep blocked": the
+  device was recorded as "user rejected" and the next plug got the
+  previously-rejected countdown for a refusal nobody made. Only the buttons
+  are answers now; anything else is no decision, like a timeout.
+- **A replayed "add" for a held device is ignored.** udev replays `add`
+  (`udevadm trigger`, a settle, a rescan) for queued devices too. Gating the
+  replay asked about the device now and again at the drain, and for one held
+  behind a locked screen skipped the forced question after unlock -- a
+  remembered device would have been admitted on trust. Only a different
+  device instance at the port replaces the queue entry.
+- **Holding a device again writes nothing new.** Each repeated "held" record
+  cost one of the ledger's bounded decision slots, and enough of them could
+  push a real "user rejected" out of the history.
+- **The trust store fails closed when it cannot be reached.** `EACCES` on its
+  directory raised out of `TrustStore`'s constructor and ended the analyzer at
+  startup, taking the gate with it. It is now a `load_error`: nothing is
+  trusted, and the reason is reported.
+- **A store the gate creates is readable by the analyzer** (0644 on
+  creation); an existing file keeps its mode. A 0600 file written by root
+  would have been remembered on disk and asked about anyway.
+- **No pointless trust bookkeeping under `--privsep`**: the analyzer no
+  longer tries to update `last_seen` in a store it cannot write, which only
+  printed "could not update trust store" once per run.
+- **`textsafe` cut.** Once one token did not fit, the cut skipped only that
+  token and kept appending what still fitted, so a long escape was dropped
+  and its neighbour shown in its place (`'\x1f0'` at a limit of 1 came out
+  as `0...`), and the combining-mark count reset. Nothing is appended after
+  the first token that does not fit. Found by the property tests.
+- **`interrogation_study.py`** reports a driver it could not detach instead
+  of swallowing the error; `interrogate.py` binds each probe rather than
+  closing over the loop variable (both found by ruff `B`).
+
 ## [0.10.0] — 2026-10-01 · quality pass
 
 ### Added

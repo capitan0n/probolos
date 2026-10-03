@@ -14,4 +14,4 @@ try:
 
     __version__ = _version("probolos")
 except Exception:  # not installed: source checkout, or metadata unavailable
-    __version__ = "0.10.0+source"
+    __version__ = "0.11.0+source"
