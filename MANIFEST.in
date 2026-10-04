@@ -1,0 +1,14 @@
+# What the sdist carries besides the package, which pyproject.toml already
+# puts in it with README.md, LICENSE and pyproject.toml. The wheel is not
+# affected: it holds the `probolos` package alone.
+#
+# The tests with everything they import, so `python -m tests.run_all` runs from
+# an unpacked sdist; the service files and the installer, so the sdist can be
+# installed the way README.md describes; and the documents the code and the
+# other documents cite by name.
+include *.md CITATION.cff install.sh interrogation_study.py
+graft docs
+graft systemd
+graft testbed
+graft tests
+global-exclude *.py[cod]

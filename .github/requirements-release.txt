@@ -1,8 +1,14 @@
-# What release.yml builds the sdist and wheel with, at exact versions so the
-# same tag always builds the same way. Dependabot proposes updates (see
-# dependabot.yml). The build backend itself (setuptools, from pyproject.toml)
-# is fetched by `build` into an isolated environment.
+# What release.yml builds the sdist and wheel with, at exact versions: the
+# frontend (build) and, because release.yml builds with --no-isolation, the
+# backend (setuptools) too. With SOURCE_DATE_EPOCH set to the commit time, the
+# same tag gives a byte-identical wheel. The sdist is not byte-reproducible:
+# setuptools writes the files' modification times into it.
+#
+# Dependabot proposes updates (see dependabot.yml); the build job in tests.yml
+# builds with these same pins, so an update that breaks the build shows up on
+# its pull request rather than at the next tag.
 build==1.6.1
+setuptools==84.0.0
 
 # build's own dependencies
 packaging==26.3

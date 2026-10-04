@@ -4,7 +4,7 @@ Spawn emulated USB devices for testing Probolos, with no hardware.
 
 Requires dummy_hcd and raw_gadget loaded, and root:
 
-    sudo modprobe dummy_hcd raw_gadget
+    sudo modprobe -a dummy_hcd raw_gadget
     sudo python -m testbed.spawn --list
     sudo python -m testbed.spawn badusb
     sudo python -m testbed.spawn flashdrive
@@ -71,10 +71,16 @@ def keyboard() -> EmulatedDevice:
 
 
 def overpowered() -> EmulatedDevice:
-    """Declares more current than USB 2.0 permits: power-exceeds-bus-limit."""
+    """
+    Declares more current than USB 2.0 permits: power-exceeds-bus-limit.
+
+    510 mA, not more: bMaxPower is one byte in 2 mA units below USB 3.0, so
+    255 x 2 mA is the most a configuration can declare, and it is still over
+    the 500 mA limit. A larger value does not fit and crashed the preset.
+    """
     return EmulatedDevice(
         manufacturer="Generic", product="Hungry Device", serial="TB-PWR-1",
-        max_power_ma=800,
+        max_power_ma=510,
         interfaces=[Interface(0x03, 0x01, 0x01)])
 
 

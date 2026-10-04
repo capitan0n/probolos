@@ -1,142 +1,129 @@
 # Leakage experiment: how many keystrokes reach the session
 
-The measurable question, before and after: with deferred bind **on** vs
-**off**, how many key events of a BadUSB payload actually reach the user's
-session? Everything else in the quarantine documentation is theory; this is
-the number.
+The measurable question: when a keystroke-injection device is plugged in, how
+many of its key events reach the user's session before Probolos captures it?
+CAPABILITIES.md §1.4 states the design's answer only qualitatively -- input can
+escape before a grab succeeds, and `--close-race-window` does not eliminate that
+race. Whether the flag shortens the window at all is part of what this
+experiment measures. It puts a number on the leak, against a real kernel gadget
+rather than a mock (ROADMAP 2.4, "keystrokes that escape before the
+grab").
 
-Three files, all in the same place (e.g. `~/Lab/personal/probolos/testbed/hidexp/`):
+Measure; do not assume a result. The table at the end starts empty.
+
+The three files live here, in the repository; run everything from this
+directory:
 
 ```bash
-mkdir -p ~/Lab/personal/probolos/testbed/hidexp
-cp -f ~/Downloads/hid_gadget_up.sh ~/Downloads/hid_gadget_down.sh \
-      ~/Downloads/hid_attack.py ~/Lab/personal/probolos/testbed/hidexp/
-chmod +x ~/Lab/personal/probolos/testbed/hidexp/*.sh
+cd testbed/hidexp          # from the repository root
 ```
+
+- `hid_gadget_up.sh` / `hid_gadget_down.sh` build and remove a USB HID
+  keyboard gadget through configfs, on the `dummy_udc.0` loopback controller.
+- `hid_attack.py` types a harmless payload through it: GUI+r, then
+  `--markers` repetitions of the five keys `c e r b s`, then Enter. It sends
+  **5 × markers + 2** key presses (42 with `--markers 8`) at 8 ms intervals,
+  and prints the number it sent. GUI+r reaches Probolos as two key-downs
+  (Meta and r), so a run in which everything is captured reports
+  `keystrokes captured:` 5 × markers + 3 (43 with `--markers 8`).
+
+Prerequisite (once per boot): `sudo modprobe -a dummy_hcd libcomposite`.
 
 ---
 
-## Step 0 — Smoke test (WITHOUT Probolos, confirm the gadget works)
+## Step 0 — Smoke test, without Probolos
 
-First make sure the gadget assembles and produces `/dev/hidg0`:
+Make sure the gadget assembles and produces `/dev/hidg0`:
 
 ```bash
-cd ~/Lab/personal/probolos/testbed/hidexp
 sudo ./hid_gadget_up.sh
-```
-
-You should see `[+] HID keyboard gadget live` and a `/dev/hidg0`. A NEW
-evdev node also appears — the "keyboard" now exists on your system.
-Confirm:
-
-```bash
 ls /dev/hidg*
-sudo dmesg | tail -5        # will show "hid-generic ... Keyboard"
+sudo dmesg | tail -5        # shows "hid-generic ... Keyboard"
 ```
 
-**WARNING:** at this point the gadget is a real keyboard attached to your
-session. If you run the attack NOW (without Probolos), the markers WILL be
-typed wherever focus is. Open an empty editor and see for yourself:
+**Warning:** the gadget is now a real keyboard attached to your session. GUI+r
+opens your desktop's run dialog and the final Enter submits what was typed
+there; the payload is only the letters above, but keep focus on an empty
+editor. This run is the "no protection" baseline:
 
 ```bash
-# With focus on an empty file/editor:
-sudo python3 hid_attack.py --markers 2
-# You will see characters appear. That is the "no protection" case.
-```
-
-Clean up before continuing:
-
-```bash
+sudo python3 hid_attack.py --markers 2      # 12 keys; you will see them typed
 sudo ./hid_gadget_down.sh
 ```
 
 ---
 
-## Step 1 — WITH Probolos, deferred bind ON (the normal case)
+## Step 1 — Control: Probolos, default path
 
-Two terminals.
+Two terminals, and an empty editor window that has the focus while the attack
+runs. The leak is every payload key that reaches the session. The first one,
+GUI+r, can open the run dialog and take the focus, so look there as well as in
+the editor.
 
-**Terminal A** — Probolos, with capture so it counts keystrokes:
-
-```bash
-cd ~/Lab/personal/probolos
-sudo python -m probolos --observe 3 --capture-payload --close-race-window
-```
-
-Let it listen.
-
-**Terminal B** — bring up the gadget (Probolos will see it as a new device)
-and then attack:
+**Terminal A** — Probolos (the `keystrokes captured` count is printed with or
+without `--capture-payload`; the flag adds the `payload-captured` finding):
 
 ```bash
-cd ~/Lab/personal/probolos/testbed/hidexp
-sudo ./hid_gadget_up.sh
-# Probolos in A now prints "NEW USB DEVICE — keyboard".
-# The moment it enters quarantine (DO NOT TOUCH), run immediately:
-sudo python3 hid_attack.py --markers 8
-```
-
-**What to look for in the Probolos report (Terminal A):**
-
-- `Keystrokes captured : 41` (or however many you sent) — it caught them all
-- Finding: `machine-generated-keystrokes` (CRITICAL) — recognised the rhythm
-- Finding: `immediate-activity` (WARNING) — hit straight away
-- Exposure: `actual exposure 0 ms` — nothing had time to leak
-
-**THE CRITICAL PART:** in Terminal B, NO character should appear. Probolos
-holds the grab; the markers go to it, not to your session. That is the
-"0 keystrokes leaked" result.
-
-Clean up:
-
-```bash
-sudo ./hid_gadget_down.sh
-# Ctrl-C on Probolos (Terminal A)
-```
-
----
-
-## Step 2 — WITH Probolos, deferred bind OFF (the control run)
-
-The control experiment is the same setup **without** `--close-race-window`:
-its absence IS the control, its presence IS the treatment. No code change is
-needed.
-
-**Terminal A** — same as Step 1 but drop the flag:
-
-```bash
+cd ../..                    # the repository root
 sudo python -m probolos --observe 3 --capture-payload
 ```
 
-**Terminal B** — identical to Step 1:
+**Terminal B** — bring up the gadget, then attack the moment Probolos reports
+the device and starts observing it:
 
 ```bash
 sudo ./hid_gadget_up.sh
 sudo python3 hid_attack.py --markers 8
 ```
 
-In the fallback path the driver binds immediately at authorize. For the ~50
-ms before the grab succeeds, the first markers LEAK. You will see:
+Record, per run:
 
-- In Terminal B: a few characters APPEAR (the leak)
-- Keystrokes captured: fewer than were sent
-- Exposure: `~50 ms` instead of 0
+- **sent:** printed by `hid_attack.py` (`[+] Sent N keystrokes ...`);
+- **captured:** `keystrokes captured: N` in the report's BEHAVIOUR UNDER
+  QUARANTINE block;
+- **leaked:** keys that reached the session, counted wherever they landed and
+  not computed from the other two (a key can also be lost to both): GUI+r if
+  the run dialog opened, the letters in the run dialog or the editor, and Enter
+  if it submitted the dialog or added a line in the editor. Leaked keys are
+  always the first ones sent, because the leak ends when the grab lands;
+- **exposure gap:** the `exposure gap: ...` line, when the report prints one;
+- **findings:** which of `machine-generated-keystrokes`, `unprompted-typing`
+  and `immediate-activity` fired.
+
+Then clean up: `sudo ./hid_gadget_down.sh`, and Ctrl-C in Terminal A.
+
+---
+
+## Step 2 — Treatment: `--close-race-window`
+
+Identical, with the flag on Probolos. It defers driver binding (bus-wide
+`drivers_autoprobe`), so the keyboard's driver is not bound at the instant the
+device is switched on; Probolos binds it itself just before grabbing. The
+race between that bind and the grab remains (CAPABILITIES §1.4, §1.12). The
+flag is **experimental and outside the 1.0 guarantees** (§2.2, §3.0), and it
+cannot be combined with `--privsep`.
+
+```bash
+sudo python -m probolos --observe 3 --capture-payload --close-race-window
+```
+
+Record the same five values.
 
 ---
 
 ## The table you produce for the thesis
 
-| Condition                | enumeration | exposure | keystrokes leaked |
-|--------------------------|-------------|----------|-------------------|
-| No Probolos              | —           | ∞        | ALL (41/41)       |
-| Probolos, deferred OFF   | ~50 ms      | ~50 ms   | some (e.g. 3–8)   |
-| Probolos, deferred ON    | ~50 ms      | ~0 ms    | 0                 |
+Repeat each condition 10 or more times and report the median and p95, not a
+single value.
 
-That table is the result. It shows a measured — not theoretical — improvement,
-against a real kernel gadget rather than a mock.
+| Condition                         | runs | sent | captured (median / p95) | leaked at the session (median / p95) | exposure gap |
+|-----------------------------------|------|------|-------------------------|--------------------------------------|--------------|
+| No Probolos (Step 0)              |      |      | —                       |                                      | —            |
+| Probolos, default (Step 1)        |      |      |                         |                                      |              |
+| Probolos, `--close-race-window`   |      |      |                         |                                      |              |
 
-**Repeat each row 10+ times** and report median and p95, not a single value.
-"leaked 0/41 in 10/10 trials" reads much stronger than a single run.
+Keep the raw per-run values with the results (TESTING.md, ROADMAP 2.2), so the
+medians can be recomputed.
 
 ---
 
@@ -146,13 +133,15 @@ against a real kernel gadget rather than a mock.
 `sudo modprobe usb_f_hid` by hand, then the up script again.
 
 **`echo dummy_udc.0 > UDC` reports "Device or resource busy":** something
-else is holding the UDC. `cat /sys/class/udc/dummy_udc.0/state` — if it
+else is holding the UDC. `cat /sys/class/udc/dummy_udc.0/state` -- if it
 reads "configured", run the down script first.
 
-**Probolos does not see the gadget:** `dummy_hcd` creates devices on
-bus 5 (`usb5`). Make sure Probolos is not filtering bus 5 — you should see
-`usb5: closed` in the baseline output.
+**Probolos does not see the gadget:** `dummy_hcd` adds its own root hub,
+`usbN`, whose number depends on the machine
+(`grep -il dummy /sys/bus/usb/devices/usb*/product` finds it). Probolos's
+startup output must list that hub as `usbN: closed`; if it does not, the
+gadget is on a bus Probolos is not gating.
 
 **The down script leaves debris:** `find /sys/kernel/config/usb_gadget/probolos_test`
-shows what remains. It is almost always the UDC still bound —
+shows what remains. It is almost always the UDC still bound --
 `echo "" > .../probolos_test/UDC` then try again.

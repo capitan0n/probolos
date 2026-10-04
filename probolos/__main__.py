@@ -193,7 +193,7 @@ def _resolve_agent_identity(args):
     exits.
 
     Auto-detection finding no desktop session is NOT an error, and treating it
-    as one was a fail-open in the shipped systemd unit. probolos.service runs
+    as one was a fail-open in the shipped systemd unit. probolos.service ran
     `--privsep --agent --timeout 0` with no --agent-user; at boot there is no
     graphical session for _active_session_user() to find and SUDO_USER is
     unset under systemd, so this exited, Restart=on-failure restarted it five

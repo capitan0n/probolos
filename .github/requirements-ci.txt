@@ -5,10 +5,14 @@
 # pull requests (see dependabot.yml), each to be read before merging.
 #
 # Locally: pip install -r .github/requirements-ci.txt
-coverage==7.16.2
+coverage[toml]==7.16.2
 hypothesis==6.168.3
 pyyaml==6.0.3
 ruff==0.16.10
+
+# coverage's TOML support on Python 3.10, which has no tomllib: without it
+# coverage refuses to start with the [tool.coverage] config in pyproject.toml.
+tomli==2.4.1 ; python_version < "3.11"
 
 # hypothesis's own dependencies
 sortedcontainers==2.4.0

@@ -817,8 +817,7 @@ class DescriptorDriftSurvivesRecording(unittest.TestCase):
         already added) carries the entry through `fingerprint_scheme:
         normalized-v1` via Ledger.load(); from_raw is then free to trust the
         stored baseline. The wider migration -- pre-round-4 ledgers with the
-        raw-blob baseline -- is covered by
-        tests.test_normalized_fingerprint.OldLedgerMigration.
+        raw-blob baseline -- is covered by OldLedgerMigration in this file.
         """
         entry = ledger_mod.Entry.from_raw({
             "identity": "0951:1666:AABBCCDD",

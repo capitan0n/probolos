@@ -195,7 +195,7 @@ class RawGadget:
                     "holding dummy_udc.0 (often dummy_hcd's own host side, or "
                     "a leftover gadget). Reset with:\n"
                     "    sudo rmmod raw_gadget dummy_hcd\n"
-                    "    sudo modprobe dummy_hcd raw_gadget\n"
+                    "    sudo modprobe -a dummy_hcd raw_gadget\n"
                     "    cat /sys/class/udc/dummy_udc.0/state   # want 'not attached'"
                 ) from exc
             raise

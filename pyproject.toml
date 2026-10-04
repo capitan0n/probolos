@@ -14,6 +14,7 @@ name = "probolos"
 version = "0.11.0"
 description = "A deny-by-default USB admission gate for Linux"
 readme = "README.md"
+authors = [{ name = "capitan0n" }]
 requires-python = ">=3.10"
 license = { text = "GPLv3" }
 keywords = ["usb", "security", "badusb", "linux", "sysfs", "hardening"]
@@ -49,11 +50,12 @@ dependencies = [
 # `dev` is what the quality checks use, never what Probolos needs to run. The
 # suite itself still runs on the standard library alone; with these installed
 # it also runs the property-based tests (Hypothesis), the --rules tests
-# (PyYAML), the lint (ruff) and the coverage measurement. CI installs the same
-# tools at the exact versions in .github/requirements-ci.txt.
+# (PyYAML), the lint (ruff), the type check (mypy) and the coverage
+# measurement. CI installs the same tools at exact versions, from
+# .github/requirements-ci.txt and, for mypy, requirements-typecheck.txt.
 agent = []
 # coverage[toml]: Python 3.10 has no tomllib, and without the extra coverage
-# would ignore [tool.coverage] below without a word.
+# refuses to start on the [tool.coverage] config below.
 dev = ["coverage[toml]>=7.10", "hypothesis", "mypy", "pyyaml", "ruff"]
 
 [project.urls]
@@ -62,9 +64,12 @@ Source = "https://github.com/capitan0n/probolos"
 Changelog = "https://github.com/capitan0n/probolos/blob/main/CHANGELOG.md"
 
 [project.scripts]
-# This is the payoff: `probolos` becomes a real command on PATH after install,
-# which removes the "must cd to repo root" dependency and lets the systemd unit
-# call an absolute ExecStart instead of `python -m probolos` with a WorkingDirectory.
+# `pip install` puts a `probolos` command on PATH, so it runs from any
+# directory. The shipped systemd units and install.sh do not use it: the units
+# run `/usr/bin/python3 -m probolos` and `/usr/bin/python3 -m probolos.agent`,
+# with the package on PYTHONPATH=/opt/probolos or installed into the system
+# Python (see systemd/README.md), and install.sh writes its own
+# /usr/local/bin/probolos wrapper that runs the package from /opt/probolos.
 probolos = "probolos.__main__:main"
 
 [tool.setuptools]
@@ -100,7 +105,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# The tests: bare asserts in the standalone descriptor tests (S101), files
+# The tests: bare asserts in the descriptor tests (S101), files
 # made group- or world-writable on purpose to prove they are refused (S103),
 # and test helpers that build real disk images with tools run by name (S607).
 "tests/**" = ["S101", "S103", "S607"]
@@ -148,7 +153,8 @@ patch = ["fork", "_exit"]
 #                         codes, and that anything else is no decision -- is
 #                         tested from the caller's side in test_agent.py.
 #
-# Both are checked on real hardware and desktops instead (TESTING.md).
+# Both are to be checked on real hardware and desktops instead: the hardware
+# matrix, TESTING.md (ROADMAP 2.2).
 omit = ["probolos/interrogate.py", "probolos/countdown_dialog.py"]
 
 [tool.coverage.report]

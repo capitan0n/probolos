@@ -1,4 +1,4 @@
-"""Run unittest classes AND the standalone descriptor tests: python -m tests.run_all.
+"""Run the whole suite: python -m tests.run_all.
 
 Restricted containers may prohibit creating listening AF_UNIX sockets. Only
 tests requiring that exact capability are skipped; socketpair IPC still runs.
@@ -37,9 +37,17 @@ def main():
                             f"AF_UNIX socket creation prohibited: {unavailable}"
                         )(getattr(cls, method)))
         suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(module))
-        for name, fn in inspect.getmembers(module, inspect.isfunction):
-            if name.startswith("test_") and fn.__module__ == module.__name__:
-                suite.addTest(unittest.FunctionTestCase(fn))
+        # A module-level test function is run by nothing: `unittest discover`
+        # does not collect it, and README.md promises that this runner and
+        # discover report the same totals. It used to be wrapped here instead,
+        # which hid exactly that difference. Refuse it, so it moves into a
+        # TestCase.
+        stray = [name for name, fn in inspect.getmembers(module, inspect.isfunction)
+                 if name.startswith("test_") and fn.__module__ == module.__name__]
+        if stray:
+            raise SystemExit(f"{module.__name__}: module-level test functions "
+                             f"{stray} are not collected by unittest discover; "
+                             f"put them in a TestCase")
     result = unittest.TextTestRunner(verbosity=2, buffer=True).run(suite)
     return 0 if result.wasSuccessful() else 1
 

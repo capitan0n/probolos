@@ -8,10 +8,11 @@ reporting:
 open a public issue for it. Anything that is already public can go in an
 ordinary issue.
 
-A report is most useful with the distribution and kernel, `probolos --version`,
-whether `--privsep` was on, and the device or input that triggered it. Fixes
-go through a private advisory first and are published with the release that
-carries them.
+A report is most useful with the distribution and kernel, the Probolos version
+(the release, or `git describe --tags --always` in the checkout you installed
+from), whether `--privsep` was on, and the device or input that triggered it.
+Fixes go through a private advisory first and are published with the release
+that carries them.
 
 ## Scope of this document
 
@@ -252,9 +253,10 @@ under `--privsep` the root gate writes "always" on its behalf (next section).
 `O_NOFOLLOW | O_CREAT | O_EXCL` and renamed into place. Previously a `nobody`
 process could pre-plant `trusted.tmp` as a symlink to, say, a file under
 `/etc/cron.d`, and the next root-run save (`sudo … --forget N`) would write the
-store's JSON through it. Stores are created mode `0600`, except a trust store
-the gate creates, which is `0644` so the analyzer can read back what was
-remembered; an existing file keeps its mode.
+store's JSON through it. Stores are created mode `0600`. Under `--privsep` the
+trust store is the exception: the launcher makes an existing one `0644` and the
+gate creates a new one `0644`, so the analyzer can read back what was
+remembered, and a rewrite keeps the read bits the file already has.
 
 **The launcher refuses to chown anything outside a fixed allowlist.**
 `--ledger /etc/x.json` would otherwise make `/etc` owned by an unprivileged
@@ -475,8 +477,8 @@ the kernel allows and the device is re-blocked the instant the read returns, but
 the race is real. A udisks-specific inhibitor can suppress udisks automounting,
 but not every other program capable of mounting a device. Holding the storage
 interface at 0 also prevents the block node needed by the current scanner; it
-is not a drop-in fix. The inhibitor file referenced in the original README was
-not present in the supplied ZIP; it was not reconstructed as part of this audit.
+is not a drop-in fix. README.md ("Stop automount racing the scan") gives a udev
+rule that sets `UDISKS_AUTO=0` for USB storage; it inhibits udisks only.
 
 ## Lockout safety
 
@@ -513,8 +515,8 @@ reboot.
 Only root hubs discovered when the gate starts are closed by the current
 implementation. New host controllers/root hubs require separate boot/udev
 policy; do not assume their first devices are blocked by this daemon. The
-supplied systemd unit was corrected to allow AF_NETLINK and to remain in the
-host network namespace for udev events. Live systemd/USB validation remains
-necessary; a static unit edit is not an integration test.
+shipped systemd unit allows AF_NETLINK and stays in the host network namespace,
+because udev events arrive over host netlink. Live systemd/USB validation
+remains necessary; a static unit check is not an integration test.
 
 Kernel authorization semantics: https://docs.kernel.org/usb/authorization.html

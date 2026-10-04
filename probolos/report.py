@@ -1,12 +1,11 @@
 """
-Minimal renderer -- no boxes, indent-based hierarchy, color for severity.
+The terminal report -- no boxes, indent-based hierarchy, color for severity.
 
-Same public API as report.py: render(), render_behaviour(), render_medium(),
-one_liner(). Callers replace `from . import report` with `from . import report1
-as report` to try it. Every rule, every finding, every severity, and the whole
-data flow are the ones report.py already builds -- only the DISPLAY changes.
+Public API: render(), render_behaviour(), render_medium(), one_liner(). It
+only DISPLAYS: every rule, finding and severity comes from rules.py and the
+analyzers unchanged.
 
-Design rules for this variant:
+Design rules:
   * no ASCII borders. Section breaks are one blank line and one header line.
   * one label, one value, one line where possible. Wrapping still happens on
     long device strings and on finding explanations.
@@ -65,14 +64,17 @@ _SEVERITY_STYLE = {
     rules.Severity.INFO:     ("✓", _green),
 }
 
-# Width of the terminal we target for wrapping. 62 keeps parity with
-# report.py's box interior, so a fresh eye can compare the two directly.
+# Width of the terminal we target for wrapping: 62, the interior width of the
+# boxed report this one replaced.
 WIDTH = 62
 INDENT = "  "
 
 
 def _wrap(text: str, width: int, indent: str = "") -> List[str]:
-    """Column-aware word wrap. See report.py for the same helper's rationale."""
+    """
+    Word wrap measured in terminal columns, not characters: a CJK name or a
+    string of combining marks has a display width unrelated to len().
+    """
     words, lines, current = text.split(), [], ""
     for word in words:
         for piece in textsafe.split_width(word, width):

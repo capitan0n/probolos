@@ -10,7 +10,10 @@ permissions:
 
 jobs:
   root:
-    runs-on: ubuntu-latest
+    # A fixed release, as in systemd.yml: ubuntu-latest moves to a new Ubuntu
+    # on its own (26.04 from 2026-10-19), and CI must not turn red with no
+    # change here. Move it on purpose.
+    runs-on: ubuntu-24.04
     # Generous for a suite that takes about a minute. What it bounds is a
     # hang: a parser that never returned would otherwise hold the runner for
     # GitHub's default of six hours before anyone was told.

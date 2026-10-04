@@ -81,9 +81,9 @@ NOTE_STACKED_MARKS = "stacked-combining-marks"
 # How many combining marks may follow one base character.
 #
 # Combining marks (Unicode category Mn/Mc/Me) occupy ZERO terminal columns, so
-# display_width() and fit() -- which exist to stop a device from pushing the
-# border of the report box off the line -- count a string of two hundred of
-# them as costing nothing and let all of them through. The terminal does not
+# display_width() -- which the report's wrapping measures with, so that a
+# device cannot push its lines out of shape -- counts a string of two hundred
+# of them as costing nothing and lets all of them through. The terminal does not
 # agree: they stack on the preceding glyph and spill into the lines ABOVE and
 # BELOW, which is the same "the report no longer looks like a report" outcome
 # the width handling was written to prevent, reached by the one route it does

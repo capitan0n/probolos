@@ -184,7 +184,7 @@ class TestWatchdog(unittest.TestCase):
         # The panic file must normally be root-owned in a root-owned directory.
         # Under test we create it as the current user in a user-owned tmpdir,
         # so tell the policy to accept that uid; the ownership LOGIC is exercised
-        # by test_safety_panic.py, not here.
+        # by PanicFileValidation below, not here.
         self.policy = safety.SafetyPolicy(panic_file=self.panic,
                                           panic_file_uid=os.getuid())
         self.stalls = []

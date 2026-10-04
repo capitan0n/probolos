@@ -76,4 +76,4 @@ echo "$UDC_NAME" > "$G/UDC"
 
 echo "[+] HID keyboard gadget live on $UDC_NAME"
 echo "    /dev/hidg* created:"
-ls -l /dev/hidg* 2>/dev/null || echo "    (no /dev/hidg -- see troubleshooting below)"
+ls -l /dev/hidg* 2>/dev/null || echo "    (no /dev/hidg -- see Troubleshooting in EXPERIMENT.md)"

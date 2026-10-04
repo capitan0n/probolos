@@ -9,7 +9,10 @@ permissions:
 
 jobs:
   typecheck:
-    runs-on: ubuntu-latest
+    # A fixed release, as in systemd.yml: ubuntu-latest moves to a new Ubuntu
+    # on its own (26.04 from 2026-10-19), and CI must not turn red with no
+    # change here. Move it on purpose.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

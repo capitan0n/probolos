@@ -1,6 +1,10 @@
 """
 Property-based tests: what must hold for EVERY input, not for the examples.
 
+Covers, across modules: descriptors and descriptors_safe, storage, protocol
+and the gate's path checks, textsafe and report, rules and analyzers, trust
+and ledger loading, agent and agentlink.
+
 WHY THIS FILE EXISTS
 --------------------
 Everything tested here takes input someone else chose: the descriptor bytes

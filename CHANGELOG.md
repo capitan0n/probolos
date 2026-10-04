@@ -1,6 +1,7 @@
 # Changelog
 
-All notable changes to Probolos. Versioning is semantic.
+All notable changes to Probolos. Versions follow PEP 440
+(`1.0.0b1` < `1.0.0rc1` < `1.0.0`).
 
 ## Unreleased · road to 1.0.0
 
@@ -20,21 +21,32 @@ is a fix, a security fix, testing, documentation or release work.
   It is display-only like every notice: no id, nothing to answer, and it
   falls back to the one-button window on a desktop with no notification
   server. Ordinary devices keep the normal-urgency notice.
+- **`install.sh` no longer skips its already-running check on an unusual
+  path.** It put the checkout path into the Python program it ran, so a path
+  with a quote in it made a syntax error, which read as "not running". The
+  path is now an argument.
+- **testbed: the `overpowered` preset builds.** It declared 800 mA, which does
+  not fit `bMaxPower` (one byte, 2 mA units), so it crashed before presenting
+  anything; it now declares 510 mA, the most a configuration can, still over
+  the 500 mA limit. `modprobe dummy_hcd raw_gadget`, in the testbed README, the
+  spawn docstring and an error hint, loaded only `dummy_hcd`; it is
+  `modprobe -a` now.
 
 ### QA
 
-- **The privilege boundary's refusal paths are tested** (`tests/test_boundary.py`):
-  every failed step of the privilege drop (euid, egid, regained root), every
-  way the analyzer child can end (Ctrl-C, `SystemExit` with a message, a
-  crash), `privsep.start()`'s child branch (session, drop, exit status, signal
-  dispositions put back) and parent branch (a gate that raises, a child
-  already reaped, signal forwarding and the pre-fork window), every refused
-  `GateClient` operation and broken exchange, and the gate's refusal and
-  error paths for paths, interfaces, root hubs, input and block opens,
-  fingerprints and its serve loop. `privsep.start()` is driven in-process with
-  fork and `_exit` mocked, because its pty-forked children report no coverage.
-  Boundary coverage went from 80% to 95% (`privsep.py` 67% → 98%,
-  `gate_client.py` 71% → 94%, `gate_server.py` 81% → 95%).
+- **The privilege boundary's refusal paths are tested**
+  (`tests/test_boundary.py`): every failed step of the privilege drop (euid,
+  egid, regained root), every way the analyzer child can end (Ctrl-C,
+  `SystemExit` with a message, a crash), `privsep.start()`'s child branch
+  (session, drop, exit status, signal dispositions put back) and parent branch
+  (a gate that raises, a child already reaped, signal forwarding and the
+  pre-fork window), every refused `GateClient` operation and broken exchange,
+  and the gate's refusal and error paths for paths, interfaces, root hubs,
+  input and block opens, fingerprints and its serve loop. `privsep.start()` is
+  driven in-process with fork and `_exit` mocked, because its pty-forked
+  children report no coverage. Boundary coverage went from 80% to 95%
+  (`privsep.py` 67% → 98%, `gate_client.py` 71% → 94%, `gate_server.py` 81% →
+  95%).
 - **Coverage leaves out what no unit test can reach**: `interrogate.py` (a
   research instrument, not on the daemon's path) and `countdown_dialog.py` (a
   Tk window in its own interpreter), with the reason next to the setting in
@@ -45,18 +57,71 @@ is a fix, a security fix, testing, documentation or release work.
   `protocol.py`, `gate_server.py`, `privsep.py` and `trust.py` (an implicit
   `Optional`); no behaviour changed.
 - **`docs/QA-LOG.md`**: one row per defect found from the freeze on, with how
-  it was found, plus the boundary coverage table.
+  it was found, plus the boundary coverage table and static-analysis triage
+  (CodeQL: two alerts, both false positives).
+- **A structure audit** of the repository on 2026-10-04 (six independent
+  reviewers, each finding re-checked by a skeptic) found the defects
+  `docs/QA-LOG.md` marks "review (structure audit)", one row each, and the
+  same method run over the fixes found two more ("review (fix verification)").
+  All of them are fixed here. The CRITICAL notice and the two `SECURITY.md`
+  statements above were found earlier, by review.
+- **New tests:** every rule id the code emits must appear in `CAPABILITIES.md`
+  (`EveryRuleIsInTheContract`); every testbed preset builds and raises the rule
+  it exists for (`tests/test_testbed.py`); the offline half of the
+  interrogation study (`tests/test_interrogate.py`: benign probes first,
+  `--gentle` sends nothing intrusive, failures classified, CSV rows match the
+  header). `tests/run_all.py` refuses module-level test functions instead of
+  wrapping them, so it and `unittest discover` count the same tests. The
+  report-width tests check every rendered line again: they matched only box
+  borders, and with the box gone they checked nothing.
+- **CI:** a build job in `tests.yml` builds with the release pins on every push,
+  checks the wheel holds the package alone, and runs the suite from the
+  unpacked sdist. Every workflow runs on `ubuntu-24.04`, not `ubuntu-latest`,
+  which moves to a new Ubuntu on its own; every job has a timeout.
+  `coverage[toml]` (and `tomli` on Python 3.10) in `requirements-ci.txt`.
 
 ### Documentation
 
 - **`SECURITY.md`**: the threat model of the gate-side trust write
   (`REQ_TRUST`); holding with no agent, the re-ask cap and replayed "add"
-  events; the `textsafe` cut; dialog exit codes that are no decision. Two statements that were no longer true are corrected: an
-  unanswered agent question does not fall back to a terminal the service does
-  not have, and a trust store the gate creates is `0644`, not `0600`.
-- **`CAPABILITIES.md`** §1.7 names the critical-urgency notice.
+  events; the `textsafe` cut; dialog exit codes that are no decision. Two
+  statements that were no longer true are corrected: an unanswered agent
+  question does not fall back to a terminal the service does not have, and a
+  trust store the gate creates is `0644`, not `0600`.
+- **`CAPABILITIES.md` §1 names every rule 0.11.0 emits.** It left out nine
+  rules, five of them CRITICAL (`storage-with-undeclared-hid`,
+  `quarantine-not-restored`, `payload-captured`, `descriptor-drift`,
+  `previously-rejected`), and listed a tenth only in §3.4. They are documented
+  now, with `analyzer-failed:<check>` and the systemd service (§1.14); nothing
+  changed in the code. §1.6 (and `SECURITY.md`) say when the trust store is
+  `0644` under `--privsep`; §1.11 sits in order; §1.12 describes the report as
+  it is; §2.2 lists `textsafe.pad`/`fit` as tested but unreachable; a pointer
+  to an audit report that is not in the repository is gone. §1.7 names the
+  critical-urgency notice.
+- **`systemd/README.md` "By hand"** gives the drop-in settings `install.sh`
+  writes (`PYTHONPATH`, `PROBOLOS_AGENT_USER`, and the agent's
+  `WorkingDirectory=/`; not `ConditionUser=`, which a per-user unit does not
+  need).
+  Without them the agent could not import `probolos`, and with the shipped
+  `PROBOLOS_AGENT_USER=nobody` the gate turned the agent off and denied every
+  device.
+- **`testbed/hidexp/EXPERIMENT.md`** runs from the repository, makes the default
+  path the control and `--close-race-window` the treatment (outside the 1.0
+  guarantees), counts leaked keystrokes at the session, and leaves the results
+  table to be measured; it predicted zero leaks, which CAPABILITIES §1.4 rules
+  out. Linked from `testbed/README.md` and ROADMAP 2.4.
+- **No `probolos --version` in the docs.** The bug form and `SECURITY.md` asked
+  for it and the CLI has no such flag; they ask for the release or
+  `git describe` instead.
+- **README.md:** the freeze status, the two test files its table missed and
+  the two new ones, the pinned tools and mypy, and pointers to CAPABILITIES,
+  ROADMAP and QA-LOG instead of "open items in CHANGELOG".
+- **`CITATION.cff`** for GitHub's "Cite this repository" and the Zenodo DOI
+  (ROADMAP 4.2), author `capitan0n`, also in `pyproject.toml`.
 - **`docs/GITHUB-SETUP.md`**: the labels, milestones, repository settings and
-  Phase 1 issues to apply by hand.
+  Phase 1 issues to apply by hand; the settings applied so far; Zenodo
+  (switched on before 1.0.0) and Software Heritage (after it). ROADMAP ticks
+  what is done.
 
 ### Release engineering
 
@@ -64,7 +129,12 @@ is a fix, a security fix, testing, documentation or release work.
   and the `__init__.py` fallback, builds the sdist and wheel with a pinned
   `build`, writes `SHA256SUMS`, attests build provenance, and opens a
   **draft** release (a pre-release for a/b/rc tags) for the maintainer to
-  publish. Nothing goes to PyPI.
+  publish. Nothing goes to PyPI. It builds with `setuptools` pinned too
+  (`--no-isolation`) and `SOURCE_DATE_EPOCH` at the commit time, so a tag
+  gives a byte-identical wheel; the sdist is not byte-reproducible.
+- **`MANIFEST.in`**: the sdist carries the tests with their helpers (they
+  could not run from it before), `testbed/`, `systemd/`, `install.sh`, `docs/`
+  and the documents the code cites. The wheel is unchanged.
 
 ## [0.11.0] — 2026-10-03 · feature freeze
 

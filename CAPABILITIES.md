@@ -67,6 +67,9 @@ defaults and are overridable per rule in a YAML config (`--rules`).
 - `storage-with-keyboard` — a mass-storage device that also declares HID input
 - `network-with-keyboard` — a network interface that also declares HID input
 - `crafted-strings-hid` — text-manipulation characters in the strings of an input device
+- `storage-with-undeclared-hid` — a mass-storage device that also declares an
+  input interface whose shape the descriptors do not show (HID subclass 0, or a
+  declared mouse whose report descriptor was not read)
 - `unreadable-descriptors`, `descriptor-chain-truncated`, `configurations-missing`
   — part of what the device declared was never examined (parse failure, a chain
   cut short, or fewer configurations read than declared), so no rule above can
@@ -77,6 +80,10 @@ defaults and are overridable per rule in a YAML config (`--rules`).
 - `self-contradictory-identity`
 - `interface-count-mismatch` — declared `bNumInterfaces` vs. interfaces present
 - `crafted-strings`
+- `network-with-undeclared-hid` — a network interface beside an input interface
+  of unclear shape (as `storage-with-undeclared-hid`)
+- `stacked-combining-marks` — more combining marks on one character than any
+  writing system uses, which can draw over the report
 - `power-exceeds-bus-limit` — declares more than the specification permits
 
 **NOTICE**
@@ -86,6 +93,12 @@ defaults and are overridable per rule in a YAML config (`--rules`).
 - `invisible-string-characters`
 - `storage-declares-negligible-power`
 - `power-varies-across-configurations`
+- `descriptor-length-overstated` — `wTotalLength` claims more configuration data
+  than was delivered
+
+A check that raises is reported, never skipped: `analyzer-failed:<check>` is
+CRITICAL when that check is the one that decides its stage, and NOTICE
+otherwise.
 
 ### 1.4 Stage 3 — Pre-authorization quarantine
 
@@ -103,6 +116,15 @@ Behavioural rules (`rules.behaviour_findings`):
 - `immediate-activity` (WARNING)
 - `incomplete-isolation` (WARNING) — a node could not be grabbed
 - `quarantine-unavailable` (NOTICE)
+- `quarantine-not-restored` (CRITICAL) — `authorized=0` could not be written
+  back after observation, so the device may still be live
+
+Payload rule (`analyzers.PayloadAnalyzer`, only with `--capture-payload`):
+
+- `payload-captured` (CRITICAL) — the device typed at least one key during
+  quarantine; its keystrokes are rebuilt as a DuckyScript-style transcript,
+  assuming a US QWERTY layout and capped at about 4096 characters (keystrokes
+  past the cap are counted, not transcribed)
 
 Authorization-to-first-grab latency is reported. It is not a measurement of
 all escaped input, and `--close-race-window` does not eliminate the race.
@@ -138,6 +160,8 @@ raw error text and paths go to the JSON audit log (`medium.detail`) only.
 
 - `partition-beyond-end-of-device` (WARNING)
 - `overlapping-partitions` (WARNING)
+- `impossible-partition-geometry` (WARNING) — entries that cannot exist on this
+  medium (`storage_hardening`); they are not read
 - `filesystem-type-mismatch` (NOTICE)
 - `filesystem-signature-without-structure` (NOTICE)
 - `large-unallocated-gap` (NOTICE)
@@ -162,8 +186,21 @@ decision. This guard includes every parsed configuration and alternate setting. 
   for forensics but never fed to the CRITICAL rule.
 - **Trust store** (`trust.py`) — devices pinned by identity *and* descriptor
   hash. Trust never overrides a CRITICAL finding. Both files are written
-  atomically at mode `0600`; an unreadable trust store fails **closed**
-  (nothing trusted, everything asked).
+  atomically. The ledger is `0600`. The trust store is `0600` unless
+  `--privsep` is used: there the launcher makes an existing store `0644` and
+  the gate creates a new one `0644`, so the analyzer can read it back, and any
+  later rewrite keeps the read bits the file already has. An unreadable trust
+  store fails **closed** (nothing trusted, everything asked).
+
+History rules (`analyzers.LedgerAnalyzer`):
+
+- `descriptor-drift` (CRITICAL) — the normalized descriptor set differs from
+  this identity's baseline: the first readable set recorded for it, whatever
+  that sighting's decision, or the set most recently approved
+- `previously-rejected` (CRITICAL) — this identity was refused before; the
+  prompt is the countdown
+- `ledger-unavailable` (NOTICE) — the history could not be read, so the device
+  is judged without it
 
 ### 1.7 Session awareness
 
@@ -215,11 +252,19 @@ bidirectional overrides, control characters, and invisible characters are
 neutralized and reported as findings. A device cannot forge or reorder the
 report about itself.
 
+### 1.11 Non-product tooling
+
+- `testbed/` — `dummy_hcd` / `raw_gadget` software emulation and a HID attack fixture
+- `interrogation_study.py` + `interrogate.py` — **research instrument only.**
+  Active control-transfer fingerprinting for data collection. It classifies
+  nothing and is not wired into the daemon.
+
 ### 1.12 Notes on what changed
 
-Four capabilities in the lists above were, until recently, code that existed
-without being reachable. They are called out because the failure mode is worth
-recognising rather than just repairing:
+Several capabilities in the lists above were, until recently, code that
+existed without being reachable or that did not do what it said. They are
+called out because the failure mode is worth recognising rather than just
+repairing:
 
 | Was | Now |
 |---|---|
@@ -231,11 +276,11 @@ recognising rather than just repairing:
 | `SafetyPolicy.is_protected()` accepted `removable=fixed` on any device. For a device behind an EXTERNAL hub that value comes from the hub's own `DeviceRemovable` bitmap, so one hostile hub silently disabled every check on everything behind it. | The chain from the device to the controller is walked; every ancestor must itself be `fixed` and the walk must reach a root hub before the exemption is granted. |
 | `Ledger.record()` overwrote `descriptor_hash` on every decision, and `LedgerAnalyzer` compared against that field. A refusal, a timeout-denial, or merely queueing a device via `_hold_until_unlocked` adopted the attacker's blob as the reference. | A dedicated `baseline_hash` moved only by an explicit approval (`Ledger.record(..., approved=True)`). Old ledgers migrate via `known_hashes[0]`. |
 | `descriptor_fingerprint()` hashed the raw descriptor blob, so the same physical stick on a USB 2 vs. a USB 3 controller produced a different digest — measured false positive on a Kingston DataTraveler. | Normalized fingerprint over the parsed device/interface identity, dropping bus-negotiated fields. The raw hash is kept beside it in `raw_hash` for forensics. Ledgers written by earlier versions clear their baseline on load and re-learn from the next sighting. |
-| `report._line()` padded with Python character count, so a long ASCII name, a CJK product name, or a product string containing box-drawing characters broke the report box. `textsafe.pad`/`fit`/`display_width` were written for exactly this and had no callers. | `_line()` uses `textsafe.pad()`; `_wrap()` measures in terminal columns; a new `_field()` wraps identity rows and quotes device-supplied strings so they read as testimony, not as verdict text. |
+| `report._line()` padded with Python character count, so a long ASCII name, a CJK product name, or a product string containing box-drawing characters broke the report box. `textsafe.pad`/`fit`/`display_width` were written for exactly this and had no callers. | The box is gone: the report is indented text, `_wrap()` measures in terminal columns (`textsafe.display_width`, `split_width`), and `_quote()` quotes device-supplied strings so they read as testimony, not as verdict text. `pad`/`fit` lost their callers with the box (§2.2). |
 | The shipped systemd unit ran `--privsep --agent --timeout 0` with no `--agent-user`. At boot there is no graphical session, so `_resolve_agent_identity()` called `sys.exit()` and `Restart=on-failure` looped forever with the gate never closing. | Auto-detection failure logs and continues without the agent (explicit unknown `--agent-user` still exits). The unit gained `Environment=PROBOLOS_AGENT_USER` and a drop-in note. |
 
-This audit adds regression scenarios and records the actual run in
-`AUDIT_REPORT_EL.md`; hardware claims are not inferred from mock tests.
+Each row has regression tests under `tests/`. Hardware claims are not
+inferred from mock tests.
 
 ### 1.13 Media changes in admitted card readers (`--watch-media`, off by default)
 
@@ -270,12 +315,15 @@ disk-event polling (typically 1–2 s); a slot whose `events` does not include
 Not covered: SD/MMC readers that are not USB mass storage (`mmcblk`, e.g.
 SDHCI or `rtsx`), composite readers, and filesystem-parser exploits (§2.1).
 
-### 1.11 Non-product tooling
+### 1.14 The background service
 
-- `testbed/` — `dummy_hcd` / `raw_gadget` software emulation and a HID attack fixture
-- `interrogation_study.py` + `interrogate.py` — **research instrument only.**
-  Active control-transfer fingerprinting for data collection. It classifies
-  nothing and is not wired into the daemon.
+`sudo ./install.sh` installs the code root-owned in `/opt/probolos` and enables
+two systemd units (`systemd/`): `probolos.service`, the gate as a system
+service with `--privsep --agent` and a sandboxed unit, and
+`probolos-agent.service`, the desktop agent as a user service. Without an
+agent the service holds devices (§1.7); with one, it asks through the desktop
+prompt (§1.1). The units are checked in CI (`systemd-analyze verify`); their
+behaviour on real hardware is part of the hardware matrix (ROADMAP 2.2).
 
 ---
 
@@ -328,6 +376,10 @@ store — have been fixed; see §1.12.
   their length. Reaching the report descriptor itself requires the device to be
   authorized and `usbhid` bound, i.e. the quarantine stage. Not yet wired to
   anything; see §3.2.
+- **`textsafe.pad()` and `textsafe.fit()`.** Tested, and correct for
+  double-width and combining characters, but the boxed report they were
+  written for is gone (§1.12): nothing outside the tests calls them. They stay
+  until after 1.0.
 - **Deferred binding remains experimental** (`--close-race-window`). It does
   not guarantee a zero exposure window, it is not available under
   `--privsep`, and it is outside the 1.0 guarantees (§3.0).
@@ -375,11 +427,11 @@ claims the keyboard usage page. Identity-level checks cannot see that at all.
 
 - An HMAC over the trust store, keyed by a root-only file, would extend §1.6
   from "nobody else could write this" to "nobody else did write this".
-- Enable systemd once §3.1 has hardware validation.
+- Validate the systemd service (§1.14) on real hardware (§3.1, ROADMAP 2.2).
 
 ### 3.4 Research directions
 
-- **Population-scale false-positive measurement of the two new rules**
+- **Population-scale false-positive measurement of two specification-derived rules**
   (`descriptor-chain-truncated`, `descriptor-length-overstated`). Both are
   reasoned from the specification rather than observed in the wild, which is
   the profile of a rule that turns out to fire on some ordinary vendor's

@@ -1,0 +1,28 @@
+# Citation metadata: GitHub's "Cite this repository" button and Zenodo read
+# this file. No version or release date on purpose: pyproject.toml is the one
+# source of the version, and each release's DOI record carries its own.
+cff-version: 1.2.0
+message: "If you use Probolos, please cite it using these metadata."
+title: "Probolos: a deny-by-default USB admission gate for Linux"
+type: software
+authors:
+  - name: capitan0n
+    alias: capitan0n
+repository-code: "https://github.com/capitan0n/probolos"
+url: "https://github.com/capitan0n/probolos"
+abstract: >-
+  Probolos holds every newly attached USB device blocked through the Linux
+  kernel's USB authorization interface and admits it only on a human decision,
+  a remembered fingerprint, or a configured exemption. Before the decision it
+  checks the device's declared identity for inconsistencies, can observe its
+  input behaviour in a grabbed quarantine and read its partition metadata
+  without mounting, and remembers devices across sessions to detect descriptor
+  drift. The privileged half runs as a minimal root gate, separate from an
+  unprivileged analyzer.
+keywords:
+  - usb
+  - security
+  - badusb
+  - linux
+  - sysfs
+  - hardening

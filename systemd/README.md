@@ -13,34 +13,50 @@ sudo ./install.sh                # install and start; re-run after pulling to up
 sudo ./install.sh --uninstall    # stop and remove; /var/lib/probolos is kept
 ```
 
-It does everything below: code to `/opt/probolos` (root-owned, since a root
-service must not run code its user can edit), a `probolos` command in
-`/usr/local/bin`, both units with local settings in drop-ins
-(`PROBOLOS_AGENT_USER` = the account that ran `sudo`), and it starts both. It
-refuses while a probolos started by hand is still running.
+It does what the manual steps below do, and more: code to `/opt/probolos`
+(root-owned, since a root service must not run code its user can edit), a
+`probolos` command in `/usr/local/bin`, both units with local settings in
+drop-ins (`PROBOLOS_AGENT_USER` = the account that ran `sudo`), and it starts
+both. It refuses while a probolos started by hand is still running.
 
-**By hand:**
+**By hand.** Put the source at `/opt/probolos`, owned by root (or install
+Probolos as a package for the system Python and leave out the `PYTHONPATH`
+lines below). Then install the units and give each the settings `install.sh`
+puts in its drop-ins. (`install.sh` also adds `ConditionUser=` to the agent,
+because it installs the agent for every account; a unit in your own
+`~/.config/systemd/user` runs only for you and does not need it.)
 
 ```bash
 # the gate, as root
 sudo cp systemd/probolos.service /etc/systemd/system/
-sudo systemctl daemon-reload
+sudo systemctl edit probolos.service
+```
 
+```ini
+[Service]
+Environment=PYTHONPATH=/opt/probolos
+# The account whose desktop answers. The unit ships the placeholder `nobody`,
+# the analyzer's own account, so the gate turns the agent off: every new
+# device is then denied, with nobody asked.
+Environment=PROBOLOS_AGENT_USER=yourname
+```
+
+```bash
 # the agent, as you
 mkdir -p ~/.config/systemd/user
 cp systemd/probolos-agent.service ~/.config/systemd/user/
-systemctl --user daemon-reload
+systemctl --user edit probolos-agent.service
 ```
-
-Probolos must be importable by the system Python, either installed as a package
-or with the source directory on `PYTHONPATH`. For a source checkout, add to the
-system unit:
 
 ```ini
+[Service]
 Environment=PYTHONPATH=/opt/probolos
+# Not your home directory: a `probolos/` folder there would be imported
+# instead of the installed one.
+WorkingDirectory=/
 ```
 
-and put the source at `/opt/probolos`.
+`systemctl edit` reloads the units when you save.
 
 ## Start
 
@@ -90,7 +106,8 @@ The gate needs root, so the units restrict what root can still reach:
 `ProtectKernelTunables` is deliberately **not** enabled: writing
 `/sys/bus/usb/devices/*/authorized` is the entire mechanism. That is the one
 broad permission the design cannot do without, and it is the reason the
-privileged half is kept to about 150 auditable lines.
+privileged half (`gate_server.py` and the protocol it serves) is kept separate
+and small enough to audit.
 
 ## Removing it
 

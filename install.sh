@@ -60,10 +60,13 @@ install_all() {
 
     # Two gates fighting over the same ports helps nobody. A probolos started
     # by hand holds the gate lock; the service's own instance is expected.
+    # The source path goes in as an argument, not into the program text: a
+    # checkout path with a quote in it made the program a syntax error, which
+    # read as "not running" and skipped this check.
     if ! systemctl is-active --quiet probolos.service 2>/dev/null \
-        && "$PY" -I -c "import sys; sys.path.insert(0, '$SRC')
+        && "$PY" -I -c 'import sys; sys.path.insert(0, sys.argv[1])
 from probolos import instance
-sys.exit(0 if instance.running() else 1)" 2>/dev/null; then
+sys.exit(0 if instance.running() else 1)' "$SRC" 2>/dev/null; then
         die "probolos is already running (in a terminal?). Stop it with Ctrl-C first."
     fi
 

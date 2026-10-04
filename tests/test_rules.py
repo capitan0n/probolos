@@ -7,6 +7,7 @@ Covers probolos.rules, probolos.analyzers and probolos.report.
 
 from __future__ import annotations
 
+import re
 import struct
 import tempfile
 import unittest
@@ -592,20 +593,24 @@ class IncompleteDescriptorViewsAreCritical(unittest.TestCase):
 # P4 -- the device does not get to draw on the decision screen
 # ---------------------------------------------------------------------------
 
-class ReportBoxHoldsItsShape(unittest.TestCase):
-
-    EXPECTED = report.WIDTH + 2
+class ReportLinesHoldTheirWidth(unittest.TestCase):
+    """
+    No line of the report is wider than report.WIDTH, measured in terminal
+    columns. This class checked the rows of the boxed report, by their border
+    characters; when the box went, it went on passing while checking no line
+    at all.
+    """
 
     def _rows(self, block):
-        return [line for line in block.splitlines()
-                if line.startswith(("┌", "└", "├", "│"))]
+        return block.splitlines()
 
     def _assert_square(self, block, label):
+        self.assertTrue(self._rows(block), f"{label}: nothing rendered")
         for line in self._rows(block):
-            self.assertEqual(
-                textsafe.display_width(line), self.EXPECTED,
-                f"{label}: row is {textsafe.display_width(line)} columns, "
-                f"box is {self.EXPECTED}: {line[:80]!r}")
+            self.assertLessEqual(
+                textsafe.display_width(line), report.WIDTH,
+                f"{label}: line is {textsafe.display_width(line)} columns, "
+                f"report is {report.WIDTH}: {line[:80]!r}")
 
     def test_ordinary_device(self):
         device = make_device(manufacturer="PixArt", product="USB Optical Mouse")
@@ -619,7 +624,7 @@ class ReportBoxHoldsItsShape(unittest.TestCase):
 
     def test_wide_glyphs_are_measured_in_columns(self):
         device = make_device(manufacturer="羅技",
-                             product="無線鍵盤滑鼠組" * 3)
+                             product="無線鍵盤滑鼠組" * 5)
         self._assert_square(report.render(device, rules.evaluate(device)),
                             "CJK")
 
@@ -967,6 +972,45 @@ class DescriptorCoverage(unittest.TestCase):
         engine.known.add("1-1")
         engine._on_remove("/sys/bus/usb/devices/1-1")
         self.assertNotIn("1-1", engine.known)
+
+
+
+class EveryRuleIsInTheContract(unittest.TestCase):
+    """
+    CAPABILITIES.md §1 is the 1.0 feature contract. At v0.11.0 it left out ten
+    rules the code ran, five of them CRITICAL, and nothing noticed. Every rule
+    id the code can emit must appear there, in backticks.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    # A rule id is the first argument of add(...) or Finding(...), followed by
+    # its severity: "storage-with-keyboard", Severity.CRITICAL.
+    RULE = re.compile(r'"([a-z]+(?:-[a-z0-9]+)+)",\s*(?:rules\.)?Severity\.')
+
+    def emitted(self):
+        ids = set()
+        for path in sorted((self.ROOT / "probolos").glob("*.py")):
+            ids.update(self.RULE.findall(path.read_text(encoding="utf-8")))
+        return ids
+
+    def test_the_scan_finds_the_rules(self):
+        ids = self.emitted()
+        # Known rules from every place that emits them: rules.py, the
+        # analyzers and the media rules. A regex that stopped matching would
+        # otherwise make the test below pass on nothing.
+        for known in ("storage-with-keyboard", "descriptor-drift",
+                      "payload-captured", "media-hidden-partition"):
+            self.assertIn(known, ids)
+        self.assertGreater(len(ids), 35)
+
+    def test_every_rule_is_documented(self):
+        # §1 only: a rule named only in §2 or §3 (descriptor-length-overstated
+        # was, in §3.4) is mentioned, not part of the contract.
+        text = (self.ROOT / "CAPABILITIES.md").read_text(encoding="utf-8")
+        contract = text.split("\n## 2. ")[0]
+        self.assertIn("## 1. What Probolos does", contract)
+        missing = sorted(i for i in self.emitted() if f"`{i}`" not in contract)
+        self.assertEqual(missing, [], "rules missing from CAPABILITIES.md §1")
 
 
 if __name__ == "__main__":

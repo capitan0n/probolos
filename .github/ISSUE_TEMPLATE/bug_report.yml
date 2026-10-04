@@ -28,7 +28,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: probolos --version
+      label: Probolos version
+      description: The release you installed (e.g. 0.11.0), or the output of `git describe --tags --always` in the checkout you ran install.sh from.
     validations:
       required: true
   - type: input
@@ -65,8 +66,8 @@ body:
   - type: textarea
     id: journal
     attributes:
-      label: journalctl -u probolos
-      description: The service's log around the event, e.g. `journalctl -u probolos --since "10 min ago"`. For the agent, `journalctl --user -u probolos-agent`.
+      label: Log output
+      description: For the service, its log around the event, e.g. `journalctl -u probolos --since "10 min ago"`, and for the agent `journalctl --user -u probolos-agent`. Run by hand, paste the terminal output instead.
       render: text
     validations:
       required: true

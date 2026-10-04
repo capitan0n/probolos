@@ -5,8 +5,9 @@
 > automated regression coverage, but **it has never been run against an actual
 > attack**: no BadUSB fixture (ATmega32u4, Raspberry Pi Zero, O.MG cable) has
 > been put through the behavioural quarantine, so the claim that matters most
-> is the one with the least evidence behind it. Interfaces, flags and on-disk
-> formats may change without notice.
+> is the one with the least evidence behind it. The feature set is frozen at
+> 0.11.0 on the way to 1.0: until then only fixes, tests and documentation go
+> in ([`ROADMAP.md`](ROADMAP.md)).
 > **Do not rely on it as a security control on a machine you care about.** Treat
 > everything here as experimental and report anything that surprises you.
 
@@ -247,7 +248,13 @@ discovery does not collect and only `run_all` picked up.
 
 ```bash
 ruff check .                                    # lint (config in pyproject.toml)
+python3 -m mypy                                 # types, root side (config in pyproject.toml)
 ```
+
+CI runs these tools at exact versions, pinned in `.github/requirements-*.txt`
+(`pip install -r .github/requirements-ci.txt -r .github/requirements-typecheck.txt`
+gets the same ones locally), and
+holds coverage of the root-side code to a floor (`.github/workflows/coverage.yml`).
 
 The suite needs only the standard library: no root, no USB hardware and no
 `pyudev` (a few tests skip themselves when an optional piece such as PyYAML
@@ -264,16 +271,20 @@ Builders and fixtures used by more than one file are in `tests/_support.py`.
 | File | Covers |
 |---|---|
 | `test_agent.py` | `agent`, `agentlink`, `dialogs` |
+| `test_boundary.py` | the refusal and error paths of `privsep`, `gate_client`, `gate_server` |
 | `test_cli.py` | `__main__` |
 | `test_daemon.py` | `daemon`, `session` |
 | `test_descriptors.py` | `descriptors`, `descriptors_safe`, `usbclass` |
 | `test_gate.py` | `gate`, `safety` |
+| `test_interrogate.py` | `interrogate`, the study's offline half (probe order, `--gentle`, CSV rows) |
 | `test_ledger.py` | `ledger`, `history` |
 | `test_privsep.py` | `privsep`, `gate_server`, `gate_client`, `protocol` |
+| `test_properties.py` | property-based (Hypothesis), across modules: descriptor, medium and protocol parsing, `textsafe`, the state files, the agent socket |
 | `test_quarantine.py` | `quarantine`, `payload`, `deferred_bind` |
 | `test_rules.py` | `rules`, `analyzers`, `report` |
 | `test_storage.py` | `storage`, `storage_hardening`, `mediawatch` |
 | `test_sysfs.py` | `sysfs` |
+| `test_testbed.py` | `testbed.spawn`, `testbed.emulate`: every preset builds and raises what `testbed/README.md` promises (for the drift pair: same identity, different fingerprint) |
 | `test_textsafe.py` | `textsafe` |
 | `test_trust.py` | `trust`, `atomicio` |
 
@@ -311,9 +322,10 @@ Short version:
   and hardened, but the report descriptor is not in the sysfs blob and has no
   source wired to it. `CAPABILITIES.md` §2.2 and §3.2.
 
-Status: **alpha — under active development.** The tree has been through six
-security review passes; each finding has a regression test named after the
-defect, under `tests/`.
+Status: **alpha, feature-frozen at 0.11.0** on the way to 1.0
+([`ROADMAP.md`](ROADMAP.md)). The tree has been through six security review
+passes; each finding has a regression test named after the defect, under
+`tests/`.
 
 **Verified on real hardware.** Closing and restoring `authorized_default` on
 all five root hubs of the reference laptop. A Kingston DataTraveler 3.0 through
@@ -331,8 +343,10 @@ kernel, and these are the claims most worth distrusting until somebody plugs an
 ATmega32u4 in and watches what happens.
 
 Treat every real-world result as data rather than a guarantee, and report
-anything that surprises you. Known open items are tracked in
-[`CHANGELOG.md`](CHANGELOG.md).
+anything that surprises you. What is not done is listed in
+[`CAPABILITIES.md`](CAPABILITIES.md) §2.2 and §3, the plan to 1.0 is
+[`ROADMAP.md`](ROADMAP.md), and defects found since the freeze are logged in
+[`docs/QA-LOG.md`](docs/QA-LOG.md).
 
 ---
 

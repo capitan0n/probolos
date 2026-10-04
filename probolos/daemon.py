@@ -1416,8 +1416,11 @@ class Probolos:
         if critical:
             # No "always" option here on purpose. Remembering a device that
             # matches an attack pattern is not a choice worth offering in one
-            # keystroke; if it really is a false positive, the user can trust
-            # it deliberately with --trust after understanding why it fired.
+            # keystroke, and trust never overrides a CRITICAL finding anyway.
+            # If a rules.py rule really is a false positive for this hardware,
+            # its severity can be lowered deliberately with --rules; the
+            # analyzer findings (descriptor-drift, previously-rejected,
+            # payload-captured, analyzer-failed:*) are not configurable.
             prompt = ("  This device matches an attack pattern.\n"
                       "  Type the word 'authorize' to allow it, anything else "
                       "to reject: ")

@@ -14,7 +14,10 @@ permissions:
 
 jobs:
   arch:
-    runs-on: ubuntu-latest
+    # A fixed release, as in systemd.yml: ubuntu-latest moves to a new Ubuntu
+    # on its own (26.04 from 2026-10-19), and CI must not turn red with no
+    # change here. Move it on purpose.
+    runs-on: ubuntu-24.04
     # The rolling image on purpose: this job exists to meet the newest Python
     # and pyudev that Arch and Manjaro ship, and a digest pin would defeat it.
     container: archlinux:latest # zizmor: ignore[unpinned-images]

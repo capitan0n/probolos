@@ -14,7 +14,6 @@ env/
 # --- Probolos runtime & state (never commit) ---
 # Audit logs and per-run captures
 *.jsonl
-cerb.jsonl
 # On-disk trust store / ledger (may reveal your real devices' VID:PID/serials)
 ledger.json
 trusted.json

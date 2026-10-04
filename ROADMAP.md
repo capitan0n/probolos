@@ -80,16 +80,16 @@ behaviour is a **feature**, and goes on the post-1.0 list.
 
 ### Phase 0: freeze (this week)
 
-- [ ] **0.1 M** Write the `Unreleased` part of `CHANGELOG.md`, covering:
+- [x] **0.1 M** Write the `Unreleased` part of `CHANGELOG.md`, covering:
   - gate-side "always" (T1);
   - holding devices with no agent, and notices (T2–T4);
   - the CI workflows;
   - the QA tooling;
   - every fix from the reviews.
   Release it as `0.11.0`.
-- [ ] **0.2 M** Add a "Feature freeze" note to the top of `CAPABILITIES.md`,
+- [x] **0.2 M** Add a "Feature freeze" note to the top of `CAPABILITIES.md`,
   and move the §1.2 items into its §3.
-- [ ] **0.3 M** Tag `v0.11.0`: the feature-complete snapshot the thesis
+- [x] **0.3 M** Tag `v0.11.0`: the feature-complete snapshot the thesis
   describes.
 - [ ] **0.4 S** Set up GitHub:
   - labels: `bug`, `security`, `qa`, `docs`, `packaging`, `release`,
@@ -98,23 +98,24 @@ behaviour is a **feature**, and goes on the post-1.0 list.
   - private vulnerability reporting, plus secret scanning with push
     protection;
   - two issue templates. The bug report asks for the distro, kernel,
-    `probolos --version`, desktop and `journalctl -u probolos` output. The
-    security one points to private reporting.
+    Probolos version (release or `git describe`), desktop and
+    `journalctl -u probolos` output. The security one points to private
+    reporting.
 - [ ] **0.5 M** Open one issue for every item in Phase 1.
 
 ### Phase 1: hardening → `1.0.0b1`
 
-- [ ] **1.1 M** Test the gate's refusal paths. Write tests for the `OSError`
+- [x] **1.1 M** Test the gate's refusal paths. Write tests for the `OSError`
   and refusal branches of `gate_server.py`, and the fork/drop/wait error paths
   of `privsep.py` (68% today) and `gate_client.py` (71%). Target: the coverage
   "boundary" (the root-side code plus its protocol, measured by
   `coverage.yml`) at ≥ 90%, up from 80%. Raise the floor in `coverage.yml` as
   it climbs.
-- [ ] **1.2 M** Remove the dead code. `AgentLink.notify_critical` has no
+- [x] **1.2 M** Remove the dead code. `AgentLink.notify_critical` has no
   caller, and the agent's `MSG_CRITICAL` handler still says "Use the
   terminal", which stopped being true when CRITICAL devices became approvable
   with the countdown. Remove the path, or make it true.
-- [ ] **1.3 M** Bring `SECURITY.md` up to date. Add the threat model for:
+- [x] **1.3 M** Bring `SECURITY.md` up to date. Add the threat model for:
   - the gate-side trust write (`REQ_TRUST`): only the gate can write; only a
     device it admitted; only a fingerprint it measured; persistence is all
     a compromised analyzer gains;
@@ -130,17 +131,17 @@ behaviour is a **feature**, and goes on the post-1.0 list.
   beta is enough; a CI job is optional.
 - [ ] **1.6 S** Do a review pass over everything since `0.10.0`, root-side code
   first. Log every finding (§6).
-- [ ] **1.7 S** Leave hardware- and GUI-only modules out of coverage
+- [x] **1.7 S** Leave hardware- and GUI-only modules out of coverage
   (`interrogate.py`, `countdown_dialog.py`), with the reason written next to
   the setting, then re-baseline both floors.
 - [ ] **1.8 S** Package (T6): finish the parked `PKGBUILD`, then build,
   install and uninstall it cleanly on Manjaro.
-- [ ] **1.9 S** Add a release workflow. On a `v*` tag it should:
+- [x] **1.9 S** Add a release workflow. On a `v*` tag it should:
   - build the sdist and wheel;
   - write `SHA256SUMS`;
   - add a build-provenance attestation;
   - create a **draft** pre-release, which you publish yourself.
-- [ ] **1.10 C** Run mypy on the root-side modules.
+- [x] **1.10 C** Run mypy on the root-side modules.
 
 **Exit:** every M item done, and every S item done or consciously moved. CI is
 green. Then bump to `1.0.0b1`, update the changelog, tag it, and publish a
@@ -165,7 +166,8 @@ pre-release.
   - screenshots of the three prompt levels.
 - [ ] **2.4 M** Take the thesis measurements (`CAPABILITIES.md` §3.1), scripted
   and repeatable:
-  - keystrokes that escape before the grab;
+  - keystrokes that escape before the grab (procedure:
+    `testbed/hidexp/EXPERIMENT.md`);
   - detection and miss rates;
   - false positives on ordinary devices;
   - how long each stage takes;

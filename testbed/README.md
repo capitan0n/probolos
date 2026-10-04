@@ -8,7 +8,7 @@ without a Rubber Ducky.
 ## Setup
 
 ```bash
-sudo modprobe dummy_hcd raw_gadget
+sudo modprobe -a dummy_hcd raw_gadget
 ls /sys/class/udc/          # expect dummy_udc.0
 ls -l /dev/raw-gadget       # expect a character device
 ```
@@ -79,6 +79,13 @@ vendor:product:serial are identical but the descriptor hash changed.
 | `overpowered` | `power-exceeds-bus-limit` (WARNING) |
 | `drift-innocent` → `drift-weaponized` | `descriptor-drift` (CRITICAL) |
 
+## The leakage experiment
+
+`hidexp/` builds a real HID keyboard gadget through configfs and types a
+harmless payload through it, to count how many keystrokes reach the session
+before Probolos captures the device. The procedure and the results table are
+in [`hidexp/EXPERIMENT.md`](hidexp/EXPERIMENT.md).
+
 ## If a device will not enumerate
 
 `raw_gadget` is low-level and `dummy_hcd` can wedge if a gadget is left
@@ -86,7 +93,7 @@ half-initialised. Reset with:
 
 ```bash
 sudo rmmod raw_gadget dummy_hcd
-sudo modprobe dummy_hcd raw_gadget
+sudo modprobe -a dummy_hcd raw_gadget
 ```
 
 The spawn tool always releases the gadget on exit, so this is only needed after
@@ -100,7 +107,7 @@ free. Reset the modules:
 
 ```bash
 sudo rmmod raw_gadget dummy_hcd
-sudo modprobe dummy_hcd raw_gadget
+sudo modprobe -a dummy_hcd raw_gadget
 cat /sys/class/udc/dummy_udc.0/state    # want: not attached
 ```
 
