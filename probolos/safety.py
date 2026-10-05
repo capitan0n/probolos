@@ -284,6 +284,9 @@ class Watchdog:
         self._last_beat = time.monotonic()
         self._paused = False
         self._fired = False
+        # Why it fired: the operator's panic file, or a stall. Only a stall is
+        # a failure of the daemon (see daemon.serve).
+        self.panicked = False
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -353,6 +356,7 @@ class Watchdog:
         # a human is exactly when someone reaches for it.
         if self._panic_present():
             self._fired = True
+            self.panicked = True
             return f"panic file {self.policy.panic_file} appeared"
         with self._lock:
             if self._paused:

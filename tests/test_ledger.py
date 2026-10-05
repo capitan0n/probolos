@@ -457,6 +457,7 @@ class RawHashKeptSeparately(unittest.TestCase):
 
     def test_raw_hash_stored_on_entry(self):
         directory = Path(tempfile.mkdtemp(prefix="probolos-raw-"))
+        self.addCleanup(shutil.rmtree, directory, True)
         path = directory / "ledger.json"
         led = ledger_mod.Ledger(path)
         dev = make_kingston_device(storage_device_blob())
@@ -477,6 +478,7 @@ class DriftRuleOnRealScenarios(unittest.TestCase):
 
     def setUp(self):
         self.directory = Path(tempfile.mkdtemp(prefix="probolos-drift-"))
+        self.addCleanup(shutil.rmtree, self.directory, True)
         self.path = self.directory / "ledger.json"
 
     def _drift(self, dev):
@@ -529,6 +531,7 @@ class OldLedgerMigration(unittest.TestCase):
     def _load(self, payload):
         import json
         directory = Path(tempfile.mkdtemp(prefix="probolos-mig-"))
+        self.addCleanup(shutil.rmtree, directory, True)
         path = directory / "ledger.json"
         path.write_text(json.dumps(payload))
         return ledger_mod.Ledger(path)
@@ -573,6 +576,7 @@ class OldLedgerMigration(unittest.TestCase):
         """After the baseline is cleared, the NEXT sighting re-anchors it."""
         import json
         directory = Path(tempfile.mkdtemp(prefix="probolos-relearn-"))
+        self.addCleanup(shutil.rmtree, directory, True)
         path = directory / "ledger.json"
         path.write_text(json.dumps({
             "schema": 1,
@@ -635,6 +639,17 @@ class HistoryDoesNotReplayLedgerEscapes(unittest.TestCase):
         self.assertNotIn("\x1b", out)
         self.assertNotIn("\x07", out)
 
+    def test_an_unreadable_history_is_not_an_empty_one(self):
+        """It printed "History is empty" -- refusals and all, gone."""
+        from probolos import history
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ledger.json")
+            with open(path, "w") as fh:
+                fh.write('{"schema": 1, "entries": {},}')
+            os.chmod(path, 0o600)
+            out = history.show_history(path=path)
+        self.assertIn("could not be read", out)
+
 
 # --------------------------------------------------------------------------
 # 3. The drift baseline
@@ -644,6 +659,7 @@ class DriftBaselineIsNeverAPlaceholder(unittest.TestCase):
 
     def setUp(self):
         self.path = Path(tempfile.mkdtemp(prefix="probolos-audit-")) / "l.json"
+        self.addCleanup(shutil.rmtree, self.path.parent, True)
 
     def _drift(self, dev):
         led = ledger_mod.Ledger(self.path)
@@ -839,10 +855,6 @@ class DescriptorDriftSurvivesRecording(unittest.TestCase):
                          "", "a failure to read must not manufacture drift")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RemovalWaitsForTheDaemon(unittest.TestCase):
     """
     A running daemon keeps the ledger in memory and writes it all back after
@@ -919,3 +931,7 @@ class RemovalWaitsForTheDaemon(unittest.TestCase):
                 daemon_mod.serve(dry_run=False, ledger_path=self.path,
                                  watchdog_timeout=0)
         self.assertEqual(order, ["claim", "load"])
+
+
+if __name__ == "__main__":
+    unittest.main()

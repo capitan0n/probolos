@@ -813,6 +813,7 @@ class LoginctlIsNotResolvedThroughPath(unittest.TestCase):
 
     def setUp(self):
         self.fake = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.fake, True)
         impostor = self.fake / "loginctl"
         impostor.write_text("#!/bin/sh\necho owned\n")
         impostor.chmod(0o755)
@@ -893,6 +894,7 @@ class AHeldQuestionBelongsToADeviceNotAPort(unittest.TestCase):
 
     def test_still_same_device_compares_the_real_inode(self):
         root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
         devdir = root / "3-9"
         devdir.mkdir()
         st = devdir.stat()
@@ -989,7 +991,8 @@ class ThePromptOffersWhatItAccepts(unittest.TestCase):
 
         engine = daemon_mod.Probolos.__new__(daemon_mod.Probolos)
         engine.timeout = timeout
-        engine.trust = (mock.Mock(**{"writable.return_value": writable})
+        engine.trust = (mock.Mock(**{"writable.return_value": writable},
+                                  load_error=None)
                         if has_trust else None)
         engine.agent = None
         engine.observe = 0
@@ -1122,7 +1125,8 @@ class DaemonWaitsForTheNode(unittest.TestCase):
             monitor=session.AlwaysUnlocked(), observe=0, inspect_storage=True)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.dev = types.SimpleNamespace(syspath=Path(tmp.name), name="3-9")
+        self.dev = types.SimpleNamespace(syspath=Path(tmp.name), name="3-9",
+                                         instance_id=(1, 2))
 
     def _run(self, pending):
         with mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
@@ -1170,10 +1174,11 @@ class EveryMediumFailureTakesOnePath(unittest.TestCase):
             monitor=session.AlwaysUnlocked(), observe=0, inspect_storage=True)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.dev = types.SimpleNamespace(syspath=Path(tmp.name), name="3-9")
+        self.dev = types.SimpleNamespace(syspath=Path(tmp.name), name="3-9",
+                                         instance_id=(1, 2))
 
     def _switch_on_fails(self):
-        def refuse(_path, value):
+        def refuse(_path, value, instance=None):
             if value == 1:
                 raise FileNotFoundError(2, "No such file or directory",
                                         self.SYSPATH_LEAK)
@@ -1250,6 +1255,57 @@ class EveryMediumFailureTakesOnePath(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # "Always" under --privsep: the analyzer cannot write trust, the gate can
 # ---------------------------------------------------------------------------
+
+class AlwaysIsNotOfferedOverAStoreThatDidNotLoad(unittest.TestCase):
+    """
+    Direct mode offered "always" over a trust store that had failed to load,
+    and saving it kept only what had been read -- after one stray comma,
+    nothing -- plus the new entry. The gate already refused this case under
+    --privsep.
+    """
+
+    def test_a_corrupt_store_is_left_as_it_is(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trusted.json"
+            path.write_text('{"schema": 1, "devices": {},}')
+            os.chmod(path, 0o600)
+            before = path.read_bytes()
+            store = trust.TrustStore(path)
+            self.assertIsNotNone(store.load_error)
+            engine = daemon_mod.Probolos(observe=0, trust_store=store)
+            self.assertFalse(engine._can_remember())
+            self.assertEqual(path.read_bytes(), before)
+
+
+class TheAnalyzerAsksForARootOwnedStore(unittest.TestCase):
+    """serve() narrows the trust store's owners to root under --privsep."""
+
+    def _owners(self, can_trust):
+        seen = []
+
+        class Store:
+            load_error, devices = "stop here", {}
+
+            def __init__(self, path, owners=None):
+                seen.append(owners)
+
+            def writable(self):
+                return False
+        with mock.patch.object(daemon_mod.trust_mod, "TrustStore", Store), \
+             mock.patch.object(daemon_mod.sysfs, "backend_can_trust",
+                               return_value=can_trust), \
+             mock.patch.object(daemon_mod, "pyudev", None), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                daemon_mod.serve(dry_run=True, trust_path=Path("/x/t.json"))
+        return seen
+
+    def test_root_only_under_privsep(self):
+        self.assertEqual(self._owners(True), [(0,)])
+
+    def test_unchanged_in_direct_mode(self):
+        self.assertEqual(self._owners(False), [None])
+
 
 class AlwaysUnderPrivsep(unittest.TestCase):
     """
@@ -2001,7 +2057,8 @@ class ACriticalDeviceWithNoAgent(_NobodyToAskCase):
         # Refused once before, so previously-rejected makes it CRITICAL.
         self.ledger.record(self.dev, "user rejected")
         self.store = mock.Mock(**{"is_trusted.return_value": False,
-                                  "writable.return_value": True})
+                                  "writable.return_value": True},
+                               load_error=None)
         self.now = 1000.0
 
     def engine(self, **options):
@@ -2119,6 +2176,140 @@ class TerminalDetection(unittest.TestCase):
         with os.fdopen(os.dup(slave)) as tty, mock.patch("sys.stdin", tty):
             self.assertTrue(daemon_mod.Probolos._has_terminal())
 
+
+class ShortcutsNeverOutrankACriticalFinding(unittest.TestCase):
+    """
+    Contracts the suite did not pin down: mutating any of them left every
+    test passing. Trust decides only whether to ask about a device with no
+    troubling finding; a CRITICAL prompt on a terminal takes the typed word
+    `authorize`, never `y`; stage 4 always ends with the device re-blocked;
+    and --dry-run writes nothing, even for a device it would let through.
+    """
+
+    def setUp(self):
+        self.dev = _device()
+        self.critical = rules.Finding(rule_id="t", severity=rules.Severity.CRITICAL,
+                                      title="t", explanation="t")
+
+    def _engine(self, **options):
+        options.setdefault("observe", 0)
+        options.setdefault("inspect_storage", False)
+        return daemon_mod.Probolos(monitor=session.FixedState(False),
+                                   lock_policy=session.POLICY_IGNORE,
+                                   **options)
+
+    def _plug(self, engine, typed="", findings=()):
+        with mock.patch.object(daemon_mod.sysfs, "admit_device") as admit, \
+                mock.patch.object(daemon_mod.sysfs, "set_authorized") as written, \
+                mock.patch.object(daemon_mod.analyzers, "run",
+                                  return_value=list(findings)), \
+                mock.patch.object(engine, "_load_with_retry",
+                                  return_value=self.dev), \
+                mock.patch.object(daemon_mod.report, "render", return_value=""), \
+                mock.patch.object(daemon_mod.report, "one_liner",
+                                  return_value="x"), \
+                mock.patch("sys.stdin", io.StringIO(typed)), \
+                redirect_stdout(io.StringIO()):
+            engine._on_add(str(self.dev.syspath))
+        return admit, written
+
+    def test_a_remembered_device_with_a_critical_finding_is_asked(self):
+        store = mock.Mock(load_error=None, **{"is_trusted.return_value": True,
+                                              "writable.return_value": False})
+        admit, _ = self._plug(self._engine(trust_store=store), typed="",
+                              findings=[self.critical])
+        admit.assert_not_called()
+
+    def test_a_remembered_device_with_no_finding_goes_through(self):
+        """GUARD: the shortcut itself still works."""
+        store = mock.Mock(load_error=None, **{"is_trusted.return_value": True,
+                                              "writable.return_value": False})
+        admit, _ = self._plug(self._engine(trust_store=store))
+        admit.assert_called_once_with(self.dev)
+
+    def test_y_does_not_pass_a_critical_terminal_prompt(self):
+        for typed in ("y\n", "yes\n", "a\n"):
+            admit, _ = self._plug(self._engine(), typed=typed,
+                                  findings=[self.critical])
+            admit.assert_not_called()
+
+    def test_the_word_authorize_does(self):
+        admit, _ = self._plug(self._engine(), typed="authorize\n",
+                              findings=[self.critical])
+        admit.assert_called_once_with(self.dev)
+
+    def test_stage_4_always_ends_with_the_device_blocked(self):
+        engine = self._engine(inspect_storage=True)
+        for outcome in (storage.MediumReport(device="/dev/sda", scheme="none"),
+                        RuntimeError("the scan blew up")):
+            with self.subTest(outcome=outcome), \
+                    mock.patch.object(daemon_mod.sysfs, "activate_device"), \
+                    mock.patch.object(daemon_mod.sysfs, "set_authorized") as written, \
+                    mock.patch.object(daemon_mod.storage, "find_block_devices",
+                                      return_value=["/dev/sda"]), \
+                    mock.patch.object(daemon_mod.sysfs, "block_node_pending",
+                                      return_value=False), \
+                    mock.patch.object(daemon_mod.storage, "inspect_safely",
+                                      side_effect=[outcome]), \
+                    redirect_stdout(io.StringIO()):
+                try:
+                    engine._inspect_medium(self.dev)
+                except RuntimeError:
+                    pass
+            self.assertEqual(written.call_args_list[-1],
+                             mock.call(self.dev.syspath, 0))
+
+    def test_dry_run_writes_nothing_even_for_a_protected_device(self):
+        self.dev.removable = "fixed"
+        ledger = mock.Mock()
+        engine = self._engine(dry_run=True, ledger=ledger,
+                              policy=safety.SafetyPolicy(allowed_ports=["3-9"]))
+        admit, written = self._plug(engine, typed="y\n")
+        admit.assert_not_called()
+        written.assert_not_called()
+        ledger.save.assert_not_called()
+        ledger.record.assert_not_called()
+
+class AStallTheWatchdogEndedIsAFailure(unittest.TestCase):
+    """
+    After the watchdog reopened the gate the process exited 0, so systemd's
+    Restart=on-failure never started it again: the gate stayed open and the
+    unit read "inactive (dead)". A stall now ends in a failure status; the
+    panic file, the operator's own off switch, still ends normally.
+    """
+
+    def _serve(self, *, panicked):
+        class Dog:
+            def __init__(self, *_a, **_k):
+                self.fired, self.panicked = True, panicked
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        policy = safety.SafetyPolicy(panic_file=Path(tmp.name) / "panic")
+        gate_cm = mock.MagicMock()
+        with mock.patch.object(daemon_mod, "pyudev", object()), \
+             mock.patch.object(daemon_mod.gate, "AuthorizationGate",
+                               return_value=gate_cm), \
+             mock.patch.object(daemon_mod.safety, "Watchdog", Dog), \
+             mock.patch.object(daemon_mod.Probolos, "snapshot"), \
+             mock.patch.object(daemon_mod.Probolos, "run"), \
+             redirect_stdout(io.StringIO()):
+            daemon_mod.serve(policy=policy, watchdog_timeout=60,
+                             lock_policy=session.POLICY_IGNORE)
+
+    def test_a_stall_exits_with_a_failure(self):
+        with self.assertRaises(SystemExit) as ended:
+            self._serve(panicked=False)
+        self.assertNotIn(ended.exception.code, (0, None))
+
+    def test_the_panic_file_ends_normally(self):
+        self._serve(panicked=True)
 
 if __name__ == "__main__":
     unittest.main()

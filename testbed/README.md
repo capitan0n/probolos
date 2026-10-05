@@ -48,7 +48,7 @@ Terminal 2 — present the attack:
 sudo python -m testbed.spawn badusb
 ```
 
-Terminal 1 should show `!! CRITICAL: Storage device that can also type`.
+Terminal 1 should show `✖ CRITICAL · Storage device that can also type`.
 
 Start with `--dry-run` on the Probolos side: a blocked device waiting for your
 answer is frozen mid-enumeration, which can stall the gadget. Once you have seen

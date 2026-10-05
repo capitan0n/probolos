@@ -5,13 +5,21 @@ import stat
 from pathlib import Path
 
 
-def open_directory(path, create=False, secure=False):
+def _owners(owners):
+    """The uids a secure check accepts: root and this process, by default."""
+    return (0, os.geteuid()) if owners is None else tuple(owners)
+
+
+def open_directory(path, create=False, secure=False, owners=None):
     """Open a directory without following a symlink in ANY component.
 
     Keep the parent descriptor until the child is open. A rename or symlink
     replacement cannot redirect a later chmod/chown to another directory.
     Callers decide which dedicated directories may be created or modified.
+    With `secure`, every component must be owned by one of `owners` (root
+    and this process unless given) and not writable by group or others.
     """
+    allowed = _owners(owners)
     path = Path(os.path.abspath(path))
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path.anchor, flags)
@@ -28,7 +36,7 @@ def open_directory(path, create=False, secure=False):
             if secure:
                 st = os.fstat(fd)
                 sticky_root = st.st_uid == 0 and st.st_mode & stat.S_ISVTX
-                if (st.st_uid not in (0, os.geteuid())
+                if (st.st_uid not in allowed
                         or (st.st_mode & 0o022 and not sticky_root)):
                     raise OSError("untrusted or writable ancestor directory")
         return fd
@@ -37,16 +45,17 @@ def open_directory(path, create=False, secure=False):
         raise
 
 
-def read_json_file(path, trusted=False):
+def read_json_file(path, trusted=False, owners=None):
     """Bound state input, reject FIFOs, and verify the inode actually read."""
     import json
     path = Path(path)
-    directory_fd = open_directory(path.parent, secure=trusted)
+    directory_fd = open_directory(path.parent, secure=trusted, owners=owners)
     fd = None
     try:
         fd = open_regular_at(directory_fd, path.name)
         st = os.fstat(fd)
-        if trusted and (st.st_uid not in (0, os.geteuid()) or st.st_mode & 0o022):
+        if trusted and (st.st_uid not in _owners(owners)
+                        or st.st_mode & 0o022):
             raise OSError("untrusted state file owner or permissions")
         with os.fdopen(fd, "rb") as fh:
             fd = None

@@ -432,7 +432,10 @@ class Agent:
     def _handle(self, line: bytes) -> None:
         try:
             message = json.loads(line.decode())
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            # RecursionError: a few KB of "[" nests deeper than json will go,
+            # and uncaught it ended the agent. The daemon side already
+            # catches it (agentlink).
             return
 
         if not isinstance(message, dict):

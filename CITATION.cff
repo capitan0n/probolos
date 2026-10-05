@@ -8,6 +8,7 @@ type: software
 authors:
   - name: capitan0n
     alias: capitan0n
+license: GPL-3.0-or-later
 repository-code: "https://github.com/capitan0n/probolos"
 url: "https://github.com/capitan0n/probolos"
 abstract: >-
@@ -17,7 +18,7 @@ abstract: >-
   checks the device's declared identity for inconsistencies, can observe its
   input behaviour in a grabbed quarantine and read its partition metadata
   without mounting, and remembers devices across sessions to detect descriptor
-  drift. The privileged half runs as a minimal root gate, separate from an
+  drift. The privileged half runs as a separate root gate, apart from an
   unprivileged analyzer.
 keywords:
   - usb

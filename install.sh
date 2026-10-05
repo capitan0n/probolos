@@ -19,6 +19,9 @@ PREFIX=/opt/probolos
 BIN=/usr/local/bin/probolos
 PY=/usr/bin/python3
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Out of whatever directory sudo was run in: python as root must not import
+# a module that happens to sit there (and every path below is absolute).
+cd /
 UNIT=/etc/systemd/system/probolos.service
 DROPIN_DIR=/etc/systemd/system/probolos.service.d
 AGENT_UNIT=/etc/systemd/user/probolos-agent.service
@@ -34,7 +37,7 @@ action=install
 while [ $# -gt 0 ]; do
     case "$1" in
         --uninstall) action=uninstall ;;
-        --user) shift; user="${1:-}" ;;
+        --user) [ $# -ge 2 ] || die "--user needs a NAME"; shift; user="$1" ;;
         -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
@@ -49,11 +52,17 @@ user_systemctl() {
 
 install_all() {
     [ -n "$user" ] || die "no desktop account: run with sudo from your own account, or pass --user NAME"
-    [ "$user" != root ] || die "the desktop account must not be root (pass --user NAME)"
-    id "$user" >/dev/null 2>&1 || die "no such user: $user"
+    # Looked up, and replaced by the name the system knows: `id` also takes a
+    # number, so `--user 0` passed a test for the NAME root, and the daemon
+    # then failed to look the account up and restarted forever.
+    local entry
+    entry="$(getent passwd -- "$user")" || die "no such user: $user"
+    user="${entry%%:*}"
+    [ "$(printf '%s' "$entry" | cut -d: -f3)" -ne 0 ] \
+        || die "the desktop account must not be root (pass --user NAME)"
     [ -f "$SRC/probolos/__main__.py" ] || die "run this from the probolos source tree"
     [ -x "$PY" ] || die "$PY not found"
-    "$PY" -c 'import pyudev' 2>/dev/null || die "pyudev is missing. Install it:
+    "$PY" -I -c 'import pyudev' 2>/dev/null || die "pyudev is missing. Install it:
     Arch/Manjaro:   sudo pacman -S python-pyudev
     Debian/Ubuntu:  sudo apt install python3-pyudev
     Fedora:         sudo dnf install python3-pyudev"
@@ -72,13 +81,28 @@ sys.exit(0 if instance.running() else 1)' "$SRC" 2>/dev/null; then
 
     # The code. Root-owned and writable by nobody else: whoever can write the
     # code a root service runs has root.
-    rm -rf "$PREFIX.new"
+    rm -rf "$PREFIX.new" "$PREFIX.old"
     mkdir -p "$PREFIX.new"
     cp -r "$SRC/probolos" "$PREFIX.new/"
+    # Regular files and directories only, checked in the root-owned copy so
+    # nothing can change between the check and the use. cp -r copies a
+    # symlink as a symlink, and chown/chmod -R leave its target alone: one in
+    # the checkout (or the package directory itself being one) left the root
+    # service running code its owner could still edit.
+    if [ -n "$(find "$PREFIX.new" ! -type f ! -type d -print -quit)" ]; then
+        rm -rf "$PREFIX.new"
+        die "$SRC/probolos holds a symlink or special file; copy the tree without it"
+    fi
     find "$PREFIX.new" -name __pycache__ -prune -exec rm -rf {} +
-    rm -rf "$PREFIX"
+    chown -R root:root "$PREFIX.new"
+    chmod -R u=rwX,go=rX "$PREFIX.new"
+    # Swapped by two renames rather than delete-then-move, so the running
+    # service is without its code for as short a time as possible.
+    if [ -e "$PREFIX" ]; then mv "$PREFIX" "$PREFIX.old"; fi
     mv "$PREFIX.new" "$PREFIX"
-    "$PY" -m compileall -q "$PREFIX" >/dev/null || true
+    rm -rf "$PREFIX.old"
+    "$PY" -I -m compileall -q "$PREFIX" >/dev/null || true
+    # Again for the bytecode just written, whatever root's umask made it.
     chown -R root:root "$PREFIX"
     chmod -R u=rwX,go=rX "$PREFIX"
 
@@ -152,7 +176,11 @@ uninstall_all() {
     user_systemctl stop probolos-agent.service || true
 
     rm -f "$UNIT" "$AGENT_UNIT"
-    rm -rf "$DROPIN_DIR" "$AGENT_DROPIN_DIR" "$PREFIX" "$PREFIX.new"
+    # Only our own drop-in: an override.conf from `systemctl edit` is the
+    # administrator's, and goes only if it is the last thing there.
+    rm -f "$DROPIN_DIR/install.conf" "$AGENT_DROPIN_DIR/install.conf"
+    rmdir "$DROPIN_DIR" "$AGENT_DROPIN_DIR" 2>/dev/null || true
+    rm -rf "$PREFIX" "$PREFIX.new" "$PREFIX.old"
     # Only our own wrapper, never someone else's file at that path.
     if [ -f "$BIN" ] && grep -qF "$MARKER" "$BIN"; then
         rm -f "$BIN"

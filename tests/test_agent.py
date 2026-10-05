@@ -717,6 +717,28 @@ class CountdownDialogs(unittest.TestCase):
         with mock.patch.object(run, "run", return_value=mock.Mock(returncode=0)):
             self.assertIs(b.notice("t", "x", 10), True)
 
+    def test_a_notice_that_died_is_not_one_somebody_closed(self):
+        """
+        kdialog and zenity notice() read every exit as "closed", so a
+        countdown window that died at once ended as a refusal nobody made.
+        """
+        from probolos import dialogs
+        zenity = dialogs.ZenityBackend()
+        zenity._binary = "/usr/bin/zenity"
+        cases = ((self.backend(), ((0, True), (-6, None), (254, None),
+                                   (255, None))),
+                 (zenity, ((0, True), (1, True), (255, None), (-11, None))))
+        for backend, outcomes in cases:
+            for code, expected in outcomes:
+                with mock.patch.object(dialogs.subprocess, "run",
+                                       return_value=mock.Mock(returncode=code)):
+                    self.assertIs(backend.notice("t", "x", 10), expected,
+                                  f"{backend.name} exit {code}")
+                    self.assertIs(
+                        backend.confirm_countdown("t", "x", "A", "N", 10, 60),
+                        False if expected else None,
+                        f"{backend.name} exit {code}")
+
     def test_tkinter_notice_outcomes(self):
         """The base class raised NotImplementedError for tkinter, so a
         tkinter-only desktop with no notification server was told nothing."""
@@ -794,12 +816,92 @@ class CountdownDialogs(unittest.TestCase):
                                    return_value=mock.Mock(returncode=code)):
                 self.assertIsNone(b.choose("t", "x", "o", "a", "n", 5))
                 self.assertIsNone(b.confirm("t", "x", "y", "n", 5))
-        answers = {10: dialogs.CHOICE_ONCE, 12: dialogs.CHOICE_ALWAYS,
-                   11: dialogs.CHOICE_NO}
-        for code, expected in answers.items():
-            with mock.patch.object(dialogs.subprocess, "run",
-                                   return_value=mock.Mock(returncode=code)):
-                self.assertEqual(b.choose("t", "x", "o", "a", "n", 5), expected)
+        # Yes then Yes is "always"; Yes then No is "once"; No is "no", and a
+        # crash at the second question is still no decision.
+        sequences = (((10, 10), dialogs.CHOICE_ALWAYS),
+                     ((10, 11), dialogs.CHOICE_ONCE),
+                     ((11,), dialogs.CHOICE_NO),
+                     ((10, 1), None))
+        for codes, expected in sequences:
+            with mock.patch.object(
+                    dialogs.subprocess, "run",
+                    side_effect=[mock.Mock(returncode=c) for c in codes]):
+                self.assertEqual(b.choose("t", "x", "o", "a", "n", 5),
+                                 expected, f"exits {codes}")
+
+    def _tk_choose(self, *presses):
+        """
+        choose() run through the backend's own dialog scripts, against a
+        stub tkinter whose askyesno() returns `presses` in order: True for
+        the button labelled Yes, False for No, an exception for a tk that
+        crashed. What reaches the daemon for each button actually pressed.
+        """
+        import sys
+        import types
+        from probolos import dialogs
+        queue = list(presses)
+        shown = []
+
+        def ask(title, text, **_kw):
+            shown.append(text)
+            press = queue.pop(0)
+            if isinstance(press, Exception):
+                raise press
+            return press
+
+        def run(argv, timeout, capture_output):
+            self.assertEqual(argv[1:3], ["-I", "-c"])
+            messagebox = types.SimpleNamespace(NO="no", askyesno=ask)
+            tk = types.SimpleNamespace(Tk=mock.Mock(), messagebox=messagebox)
+            with mock.patch.dict(sys.modules, {"tkinter": tk,
+                                               "tkinter.messagebox": messagebox}), \
+                 mock.patch.object(sys, "argv", ["-c", *argv[4:]]):
+                try:
+                    # The backend's own script, run against the stub.
+                    exec(compile(argv[3], "<tk>", "exec"), {})  # noqa: S102
+                except SystemExit as exc:
+                    return mock.Mock(returncode=exc.code)
+                except Exception:      # what python -c exits with on a crash
+                    return mock.Mock(returncode=1)
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(dialogs.subprocess, "run", side_effect=run):
+            choice = dialogs.TkinterBackend().choose(
+                "Probolos", "A new device.\n\nAllow it?", "Allow once",
+                "Always allow", "Keep blocked", 30)
+        return choice, shown, queue
+
+    def test_tk_no_to_allow_it_keeps_the_device_blocked(self):
+        """
+        The tk fallback answered "Allow it?" with Yes/No/Cancel and mapped
+        No to "Always allow": the button that reads as a refusal admitted
+        the device and trusted it for good.
+        """
+        from probolos import dialogs
+        choice, shown, _ = self._tk_choose(False)
+        self.assertEqual(choice, dialogs.CHOICE_NO)
+        self.assertEqual(len(shown), 1, "no second question after a No")
+        self.assertIn("No: Keep blocked", shown[0])
+
+    def test_tk_always_needs_a_yes_to_remember_it(self):
+        from probolos import dialogs
+        cases = (((True, True), dialogs.CHOICE_ALWAYS),
+                 ((True, False), dialogs.CHOICE_ONCE),
+                 ((True, RuntimeError("display gone")), None),
+                 ((RuntimeError("no display"),), None))
+        for presses, expected in cases:
+            choice, shown, left = self._tk_choose(*presses)
+            self.assertEqual(choice, expected, presses)
+            self.assertEqual(left, [], presses)
+            if len(shown) == 2:
+                self.assertIn("Remember this device?", shown[1])
+
+    def test_deeply_nested_json_does_not_end_the_agent(self):
+        """A few KB of "[" raised RecursionError out of _handle."""
+        from probolos import agent as agent_mod
+        agent = agent_mod.Agent.__new__(agent_mod.Agent)
+        agent.log = lambda *a: None
+        agent._handle(b"[" * 100_000)
 
     def test_a_failed_countdown_window_falls_back_to_the_main_dialog(self):
         from probolos import agent as agent_mod

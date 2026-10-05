@@ -214,7 +214,8 @@ def _run_analyzer(analyzer_main, client) -> int:
 
 
 def start(analyzer_main, drop_to: str = "nobody", log=print,
-          state_paths=(), watch_media: bool = False, trust_path=None) -> int:
+          state_paths=(), watch_media: bool = False, trust_path=None,
+          close_in_child=()) -> int:
     """
     Fork the gate and the analyzer.
 
@@ -230,6 +231,11 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     `trust_path` is where the gate writes "always" (None under --no-trust).
     Root side for the same reason: it is the one file the gate writes, so
     which file that is must not be something the analyzer gets to say.
+
+    `close_in_child` are descriptors the root process holds that the analyzer
+    must not inherit: the one-gate-per-machine lock (instance.py). O_CLOEXEC
+    acts at exec(), not at fork(), so the analyzer held it too and could
+    flock(LOCK_UN) it, letting a second gate start beside this one.
     """
     if os.getuid() != 0:
         raise PrivsepError(
@@ -308,6 +314,11 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
             except (TypeError, ValueError, OSError):
                 pass
         parent_sock.close()
+        for fd in close_in_child:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         # A session of its own, so the terminal is no longer its CONTROLLING
         # terminal. The analyzer keeps the inherited stdin/stdout -- the
         # terminal prompt needs them -- and on its controlling tty any

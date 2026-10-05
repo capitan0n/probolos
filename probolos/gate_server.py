@@ -863,12 +863,11 @@ class GateServer:
         """
         One sysfs text attribute, read as sysfs.read_attr reads it.
 
-        Text mode with the default decoding, then strip(), so the value is the
-        one the analyzer got -- but relative to a pinned directory, with
-        O_NOFOLLOW, and bounded. None when it cannot be read, as read_attr
-        answers. Text that does not decode raises ValueError, as it does in
-        read_attr: the analyzer then has no device and no key, so the caller
-        must not produce one either.
+        UTF-8 with replacement, then strip(), so the value is the one the
+        analyzer got -- but relative to a pinned directory, with O_NOFOLLOW,
+        and bounded. None when it cannot be read, as read_attr answers. Both
+        sides decode the same way whatever the locale: read_attr used to
+        raise on text the locale could not decode, and this mirrored it.
         """
         try:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -876,10 +875,11 @@ class GateServer:
         except OSError:
             return None
         try:
-            with os.fdopen(fd) as fh:
-                return fh.read(_ATTR_LIMIT).strip()
+            with os.fdopen(fd, "rb") as fh:
+                raw = fh.read(_ATTR_LIMIT)
         except OSError:
             return None
+        return raw.decode("utf-8", errors="replace").strip()
 
     @classmethod
     def _fingerprint_at(cls, directory_fd: int) -> Optional[tuple]:

@@ -769,6 +769,7 @@ class OnlyWholeUsbDisksAreEverOpened(unittest.TestCase):
 
     def _tree(self, *names):
         root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
         block = root / "host0" / "target" / "block"
         block.mkdir(parents=True)
         for name in names:

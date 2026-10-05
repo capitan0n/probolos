@@ -85,6 +85,36 @@ These are real and are not hidden:
 Startup preparation and protocol/cleanup code also belong to the privileged
 boundary. A dedicated service account is preferable to shared `nobody`.
 
+**Any process running as `nobody` can open the gate (open).** The analyzer's
+uid is the shared `nobody` by default, so any other process with that uid may
+signal it. When the analyzer dies the gate does what it does for every
+analyzer exit: re-blocks what it switched on and sets `authorized_default`
+back to 1 on every hub. The service then restarts after `RestartSec=5`, and
+devices attached in between are admitted by the kernel and become part of the
+next run's untouched baseline. Killing the analyzer after every restart keeps
+the gate open most of the time; stopping it (`SIGSTOP`) instead freezes the
+prompts with the gate closed. Precondition: code execution as `nobody`.
+Mitigation today: `--privsep-user` with a dedicated account that nothing else
+uses (the shipped unit does not do this yet, and it is untested there). The
+fix -- telling an analyzer that exited from one that was killed, and keeping
+the hubs closed for the second -- changes the restore policy and is left for
+the beta.
+
+**The analyzer's descendants can outlive the gate (open).** The gate reaps
+the analyzer it forked, not processes that analyzer forked in turn. A
+compromised analyzer can leave a `nobody` process behind that keeps the
+operator's terminal open after Probolos has exited and reads what is typed
+next there, or that holds the gate's socket so the gate never sees the
+analyzer go. Under the systemd unit `KillMode=control-group` ends every
+process in the unit; a run from a terminal has no such backstop. The fix is a
+subreaper in the gate that kills what is left of the analyzer's tree.
+
+**Temporary activation is bound to the inspected instance.** Stage 3 and 4
+switch a device on by the kernel directory instance the identity checks read,
+in both modes (`sysfs.activate_device`), as final admission already was. They
+used to go by path: a device that re-enumerated at the same port in between
+was switched on in its place, for stage 4 with no input grab.
+
 **Temporary activation and admission are different operations.** The gate can
 open input/block nodes belonging to a blocked peripheral or to the same device
 instance it temporarily activated. Temporary open permission expires after
@@ -206,9 +236,8 @@ group-owned by the desktop user's group, writable by both.
 
 Write permission on a directory is the right to unlink and replace any file
 inside it, whatever that file's own owner and mode. So every member of the
-desktop user's group — and every process running as the shared `nobody`
-account that owns the directory — could unlink `agent.sock` and bind its own
-listener at that path. The real agent would then connect to *that* listener, be
+desktop user's group could unlink `agent.sock` and bind its own listener at
+that path. The real agent would then connect to *that* listener, be
 asked its questions by it, and hand its answers to it. `SO_PEERCRED` does not
 help: the attacker is never a client of ours at all.
 
@@ -218,6 +247,16 @@ therefore `2750` — the setgid bit still makes the socket inherit the desktop
 group, and the `0660` socket still lets that group open it. Dropping group
 write costs nothing: the analyzer owns the directory and still creates, chmods
 and unlinks its own socket there.
+
+**Still open: the directory's owner.** `2750` removed the group's write
+permission, not the owner's, and the owner is the analyzer's account --
+`nobody` by default, which other processes share. Any process running as
+`nobody` can still unlink `agent.sock` and listen in its place; the agent does
+not check who it connected to, so it would show that process's questions.
+Answers to them admit nothing (the real socket still checks `SO_PEERCRED`),
+but the real analyzer loses its agent and holds devices meanwhile. A dedicated
+`--privsep-user` account closes this; so would a root-owned directory with the
+socket bound by root before the drop.
 
 Two smaller defects on the same path are fixed with it. The socket's mode was
 set with `os.chmod` on a bare, operator-supplied path (`--agent-socket`), which
@@ -252,7 +291,7 @@ under `--privsep` the root gate writes "always" on its behalf (next section).
 **Writes never follow a symlink.** State files are written with
 `O_NOFOLLOW | O_CREAT | O_EXCL` and renamed into place. Previously a `nobody`
 process could pre-plant `trusted.tmp` as a symlink to, say, a file under
-`/etc/cron.d`, and the next root-run save (`sudo … --forget N`) would write the
+`/etc/cron.d`, and the next root-run save (`sudo … --remove-trusted N`) would write the
 store's JSON through it. Stores are created mode `0600`. Under `--privsep` the
 trust store is the exception: the launcher makes an existing one `0644` and the
 gate creates a new one `0644`, so the analyzer can read back what was
@@ -342,9 +381,16 @@ plug of that device CRITICAL ("previously rejected").
   error exit (255), a Tk window that crashed, and a timeout are all no
   decision. They used to read as "Keep blocked" and be recorded as a refusal
   nobody made. A shown question nobody answered is recorded as "no answer",
-  is not re-queued, and the person is told to replug it. Remaining limit: GTK
-  exits 1 when it loses the display, which zenity reports exactly like
-  Cancel; that case is still read as a refusal.
+  is not re-queued, and the person is told to replug it. The countdown's
+  first window follows the same rule: one that died rather than being
+  closed is no decision (it used to end the countdown as a refusal).
+  Remaining limit: GTK exits 1 when it loses the display, which zenity
+  reports exactly like Cancel; that case is still read as a refusal.
+- **The tkinter fallback asks twice.** A Tk message box labels its buttons
+  Yes/No/Cancel whatever it asks, and "No" used to mean "Always allow" under
+  a question ending "Allow it?". It now asks "Allow it?" (No keeps the device
+  blocked) and then, separately, "Remember this device?" (No, the default,
+  allows it once).
 
 ## Device strings are treated as hostile input
 
@@ -491,7 +537,7 @@ independent layers:
 | Port allowlist | `--allow-port` keeps a rescue port always open |
 | Watchdog | daemon alive but stuck; reopens the gate |
 | Panic file | `sudo touch /run/probolos.panic` from another TTY or over SSH |
-| Privilege separation | analyzer compromise cannot escalate to root |
+| Privilege separation | bounds what an analyzer compromise can make root do (see "Known weaknesses") |
 
 Plus the gate's own restore paths (context manager, signal handlers, `atexit`)
 which cover a daemon that dies, and `--release` for manual recovery.
@@ -501,8 +547,11 @@ disconnects, including after an analyzer crash. Killing the root gate too,
 kernel failures, or failed sysfs writes still require manual recovery:
 
 ```bash
-echo 1 | sudo tee /sys/bus/usb/devices/usb1/authorized_default
+for hub in /sys/bus/usb/devices/usb*/authorized_default; do echo 1 | sudo tee "$hub"; done
 ```
+
+That only affects devices attached from then on: replug anything still
+blocked, or authorize it with `echo 1 | sudo tee /sys/bus/usb/devices/<name>/authorized`.
 
 The panic file must be **root-owned, in a root-owned directory**, and is checked
 with `lstat` so a symlink or hardlink planted at that path is refused. An off

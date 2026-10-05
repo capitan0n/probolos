@@ -195,4 +195,11 @@ def show_history(verbose: bool = False, path=None) -> str:
     led = ledger_mod.Ledger(path) if path else ledger_mod.Ledger()
     # Ledger loads itself in __init__; we do not call load() again.
     entries = list(led.entries.values()) if hasattr(led, "entries") else []
-    return format_table(entries, verbose=verbose)
+    table = format_table(entries, verbose=verbose)
+    # A ledger that did not load used to print "History is empty", which
+    # reads as nothing ever having been seen -- refusals included.
+    error = getattr(led, "load_error", None)
+    if error:
+        return (f"[!] The history file could not be read: {_clean(str(error))}\n"
+                f"    Only what could be read is shown.\n" + table)
+    return table

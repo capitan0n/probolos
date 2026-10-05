@@ -225,8 +225,11 @@ class DeferredBind:
     """
 
     def __init__(self, usb_syspath: Path, log: Callable[[str], None] = print,
-                 dry_run: bool = False):
+                 dry_run: bool = False, instance: Optional[tuple] = None):
         self.syspath = usb_syspath
+        # The kernel directory instance that was inspected. With it, the
+        # switch-on lands only on that instance (sysfs.activate_device).
+        self.instance = instance
         self.log = log
         self.dry_run = dry_run
         self.interfaces: List[Path] = []      # discovered AFTER authorization
@@ -268,7 +271,7 @@ class DeferredBind:
             return
 
         try:
-            sysfs.set_authorized(self.syspath, 1)
+            sysfs.set_authorized(self.syspath, 1, instance=self.instance)
             self._device_authorized = True
 
             # The interfaces exist now -- this is the whole point, and the

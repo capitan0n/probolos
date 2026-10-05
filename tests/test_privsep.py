@@ -13,6 +13,7 @@ import pty
 import select
 import signal
 import socket
+import shutil
 import tempfile
 import termios
 import threading
@@ -610,6 +611,7 @@ class GateScopeCheckIsNotRedirectable(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
         self.devdir = self.root / "1-1"
         self.devdir.mkdir()
 
@@ -870,7 +872,11 @@ class SysfsWritesTruncate(unittest.TestCase):
 
         from probolos import sysfs
 
-        self.assertIn("O_TRUNC", inspect.getsource(sysfs._DirectBackend.admit))
+        # admit() and an instance-bound activation share the one write.
+        self.assertIn("_write_to_instance",
+                      inspect.getsource(sysfs._DirectBackend.admit))
+        self.assertIn("O_TRUNC",
+                      inspect.getsource(sysfs._DirectBackend._write_to_instance))
 
 
 class AnalyzerChildAlwaysEndsInAnExitStatus(unittest.TestCase):
@@ -1219,6 +1225,22 @@ class GateAdmission(unittest.TestCase):
         self.assertIsNone(self.server._open_scope_parent_of(self.node))
         self.assertFalse(self.temporary(0).ok)
 
+    def test_temporary_activation_refuses_a_different_instance(self):
+        """
+        Stage 3 and 4 switch a device on by its inspected instance. A device
+        that re-enumerated at the same port is a different directory inode,
+        and the gate must not switch it on in the inspected one's place.
+        """
+        stale = protocol.Request(protocol.REQ_AUTHORIZE, str(self.usb), 1,
+                                 (0, 0))
+        resp = self.server._do_authorize(stale)
+        self.assertEqual(resp.status, protocol.DENIED)
+        self.assertIn("changed since inspection", resp.detail)
+        self.assertEqual((self.usb / "authorized").read_text().strip(), "0")
+        current = protocol.Request(protocol.REQ_AUTHORIZE, str(self.usb), 1,
+                                   self.server._instance(self.usb))
+        self.assertTrue(self.server._do_authorize(current).ok)
+
     def test_interface_ancestor_is_skipped_to_find_the_usb_device(self):
         intf = self.usb / "1-1:1.0"
         intf.mkdir()
@@ -1542,6 +1564,13 @@ class GateFingerprintIsTheAnalyzersKey(_GateTrustCase):
         self.assertEqual(key, trust.key_for(sysfs.load_device(self.usb)))
         self.assertIn(textsafe.sanitize(raw).text, key)
         self.assertNotIn("\x1b", key)
+
+    def test_equal_when_the_serial_is_not_utf8(self):
+        """Both halves decode the same way; neither raises on it any more."""
+        (self.usb / "serial").write_bytes(b"SN\xff\xfe42\n")
+        key = self._gate_key()[0]
+        self.assertIsNotNone(key)
+        self.assertEqual(key, trust.key_for(sysfs.load_device(self.usb)))
 
     def test_equal_when_there_is_no_serial(self):
         (self.usb / "serial").unlink()
