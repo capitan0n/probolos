@@ -1,13 +1,14 @@
 # Probolos
 
-> ⚠️ **Alpha — under active development.** This is an early, research-stage
+> **Alpha — under active development.** This is an early, research-stage
 > project. The admission path has been exercised on real hardware and has
 > automated regression coverage, but **it has never been run against an actual
 > attack**: no BadUSB fixture (ATmega32u4, Raspberry Pi Zero, O.MG cable) has
 > been put through the behavioural quarantine, so the claim that matters most
 > is the one with the least evidence behind it. The feature set is frozen at
 > 0.11.0 on the way to 1.0: until then only fixes, tests and documentation go
-> in ([`ROADMAP.md`](ROADMAP.md)).
+> in ([`ROADMAP.md`](ROADMAP.md)). Known open weaknesses are listed in
+> [`SECURITY.md`](SECURITY.md), "Known weaknesses".
 > **Do not rely on it as a security control on a machine you care about.** Treat
 > everything here as experimental and report anything that surprises you.
 
@@ -66,15 +67,16 @@ asserting that other tools invariably decide after driver binding was removed.
 ```bash
 git clone https://github.com/capitan0n/probolos
 cd probolos
-sudo pacman -S python-pyudev     # or your distro's package, or: pip install pyudev
+sudo pacman -S python-pyudev     # or your distro's package (python3-pyudev)
 sudo python3 -m probolos --observe 3
 ```
 
 Plug in a device. You will get a report and a prompt.
 
 > **Keep a second way in while testing** — SSH, or your built-in keyboard.
-> Internal (`removable=fixed`) ports are never gated, so a laptop keyboard on
-> the PS/2 controller is unaffected, but check before you rely on it.
+> A laptop keyboard on the PS/2 (i8042) controller is not USB and is never
+> affected. Devices on internal (`removable=fixed`) USB ports are not gated
+> unless you pass `--gate-fixed-ports`; check before you rely on either.
 
 Stop with `Ctrl-C`; the gate reopens on every exit path.
 
@@ -88,6 +90,10 @@ python3 -m probolos.agent          # in your graphical session
 `--privsep` runs the analyzer as `nobody` and routes privileged operations
 through a separate gate. The trusted code also includes startup preparation,
 protocol handling and cleanup; it is not a 150-line security boundary.
+`nobody` is shared: any other process running as `nobody` can kill the
+analyzer, and the gate then reopens (`SECURITY.md`, "Known weaknesses").
+`--privsep-user` takes a dedicated account instead; the shipped unit does not
+use one yet.
 `--agent` moves the prompt into a desktop dialog: one dialog for a plain
 storage device, a second confirmation for anything that can type or carry
 traffic or showed a warning, and a 10-second countdown before "Allow anyway"
@@ -169,7 +175,7 @@ of watched readers read-only and switch those readers off. See `SECURITY.md`.
 | Flag | Effect |
 |---|---|
 | `--observe SEC` | length of the behavioural quarantine (`0` disables stage 3) |
-| `--privsep` | run the analyzer as `nobody` behind a minimal root gate |
+| `--privsep` | run the analyzer as `nobody` behind a separate root gate |
 | `--agent` | ask via a desktop dialog instead of the terminal |
 | `--dry-run` | report everything, change nothing |
 | `--list` | read-only inventory of attached devices; never closes the gate |
@@ -191,11 +197,12 @@ The gate restores on exit, on signals, and via `atexit`. If a device is still
 blocked:
 
 ```bash
-sudo python3 -m probolos --release
+sudo python3 -m probolos --release      # from the checkout
+sudo probolos --release                 # after install.sh
 ```
 
-If Probolos itself is wedged, the panic file forces the gate open from another
-TTY or over SSH:
+`--release` refuses while a gate is still running. If Probolos itself is
+wedged, the panic file forces the gate open from another TTY or over SSH:
 
 ```bash
 sudo touch /run/probolos.panic
@@ -205,8 +212,11 @@ It must be **root-owned** — a panic file anyone could create would be a way fo
 any local account to switch the tool off. Last resort, one line:
 
 ```bash
-echo 1 | sudo tee /sys/bus/usb/devices/usb1/authorized_default
+for hub in /sys/bus/usb/devices/usb*/authorized_default; do echo 1 | sudo tee "$hub"; done
 ```
+
+That only affects devices attached from then on: replug anything still
+blocked, or authorize it with `echo 1 | sudo tee /sys/bus/usb/devices/<name>/authorized`.
 
 ---
 
@@ -322,10 +332,11 @@ Short version:
   and hardened, but the report descriptor is not in the sysfs blob and has no
   source wired to it. `CAPABILITIES.md` §2.2 and §3.2.
 
-Status: **alpha, feature-frozen at 0.11.0** on the way to 1.0
-([`ROADMAP.md`](ROADMAP.md)). The tree has been through six security review
-passes; each finding has a regression test named after the defect, under
-`tests/`.
+Status: **alpha, 0.12.0**, feature-frozen since 0.11.0 on the way to 1.0
+([`ROADMAP.md`](ROADMAP.md)). The tree has been through several security
+review passes, the latest on 2026-10-04 ([`docs/QA-LOG.md`](docs/QA-LOG.md));
+each fixed finding has a regression test named after the defect, under
+`tests/`, and the ones still open are listed in `SECURITY.md`.
 
 **Verified on real hardware.** Closing and restoring `authorized_default` on
 all five root hubs of the reference laptop. A Kingston DataTraveler 3.0 through
@@ -352,7 +363,10 @@ anything that surprises you. What is not done is listed in
 
 ## License
 
-GPLv3 — see [`LICENSE`](LICENSE).
+GPL-3.0-or-later: Probolos is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version. See [`LICENSE`](LICENSE).
 
 Note the warranty disclaimer in particular: this is alpha, security-relevant
 software provided as-is. You are responsible for what you run it on.

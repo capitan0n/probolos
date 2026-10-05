@@ -118,7 +118,7 @@ class CommandLineWiring(unittest.TestCase):
              self.assertRaises(SystemExit):
             cli.main(["--media-policy", "deauthorize"])
 
-    def _run(self, argv):
+    def _run(self, argv, lock=None):
         from probolos import __main__ as cli
         from probolos import privsep
         captured = {}
@@ -129,7 +129,7 @@ class CommandLineWiring(unittest.TestCase):
 
         with mock.patch.object(cli, "require_usb"), \
              mock.patch.object(cli, "require_root"), \
-             mock.patch.object(cli, "claim_the_gate"), \
+             mock.patch.object(cli, "claim_the_gate", return_value=lock), \
              mock.patch.object(privsep, "start", fake_start), \
              mock.patch.object(cli.daemon, "serve",
                                side_effect=lambda **kw: captured.update(kw)), \
@@ -144,6 +144,11 @@ class CommandLineWiring(unittest.TestCase):
         captured = self._run(["--privsep", "--no-trust", "--no-ledger",
                               "--watch-media"])
         self.assertTrue(captured["watch_media"])
+
+    def test_the_analyzer_is_told_to_close_the_gate_lock(self):
+        captured = self._run(["--privsep", "--no-trust", "--no-ledger"],
+                             lock=7)
+        self.assertEqual(captured["close_in_child"], (7,))
 
     def test_direct_mode_passes_the_flag_and_policy_to_the_daemon(self):
         captured = self._run(["--no-trust", "--no-ledger", "--watch-media",
@@ -225,6 +230,127 @@ class VersionHasOneSource(unittest.TestCase):
             probolos.__version__ in (declared, declared + "+source"),
             f"{probolos.__version__!r} does not match pyproject {declared!r}")
 
+
+class OneCommandPerRunAndDryRunChangesNothing(unittest.TestCase):
+    """
+    `--remove-trusted ""` was falsy, fell through every command and started
+    the gate; `--list --release` ran the first and dropped the second; and
+    `--dry-run --release` released every device, though --dry-run promises
+    to change nothing.
+    """
+
+    def _main(self, argv):
+        calls = []
+        with mock.patch.object(cli, "require_usb"), \
+             mock.patch.object(cli, "require_root"), \
+             mock.patch.object(cli, "claim_the_gate", return_value=None), \
+             mock.patch.object(cli, "cmd_release",
+                               side_effect=lambda: calls.append("release")), \
+             mock.patch.object(cli, "cmd_list",
+                               side_effect=lambda **_k: calls.append("list")), \
+             mock.patch.object(cli, "cmd_remove_trusted",
+                               side_effect=lambda *_a: calls.append("remove")), \
+             mock.patch.object(cli.daemon, "serve",
+                               side_effect=lambda **_k: calls.append("serve")), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            try:
+                cli.main(argv)
+                code = 0
+            except SystemExit as exc:
+                code = exc.code
+        return code, calls
+
+    def test_an_empty_pattern_is_refused_and_starts_nothing(self):
+        for value in ("", "   "):
+            code, calls = self._main(["--remove-trusted", value])
+            self.assertEqual(code, 2)
+            self.assertEqual(calls, [], "the gate started")
+
+    def test_two_commands_are_refused(self):
+        code, calls = self._main(["--list", "--release"])
+        self.assertEqual(code, 2)
+        self.assertEqual(calls, [])
+
+    def test_dry_run_refuses_the_commands_that_change_state(self):
+        for argv in (["--release"], ["--remove-trusted", "all", "--yes"],
+                     ["--remove-all", "--yes"]):
+            code, calls = self._main(["--dry-run", *argv])
+            self.assertEqual(code, 2, argv)
+            self.assertEqual(calls, [], argv)
+
+    def test_one_command_still_runs(self):
+        self.assertEqual(self._main(["--remove-trusted", "2"]), (0, ["remove"]))
+        self.assertEqual(self._main(["--list", "--dry-run"]), (0, ["list"]))
+
+    def test_dry_run_privsep_hands_nothing_over(self):
+        from probolos import privsep
+        captured = {}
+
+        def fake_start(_analyzer_main, **kwargs):
+            captured.update(kwargs)
+            return 0
+        with mock.patch.object(cli, "require_usb"), \
+             mock.patch.object(privsep, "start", fake_start), \
+             mock.patch.object(privsep, "prepare_trust_readable") as readable, \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli.main(["--dry-run", "--privsep", "--ledger",
+                          "/var/lib/probolos/state/ledger.json"])
+        readable.assert_not_called()
+        self.assertEqual(captured["state_paths"], [])
+
+
+class ReleaseRefusesUnderARunningGate(unittest.TestCase):
+    """
+    --release authorizes every blocked device and reopens the hubs. Under a
+    running gate that admitted what it was holding or had refused, while the
+    daemon went on prompting as though the hubs were closed.
+    """
+
+    def test_refused_while_a_gate_holds_the_lock(self):
+        with mock.patch.object(cli, "require_root"), \
+             mock.patch.object(cli.instance, "running", return_value=True), \
+             mock.patch.object(cli.gate, "unauthorized_devices") as listed, \
+             mock.patch.object(cli.sysfs, "set_authorized") as written:
+            with self.assertRaises(SystemExit) as ended:
+                cli.cmd_release()
+        self.assertIn("running", str(ended.exception.code))
+        listed.assert_not_called()
+        written.assert_not_called()
+
+    def test_hubs_are_reopened_even_with_no_device_blocked(self):
+        """
+        It returned at "Nothing stranded" before the hub loop, so a gate left
+        closed by a SIGKILL with nothing plugged in stayed closed.
+        """
+        hub = Path("/sys/bus/usb/devices/usb1")
+        with mock.patch.object(cli, "require_root"), \
+             mock.patch.object(cli.instance, "running", return_value=False), \
+             mock.patch.object(cli.gate, "unauthorized_devices",
+                               return_value=[]), \
+             mock.patch.object(cli.sysfs, "list_root_hubs", return_value=[hub]), \
+             mock.patch.object(cli.sysfs, "get_authorized_default",
+                               return_value=0), \
+             mock.patch.object(cli.sysfs, "set_authorized_default") as reset, \
+             redirect_stdout(io.StringIO()):
+            cli.cmd_release()
+        reset.assert_called_once_with(hub, 1)
+
+    def test_a_failed_release_is_a_failure_status(self):
+        dev = mock.Mock(syspath=Path("/sys/bus/usb/devices/1-1"))
+        dev.name = "1-1"
+        with mock.patch.object(cli, "require_root"), \
+             mock.patch.object(cli.instance, "running", return_value=False), \
+             mock.patch.object(cli.gate, "unauthorized_devices",
+                               return_value=[dev]), \
+             mock.patch.object(cli.sysfs, "set_authorized",
+                               side_effect=OSError("EIO")), \
+             mock.patch.object(cli.sysfs, "list_root_hubs", return_value=[]), \
+             mock.patch.object(cli.report, "one_liner", return_value="x"), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as ended:
+                cli.cmd_release()
+        self.assertEqual(ended.exception.code, 1)
 
 if __name__ == "__main__":
     unittest.main()

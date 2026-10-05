@@ -94,15 +94,26 @@ def cmd_release() -> None:
     an obvious way out.
     """
     require_root()
+    # Not under a running gate. It would admit every device that gate holds
+    # or was refused, and reopen the hubs under a daemon that goes on
+    # prompting as though they were closed. A wedged gate is what the panic
+    # file is for.
+    if instance.running():
+        sys.exit("probolos is running; --release would admit every device it "
+                 "is holding, behind its back.\nStop it first:\n"
+                 "    in its terminal:  Ctrl-C\n"
+                 "    as a service:     sudo systemctl stop probolos\n"
+                 f"If it is wedged:     sudo touch {safety.DEFAULT_PANIC_FILE}")
+    failed = False
     stranded = gate.unauthorized_devices()
     if not stranded:
         print("Nothing stranded — no blocked devices found.")
-        return
     for dev in stranded:
         try:
             sysfs.set_authorized(dev.syspath, 1)
             print(f"  released: {report.one_liner(dev)}")
         except OSError as exc:
+            failed = True
             print(f"  failed {dev.name}: {exc}")
 
     # Reported, never raised. This is the documented way out of a machine whose
@@ -117,8 +128,11 @@ def cmd_release() -> None:
                 sysfs.set_authorized_default(hub, 1)
                 print(f"  {hub.name}: authorized_default reset to 1")
             except OSError as exc:
+                failed = True
                 print(f"  failed {hub.name}: {exc}")
                 print(f"    run as root:  echo 1 > {hub}/authorized_default")
+    if failed:
+        sys.exit(1)
 
 
 def _active_session_user() -> Optional[str]:
@@ -403,7 +417,9 @@ def main(argv=None) -> None:
     parser.add_argument("--list", action="store_true",
                         help="show attached devices and exit")
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="with --list: full per-interface breakdown")
+                        help="with --list: full per-interface breakdown; "
+                             "with --history: ports, decisions and "
+                             "fingerprints")
     parser.add_argument("--release", action="store_true",
                         help="authorize all blocked devices and reopen the gate")
     parser.add_argument("--dry-run", action="store_true",
@@ -509,6 +525,26 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
     if args.media_policy != "log" and not args.watch_media:
         parser.error("--media-policy needs --watch-media")
+    # One command per run. The first used to win silently (`--list --release`
+    # listed, and released nothing), and an empty --remove-trusted was falsy:
+    # it fell through all of them and started the gate.
+    if args.remove_trusted is not None and not args.remove_trusted.strip():
+        parser.error("--remove-trusted needs a number, a name or id "
+                     "substring, or 'all'")
+    commands = [flag for flag, given in (
+        ("--list", args.list), ("--trusted", args.trusted),
+        ("--history", args.history),
+        ("--remove-trusted", args.remove_trusted is not None),
+        ("--remove-all", args.remove_all), ("--release", args.release))
+        if given]
+    if len(commands) > 1:
+        parser.error(f"{commands[0]} and {commands[1]} are separate "
+                     f"commands; run one at a time")
+    # --dry-run promises to change nothing; these three change state.
+    if args.dry_run and commands and commands[0] in (
+            "--remove-trusted", "--remove-all", "--release"):
+        parser.error(f"{commands[0]} changes state and --dry-run changes "
+                     f"nothing; run it without --dry-run")
 
     require_usb()
 
@@ -528,7 +564,7 @@ def main(argv=None) -> None:
         print(history.show_history(verbose=args.verbose,
                                    path=args.ledger if args.ledger else None))
         return
-    if args.remove_trusted:
+    if args.remove_trusted is not None:
         cmd_remove_trusted(trust_path, args.remove_trusted, args.yes)
         return
     if args.remove_all:
@@ -539,11 +575,12 @@ def main(argv=None) -> None:
         cmd_release()
         return
 
+    gate_lock = None
     if not args.dry_run:
         require_root()
         # Held until the process exits. Before the banner, so a refusal is
         # the only thing printed.
-        gate_lock = claim_the_gate()  # noqa: F841
+        gate_lock = claim_the_gate()
     print(BANNER)
     if not args.dry_run:
         print("[!] The gate will close: NEW USB devices will not work until")
@@ -684,16 +721,22 @@ def main(argv=None) -> None:
             # a fingerprint it measured itself.
             # Trust is read-only to the analyzer: readable file, root-owned
             # directory. Done before the drop, while we still can.
-            if not args.no_trust and trust_path:
+            # Neither under --dry-run, which changes nothing: no file is made
+            # readable and no directory handed over. The analyzer reads what
+            # it already can, and a dry run judges without trust anyway.
+            if not args.no_trust and trust_path and not args.dry_run:
                 privsep.prepare_trust_readable(trust_path)
             # --watch-media widens what the gate will open (whole disks of
             # admitted storage hosts), so the gate learns it from the root
             # side here and never from the analyzer. The trust path likewise:
             # it names the one file the gate writes.
             rc = privsep.start(analyzer_main, drop_to=args.privsep_user,
-                               state_paths=[p for p in (ledger_path,) if p],
+                               state_paths=([] if args.dry_run else
+                                            [p for p in (ledger_path,) if p]),
                                watch_media=args.watch_media and not args.dry_run,
-                               trust_path=None if args.no_trust else trust_path)
+                               trust_path=None if args.no_trust else trust_path,
+                               close_in_child=(() if gate_lock is None
+                                               else (gate_lock,)))
         except privsep.PrivsepError as exc:
             sys.exit(f"privsep: {exc}")
         sys.exit(rc)

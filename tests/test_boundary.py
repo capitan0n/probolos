@@ -333,10 +333,19 @@ class StartParentSide(_StartCase):
         run_gate.assert_called_once()
 
 
+def _fd_open(fd):
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    return True
+
+
 class StartChildSide(_StartCase):
     """The analyzer half: leave the session, drop, run, and only ever _exit."""
 
-    def child(self, analyzer_main=lambda _c: 5, *, setsid=None, drop=None):
+    def child(self, analyzer_main=lambda _c: 5, *, setsid=None, drop=None,
+              close_in_child=()):
         with mock.patch.object(privsep.os, "fork", return_value=0), \
                 mock.patch.object(privsep.os, "setsid",
                                   side_effect=setsid), \
@@ -346,7 +355,8 @@ class StartChildSide(_StartCase):
                 mock.patch.object(privsep.gate_server, "run_gate") as gate, \
                 mock.patch("sys.stderr"):
             with self.assertRaises(_Exited) as ended:
-                privsep.start(analyzer_main, log=self.logged.append)
+                privsep.start(analyzer_main, log=self.logged.append,
+                              close_in_child=close_in_child)
         gate.assert_not_called()
         return ended.exception.code, dropped
 
@@ -374,6 +384,19 @@ class StartChildSide(_StartCase):
         self.assertEqual(code, 70)
         dropped.assert_not_called()
         self.assertEqual(ran, [], "the analyzer ran on the terminal session")
+
+    def test_the_gate_lock_is_not_inherited_by_the_analyzer(self):
+        """
+        The instance lock is O_CLOEXEC, which acts at exec(), not at fork():
+        the analyzer used to hold it and could unlock it, so a second gate
+        could start beside this one. It is closed before the analyzer runs.
+        """
+        lock = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+        self.addCleanup(lambda: os.close(lock) if _fd_open(lock) else None)
+        seen = []
+        self.child(lambda _c: seen.append(_fd_open(lock)),
+                   close_in_child=(lock,))
+        self.assertEqual(seen, [False])
 
     def test_failing_to_drop_privilege_stops_the_child(self):
         ran = []
@@ -493,6 +516,12 @@ class GateClientRefusals(unittest.TestCase):
         client.set_default("/sys/usb1", 0)
         self.assertTrue(client.ping())
         self.assertFalse(self.sock.closed)
+
+    def test_a_temporary_activation_carries_the_inspected_instance(self):
+        """The gate compares it; without it any device at the path qualified."""
+        client = self.client(OK)
+        client.authorize("/sys/x", 1, (3, 4))
+        self.assertEqual(self.sock.sent[0].instance, (3, 4))
 
     def test_a_label_too_long_for_the_protocol_is_cut(self):
         client = self.client(OK)

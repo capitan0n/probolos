@@ -169,11 +169,18 @@ def _signature_of(st):
 
 
 class TrustStore:
-    def __init__(self, path: Optional[Path] = None):
+    def __init__(self, path: Optional[Path] = None, owners=None):
         self.path = Path(path) if path else default_path()
+        # Who may own the file and its directories: root and this process,
+        # unless the caller narrows it. The --privsep analyzer passes (0,):
+        # its uid is the shared `nobody`, and a store `nobody` owns is one
+        # any process running as `nobody` could have written -- the gate
+        # already refused such a store, while the analyzer admitted from it.
+        self.owners = None if owners is None else tuple(owners)
         self.devices: Dict[str, TrustedDevice] = {}
         self.load_error: Optional[str] = None
         self._last_save_error: Optional[str] = None
+        self.repeated_save_error = False
         # What the file on disk looked like when we last read or wrote it.
         self._disk_sig = None
         self.load()
@@ -258,7 +265,7 @@ class TrustStore:
 
         try:
             from .securefs import read_json_file
-            data = read_json_file(self.path, trusted=True)
+            data = read_json_file(self.path, trusted=True, owners=self.owners)
         except (OSError, ValueError, UnicodeError, RecursionError) as exc:
             # Fail CLOSED: an unreadable trust store means nothing is trusted,
             # so every device is asked about. The opposite default -- trusting
@@ -341,9 +348,12 @@ class TrustStore:
         if not _stat.S_ISREG(st.st_mode):
             return "trust store is not a regular file"
 
-        if st.st_uid not in (0, os.geteuid()):
-            return (f"trust store is owned by uid {st.st_uid}, not by root or "
-                    f"uid {os.geteuid()}; nothing in it is trusted")
+        owners = (0, os.geteuid()) if self.owners is None else self.owners
+        who = " or ".join("root" if uid == 0 else f"uid {uid}"
+                          for uid in dict.fromkeys(owners))
+        if st.st_uid not in owners:
+            return (f"trust store is owned by uid {st.st_uid}, not by "
+                    f"{who}; nothing in it is trusted")
 
         writable_by_others = st.st_mode & (_stat.S_IWGRP | _stat.S_IWOTH)
         if writable_by_others:
@@ -358,9 +368,9 @@ class TrustStore:
         except OSError as exc:
             return f"cannot stat the trust store's directory: {exc}"
 
-        if parent.st_uid not in (0, os.geteuid()):
+        if parent.st_uid not in owners:
             return (f"the trust store's directory {directory} is owned by uid "
-                    f"{parent.st_uid}, not by root or uid {os.geteuid()}; "
+                    f"{parent.st_uid}, not by {who}; "
                     "whoever owns it can replace the file regardless of the "
                     "file's own permissions, so nothing in it is trusted")
 
@@ -375,7 +385,13 @@ class TrustStore:
 
     def save(self, readable: bool = False) -> Optional[str]:
         """
-        Write the store; None on success, else the error (reported once).
+        Write the store; None on success, else the error -- every time.
+
+        It used to return None for a failure that repeated the previous one,
+        so a second "always" that could not be saved printed "remembered for
+        future admissions". `repeated_save_error` now says whether the error
+        is the one the last failed save gave, for a caller that reports on
+        every admission and wants to say it once.
 
         `readable` asks for 0644 when the file does not exist yet. The root
         gate passes it: under --privsep it is the gate that writes "always",
@@ -400,11 +416,12 @@ class TrustStore:
                 "devices": {k: asdict(v) for k, v in self.devices.items()},
             }, mode=mode)
             self._disk_sig = _signature_of(written)
+            self._last_save_error = None
+            self.repeated_save_error = False
             return None
         except OSError as exc:
             message = str(exc)
-            if message == self._last_save_error:
-                return None
+            self.repeated_save_error = message == self._last_save_error
             self._last_save_error = message
             return message
 

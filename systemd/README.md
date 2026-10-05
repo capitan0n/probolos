@@ -19,9 +19,8 @@ It does what the manual steps below do, and more: code to `/opt/probolos`
 drop-ins (`PROBOLOS_AGENT_USER` = the account that ran `sudo`), and it starts
 both. It refuses while a probolos started by hand is still running.
 
-**By hand.** Put the source at `/opt/probolos`, owned by root (or install
-Probolos as a package for the system Python and leave out the `PYTHONPATH`
-lines below). Then install the units and give each the settings `install.sh`
+**By hand.** Put the source at `/opt/probolos`, owned by root. (No
+distribution package exists yet; ROADMAP 1.8.) Then install the units and give each the settings `install.sh`
 puts in its drop-ins. (`install.sh` also adds `ConditionUser=` to the agent,
 because it installs the agent for every account; a unit in your own
 `~/.config/systemd/user` runs only for you and does not need it.)
@@ -37,7 +36,7 @@ sudo systemctl edit probolos.service
 Environment=PYTHONPATH=/opt/probolos
 # The account whose desktop answers. The unit ships the placeholder `nobody`,
 # the analyzer's own account, so the gate turns the agent off: every new
-# device is then denied, with nobody asked.
+# device is then held blocked, with nobody asked.
 Environment=PROBOLOS_AGENT_USER=yourname
 ```
 
@@ -107,7 +106,7 @@ The gate needs root, so the units restrict what root can still reach:
 `/sys/bus/usb/devices/*/authorized` is the entire mechanism. That is the one
 broad permission the design cannot do without, and it is the reason the
 privileged half (`gate_server.py` and the protocol it serves) is kept separate
-and small enough to audit.
+from the analyzer, with its own tests and a coverage floor.
 
 ## Removing it
 
@@ -120,5 +119,5 @@ Stopping the service reopens the gate, as every exit path does. If something has
 gone wrong and devices are left blocked:
 
 ```bash
-sudo python -m probolos --release
+sudo probolos --release    # after install.sh; from a checkout: sudo python3 -m probolos --release
 ```

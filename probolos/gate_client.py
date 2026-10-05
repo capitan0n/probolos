@@ -87,9 +87,12 @@ class GateClient:
         if not resp.ok:
             raise GateError(f"admit failed: {resp.status}: {resp.detail}")
 
-    def authorize(self, syspath, value: int) -> None:
+    def authorize(self, syspath, value: int, instance=None) -> None:
+        # With an instance the gate refuses a different device at the path
+        # (_change_authorization compares it); sysfs.activate_device sends one.
         resp, _ = self._round_trip(protocol.Request(
-            protocol.REQ_AUTHORIZE, path=str(syspath), value=value))
+            protocol.REQ_AUTHORIZE, path=str(syspath), value=value,
+            instance=instance))
         if not resp.ok:
             raise GateError(f"authorize failed: {resp.status}: {resp.detail}")
 
@@ -179,8 +182,8 @@ class GateBackend:
     def admit(self, syspath, instance) -> None:
         self.client.admit(syspath, instance)
 
-    def authorize(self, syspath, value: int) -> None:
-        self.client.authorize(syspath, value)
+    def authorize(self, syspath, value: int, instance=None) -> None:
+        self.client.authorize(syspath, value, instance)
 
     def authorize_interface(self, intf_dir, value: int) -> None:
         # Was missing entirely: sysfs.set_interface_authorized() routes through

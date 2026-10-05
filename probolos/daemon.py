@@ -471,10 +471,12 @@ class Probolos:
                 # its trust surface is one entry per admission, kept small --
                 # so trying here only printed "could not update trust store"
                 # once per run, about something that was never going to work.
-                if self.trust.writable():
+                # Not over a store that failed to load: the rewrite would
+                # drop what could not be read, for bookkeeping.
+                if self.trust.writable() and not self.trust.load_error:
                     self.trust.record_admission(dev)
                     error = self.trust.save()
-                    if error:
+                    if error and not self.trust.repeated_save_error:
                         print(f"[!] could not update trust store: {error}")
                 print(f"[=] TRUSTED — {report.one_liner(dev, findings)}\n")
                 self.known.add(dev.name)
@@ -1043,7 +1045,7 @@ class Probolos:
         print("  table directly, without mounting it.")
 
         try:
-            sysfs.set_authorized(dev.syspath, 1)
+            sysfs.activate_device(dev)
         except OSError as exc:
             # This used to print the raw exception -- errno text and the full
             # sysfs path -- at the decision prompt and return None, so no
@@ -1188,7 +1190,8 @@ class Probolos:
         # Keep the legacy experimental flag, with its limitation visible.
         if self.close_race_window:
             if deferred_bind.supported(dev.syspath):
-                db = deferred_bind.DeferredBind(dev.syspath, log=print)
+                db = deferred_bind.DeferredBind(dev.syspath, log=print,
+                                                instance=dev.instance_id)
                 return quarantine.quarantine(
                     dev.syspath,
                     authorize_fn=db.authorize_device,
@@ -1210,7 +1213,7 @@ class Probolos:
 
         return quarantine.quarantine(
             dev.syspath,
-            authorize_fn=lambda: sysfs.set_authorized(dev.syspath, 1),
+            authorize_fn=lambda: sysfs.activate_device(dev),
             duration=self.observe,
             capture=self.capture_payload,
             deauthorize_fn=lambda: sysfs.set_authorized(dev.syspath, 0),
@@ -1284,6 +1287,11 @@ class Probolos:
         does it for us -- see _gate_keeps_trust for when it would refuse.
         """
         if self.trust is None:
+            return False
+        # Never over a store that failed to load, as the gate refuses to
+        # (gate_server._do_trust): saving it would keep only what was read
+        # -- after one stray comma, nothing -- plus the new entry.
+        if self.trust.load_error:
             return False
         return self.trust.writable() or _gate_keeps_trust(self.trust)
 
@@ -1637,7 +1645,11 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
 
     trust_store = None
     if trust_path is not None:
-        trust_store = trust_mod.TrustStore(trust_path)
+        # Under --privsep (a backend that can trust) only a root-owned store
+        # counts, as it does for the gate: this process is the shared
+        # `nobody`, and what `nobody` owns any `nobody` process could write.
+        trust_store = trust_mod.TrustStore(
+            trust_path, owners=(0,) if sysfs.backend_can_trust() else None)
         if trust_store.load_error:
             print(f"[!] trust store unreadable ({trust_store.load_error}); "
                   f"nothing will be treated as trusted")
@@ -1747,3 +1759,12 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
             if link:
                 link.stop()
             print("[*] Reopening the gate:")
+
+    # A stall the watchdog ended is a failure, and the exit status says so.
+    # It used to be 0, so systemd's Restart=on-failure never started the gate
+    # again: protection stayed off and the unit read "inactive (dead)" rather
+    # than "failed". The panic file is the operator's own off switch, and
+    # still ends the run normally.
+    if dog is not None and dog.fired and not dog.panicked:
+        raise SystemExit("[!!] The watchdog reopened the gate; exiting with a "
+                         "failure status so a supervisor can start it again.")

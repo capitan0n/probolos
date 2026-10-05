@@ -121,6 +121,62 @@ class TestTrustStore(unittest.TestCase):
         self.assertEqual(store.lookup(Dev()).times_admitted, 2)
 
 
+class EveryFailedSaveIsReported(unittest.TestCase):
+    """
+    save() returned None -- success -- for a failure that repeated the last
+    one, so the second "always" that could not be kept printed "remembered
+    for future admissions" with nothing on disk.
+    """
+
+    def test_a_repeated_failure_is_still_a_failure(self):
+        with TemporaryDirectory() as tmp:
+            store = trust.TrustStore(Path(tmp) / "trusted.json")
+            store.trust(Dev())
+            with mock.patch.object(atomicio, "write_json_atomic",
+                                   side_effect=OSError("read-only")):
+                first, second = store.save(), store.save()
+            self.assertEqual((first, second), ("read-only", "read-only"))
+            self.assertTrue(store.repeated_save_error)
+            self.assertIsNone(store.save())
+            self.assertFalse(store.repeated_save_error)
+
+
+class TheAnalyzerTrustsOnlyARootOwnedStore(unittest.TestCase):
+    """
+    The ownership checks accepted root or this process. Under --privsep this
+    process is the shared `nobody`, so a store `nobody` owned -- writable by
+    any process running as `nobody` -- was admitted from by the analyzer,
+    while the gate refused the same file. The analyzer now passes owners=(0,).
+    """
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        directory = Path(self.tmp.name) / "state"
+        directory.mkdir(mode=0o755)
+        self.path = directory / "trusted.json"
+        store = trust.TrustStore(self.path)
+        store.trust(Dev())
+        self.assertIsNone(store.save())
+        os.chmod(self.path, 0o644)
+        # A uid that is neither root nor, once geteuid is patched, unusual.
+        self.owner = os.geteuid() or 65534
+        if os.geteuid() == 0:
+            for target in (directory, self.path):
+                os.chown(target, self.owner, self.owner)
+        patcher = mock.patch("os.geteuid", return_value=self.owner)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_by_default_this_processes_own_file_is_accepted(self):
+        self.assertIsNone(trust.TrustStore(self.path).load_error)
+
+    def test_with_root_only_it_is_refused_and_nothing_is_trusted(self):
+        store = trust.TrustStore(self.path, owners=(0,))
+        self.assertIn("not by root", store.load_error)
+        self.assertFalse(store.is_trusted(Dev()))
+
+
 class TestNumberedManagement(unittest.TestCase):
     """ufw-style: list numbered, delete by number. Stable ordering is what
     makes the numbers safe to act on."""
@@ -527,10 +583,6 @@ class StateReload(unittest.TestCase):
             self.assertIsNone(trust.TrustedDevice.from_raw(data["key"], data))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ---------------------------------------------------------------------------
 # Revocation reaches a daemon that is already running
 # ---------------------------------------------------------------------------
@@ -673,3 +725,7 @@ class WritableSaysWhetherAlwaysCanBeKept(unittest.TestCase):
         store = trust.TrustStore(Path(self.tmp.name) / "trusted.json")
         with mock.patch("os.access", return_value=False):
             self.assertFalse(store.writable())
+
+
+if __name__ == "__main__":
+    unittest.main()

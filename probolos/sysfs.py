@@ -65,11 +65,23 @@ def read_attr(devpath: Path, name: str) -> Optional[str]:
     Absent attributes are completely normal here (a device with no serial
     number has no `serial` file at all), and a device can be unplugged
     mid-read, so ENOENT/EIO are expected control flow rather than errors.
+
+    Decoded as UTF-8 with replacement, never with the locale's codec.
+    read_text() used the process locale and raised UnicodeDecodeError -- a
+    ValueError, which nothing here caught -- for text that codec could not
+    decode: any non-ASCII product name under a non-UTF-8 locale, or bytes
+    that are not UTF-8. At startup that escaped snapshot(), and the gate
+    reopened as the process exited. textsafe.sanitize already decodes bytes
+    this way and turns U+FFFD into the `undecodable-bytes` finding, so an
+    undecodable string is reported instead of stopping the daemon.
+    gate_server._read_text_at decodes the same way, so the trust key the
+    gate computes still matches this one.
     """
     try:
-        return (devpath / name).read_text().strip()
+        raw = (devpath / name).read_bytes()
     except (FileNotFoundError, OSError):
         return None
+    return raw.decode("utf-8", errors="replace").strip()
 
 
 def read_int_attr(devpath: Path, name: str, base: int = 10) -> Optional[int]:
@@ -612,13 +624,20 @@ class _DirectBackend:
         # stats syspath through the symlink, so the (st_dev, st_ino) it recorded
         # is already the inode of the RESOLVED directory, which is what fstat
         # returns here.
+        self._write_to_instance(syspath, "1", instance,
+                                "device changed since inspection; "
+                                "approval discarded")
+
+    @staticmethod
+    def _write_to_instance(syspath, value: str, instance, refusal: str) -> None:
+        """Write `authorized` only if the directory is still `instance`."""
         directory_fd = os.open(os.path.realpath(syspath),
                                os.O_RDONLY | os.O_DIRECTORY |
                                os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             st = os.fstat(directory_fd)
             if instance != (st.st_dev, st.st_ino):
-                raise OSError("device changed since inspection; approval discarded")
+                raise OSError(refusal)
             # O_CLOEXEC: this runs in the privileged half, which spawns the
             # storage worker and the dialog backends. A descriptor open on a
             # device's `authorized` attribute must not survive into a child
@@ -628,18 +647,25 @@ class _DirectBackend:
             try:
                 with os.fdopen(fd, "w") as fh:
                     fd = None      # fdopen owns it from here
-                    fh.write("1")
+                    fh.write(value)
             finally:
                 if fd is not None:
                     os.close(fd)
         finally:
             os.close(directory_fd)
 
-    def authorize(self, syspath: Path, value: int) -> None:
+    def authorize(self, syspath: Path, value: int, instance=None) -> None:
         # Pinned rather than by name: see _write_attr_pinned. This is the write
         # that switches a device on, so a symlink here is a root write to a
         # file of the planter's choosing AND a device that never came alive.
-        _write_attr_pinned(syspath, "authorized", str(value))
+        # With an instance, the write lands only on that kernel directory
+        # instance, as admit() does (see activate_device).
+        if instance is None:
+            _write_attr_pinned(syspath, "authorized", str(value))
+            return
+        self._write_to_instance(syspath, str(value), instance,
+                                "device changed since inspection; "
+                                "activation refused")
 
     def authorize_interface(self, intf_dir, value: int) -> None:
         # Interface-level authorization: controls whether the kernel
@@ -695,7 +721,7 @@ def set_interface_authorized(intf_dir, value: int) -> None:
     _backend.authorize_interface(intf_dir, value)
 
 
-def set_authorized(syspath: Path, value: int) -> None:
+def set_authorized(syspath: Path, value: int, instance=None) -> None:
     """
     Authorize (1) or deauthorize (0) a single device.
 
@@ -704,9 +730,28 @@ def set_authorized(syspath: Path, value: int) -> None:
     becomes able to type. Writing 0 unconfigures it again.
 
     Routed through the active backend so that under privilege separation the
-    write happens in the root gate, not here.
+    write happens in the root gate, not here. With `instance`, the write is
+    refused unless the device directory is still that kernel instance.
     """
-    _backend.authorize(syspath, value)
+    if instance is None:
+        _backend.authorize(syspath, value)
+    else:
+        _backend.authorize(syspath, value, instance=instance)
+
+
+def activate_device(dev: UsbDevice) -> None:
+    """
+    Switch the inspected instance on for stage 3 or 4, never its replacement.
+
+    Temporary activation used to go by path alone. A device that left and
+    re-enumerated at the same port between the identity checks and this
+    write -- a different device, judged by nothing -- was switched on in its
+    place: for stage 4 with no input grab at all. admit_device() was already
+    bound to the instance; this is the same rule for the earlier write.
+    """
+    if dev.instance_id is None:
+        raise OSError("device instance is unavailable; activation refused")
+    set_authorized(dev.syspath, 1, instance=dev.instance_id)
 
 
 def admit_device(dev: UsbDevice) -> None:

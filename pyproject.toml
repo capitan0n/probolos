@@ -1,8 +1,9 @@
 [build-system]
 # setuptools is the least surprising choice for a plain src-less layout and is
 # already present on almost every distro. The build backend is what turns this
-# tree into something `pip install .` understands.
-requires = ["setuptools>=61.0"]
+# tree into something `pip install .` understands. 77 is the first release
+# that reads the SPDX `license` expression below (PEP 639).
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,24 +12,26 @@ name = "probolos"
 # back through importlib.metadata rather than repeating it; the literal in that
 # file is a source-checkout fallback only and carries a "+source" suffix so the
 # two can never silently disagree again (they did: 0.5.1 vs 0.9.0).
-version = "0.11.0"
+version = "0.12.0"
 description = "A deny-by-default USB admission gate for Linux"
 readme = "README.md"
 authors = [{ name = "capitan0n" }]
 requires-python = ">=3.10"
-license = { text = "GPLv3" }
+# GNU GPL version 3, or (at your option) any later version. An SPDX
+# expression (PEP 639): the `{ text = ... }` table it replaces is deprecated in
+# setuptools, and "GPLv3" did not say whether later versions apply.
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 keywords = ["usb", "security", "badusb", "linux", "sysfs", "hardening"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    # GPL, not MIT. LICENSE, README and the `license` field above all say
-    # GPLv3; this classifier said MIT, and the classifier is the one that ends
-    # up in the published metadata -- so an installed package would have told
-    # everyone the opposite of what the repository says, under the one heading
-    # where being wrong has legal consequences rather than cosmetic ones.
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    # No "License ::" classifier: with the SPDX expression above, PEP 639
+    # makes the expression the one license statement in the metadata, and
+    # setuptools refuses both together. (The classifier once said MIT while
+    # everything else said GPL; one statement cannot disagree with itself.)
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Topic :: Security",

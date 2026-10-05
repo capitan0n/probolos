@@ -7,13 +7,17 @@ Covers probolos.sysfs.
 
 from __future__ import annotations
 
+import io
 import os
+import subprocess
+import sys
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from probolos import gate, gate_server, sysfs
+from probolos import gate, gate_server, sysfs, textsafe
 from tests._support import FakeSysfs, _TreeCase
 
 
@@ -141,6 +145,62 @@ class DescriptorBlobIsBounded(unittest.TestCase):
         self.assertIsNotNone(device.descriptor_set)
 
 
+class DeviceStringsDecodeWhateverTheLocale(unittest.TestCase):
+    """
+    read_attr() used read_text(): the locale's codec, and a UnicodeDecodeError
+    -- a ValueError, which it did not catch -- for text that codec could not
+    decode. load_device() let it out, and daemon.snapshot() has no handler,
+    so one such device attached at startup ended the run and reopened the
+    gate. Device strings are now decoded as UTF-8 with replacement, the way
+    textsafe already decodes bytes, and an undecodable one is a finding.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.devices = Path(self.tmp.name)
+        self.dev = self.devices / "1-1"
+        self.dev.mkdir()
+        (self.dev / "idVendor").write_text("046d\n")
+        (self.dev / "idProduct").write_text("c52b\n")
+
+    def test_bytes_that_are_not_utf8_are_a_finding_not_an_exception(self):
+        (self.dev / "manufacturer").write_bytes(b"ACME\xff\xfe widget\n")
+        device = sysfs.load_device(self.dev)
+        self.assertIsNotNone(device)
+        self.assertIn("ACME", device.manufacturer)
+        self.assertIn("�", device.manufacturer)
+        self.assertIn(textsafe.NOTE_UNDECODABLE, device.string_notes)
+
+    def test_listing_devices_survives_one_that_does_not_decode(self):
+        """The startup path: snapshot() iterates exactly this list."""
+        (self.dev / "product").write_bytes(b"\xc3\x28\n")
+        with mock.patch.object(sysfs, "USB_DEVICES", self.devices):
+            names = [d.name for d in sysfs.list_devices()]
+        self.assertEqual(names, ["1-1"])
+
+    def test_a_non_ascii_name_reads_the_same_under_the_c_locale(self):
+        """
+        Run where the locale codec is ASCII and Python's UTF-8 mode is off,
+        the configuration in which read_text() raised on any honest non-ASCII
+        product name.
+        """
+        (self.dev / "manufacturer").write_text("Lögitech\n", encoding="utf-8")
+        program = ("import sys; from pathlib import Path; "
+                   "from probolos import sysfs; "
+                   "d = sysfs.load_device(Path(sys.argv[1])); "
+                   "print(ascii(d.manufacturer))")
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0",
+               "PYTHONCOERCECLOCALE": "0",
+               "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+        result = subprocess.run([sys.executable, "-c", program, str(self.dev)],
+                                env=env, capture_output=True, text=True,
+                                timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), ascii("Lögitech"))
+
+
 # ---------------------------------------------------------------------------
 # P1 -- the privileged write must survive the bus view, which is all symlinks
 # ---------------------------------------------------------------------------
@@ -227,6 +287,7 @@ class DirectBackendNeverFollowsASymlink(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
         self.victim = self.root / "victim"
         self.victim.write_text("untouched")
         self.devdir = self.root / "device"
@@ -328,6 +389,62 @@ class DirectBackendNeverFollowsASymlink(unittest.TestCase):
                              "refusals must not leak descriptors")
 
 
+class ActivationIsBoundToTheInspectedInstance(unittest.TestCase):
+    """
+    Stage 3 and 4 used to switch a device on by path alone. A device that
+    left and re-enumerated at the same port in between -- judged by nothing
+    -- was switched on in the inspected one's place; for stage 4 with no
+    input grab. activate_device() now writes only to the inspected instance,
+    as admit_device() always did.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.devdir = Path(self.tmp.name) / "1-1"
+        self._make()
+        self.dev = sysfs.load_device(self.devdir)
+        backend = mock.patch.object(sysfs, "_backend", sysfs._DirectBackend())
+        backend.start()
+        self.addCleanup(backend.stop)
+
+    def _make(self):
+        self.devdir.mkdir()
+        (self.devdir / "authorized").write_text("0\n")
+        (self.devdir / "idVendor").write_text("abcd\n")
+        (self.devdir / "idProduct").write_text("1234\n")
+
+    def test_the_inspected_instance_is_switched_on(self):
+        sysfs.activate_device(self.dev)
+        self.assertEqual((self.devdir / "authorized").read_text(), "1")
+
+    def test_a_device_that_replaced_it_at_the_port_is_not(self):
+        keep = Path(self.tmp.name) / "inspected"
+        self.devdir.rename(keep)          # keeps the old inode alive
+        self._make()                       # a new device at the same path
+        with self.assertRaisesRegex(OSError, "changed since inspection"):
+            sysfs.activate_device(self.dev)
+        self.assertEqual((self.devdir / "authorized").read_text(), "0\n")
+
+    def test_no_instance_means_no_activation(self):
+        self.dev.instance_id = None
+        with self.assertRaises(OSError):
+            sysfs.activate_device(self.dev)
+        self.assertEqual((self.devdir / "authorized").read_text(), "0\n")
+
+    def test_stage_4_never_switches_on_a_replacement(self):
+        from probolos import daemon, session
+        engine = daemon.Probolos(monitor=session.AlwaysUnlocked(), observe=0,
+                                 inspect_storage=True)
+        keep = Path(self.tmp.name) / "inspected"
+        self.devdir.rename(keep)
+        self._make()
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            medium = engine._inspect_medium(self.dev)
+        self.assertIn("switched on", medium.error)
+        self.assertEqual((self.devdir / "authorized").read_text(), "0\n")
+
+
 class AdmitDescriptorIsCloseOnExec(unittest.TestCase):
     """
     The privileged half spawns children (the storage worker, dialog backends).
@@ -340,7 +457,9 @@ class AdmitDescriptorIsCloseOnExec(unittest.TestCase):
 
         from probolos import sysfs
 
-        source = inspect.getsource(sysfs._DirectBackend.admit)
+        self.assertIn("_write_to_instance",
+                      inspect.getsource(sysfs._DirectBackend.admit))
+        source = inspect.getsource(sysfs._DirectBackend._write_to_instance)
         self.assertIn("O_CLOEXEC", source)
 
 

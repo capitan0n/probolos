@@ -3,12 +3,158 @@
 All notable changes to Probolos. Versions follow PEP 440
 (`1.0.0b1` < `1.0.0rc1` < `1.0.0`).
 
-## Unreleased · road to 1.0.0
+## [0.12.0] — 2026-10-05 · Phase 1 hardening
 
-The feature set is frozen at 0.11.0 (`CAPABILITIES.md` §1). Everything below
-is a fix, a security fix, testing, documentation or release work.
+Still alpha, still frozen at the 0.11.0 feature set (`CAPABILITIES.md` §1):
+everything below is a fix, a security fix, testing, documentation or release
+work. It is not the first beta. The security audit of 2026-10-04 found the
+defects marked "review (security audit)" in `docs/QA-LOG.md`; the ones fixed
+here have regression tests that fail on 0.11.0, and the ones still open are
+listed under "Known open issues" below and in `SECURITY.md`.
+
+### Security
+
+- **The tkinter fallback no longer turns "No" into "Always allow".** On a
+  desktop with only tkinter, the one-step prompt asked "Allow it?" with
+  Yes/No/Cancel, and No meant "Always allow": the button that reads as a
+  refusal admitted the device and trusted it for good. The Tk backend now
+  asks twice, as the base class allows: "Allow it?" (No keeps it blocked),
+  then "Remember this device?" (No, the default, allows it once).
+- **Stage 3 and 4 switch on the inspected device, never its replacement.**
+  Temporary activation went by path. A device that re-enumerated at the same
+  port between the identity checks and the switch-on -- a different device,
+  judged by nothing -- was switched on in its place, for stage 4 with no input
+  grab. `sysfs.activate_device` now writes only to the inspected kernel
+  directory instance, in both modes, as final admission already did.
+- **Device strings decode the same way under every locale.** `read_attr`
+  used the locale's codec and let `UnicodeDecodeError` out: under a non-UTF-8
+  locale an honest non-ASCII product name, or bytes that are not UTF-8,
+  stopped `snapshot()` at startup and the gate reopened as the process
+  exited. Strings are decoded as UTF-8 with replacement on both sides of the
+  boundary, so the trust keys still agree, and an undecodable one is the
+  existing `crafted-strings` finding. (A serial holding a carriage return now
+  keeps it, so such a remembered device is asked about once more.)
+- **The analyzer no longer inherits the one-gate lock.** `O_CLOEXEC` acts at
+  exec, not fork, so the `--privsep` analyzer held the instance lock and could
+  release it, letting a second gate start beside the first. It is closed in
+  the child before the analyzer runs.
+- **Under `--privsep` the analyzer trusts only a root-owned store**, as the
+  gate does. It accepted a store owned by its own uid -- the shared `nobody`
+  -- which any `nobody` process could write, given a `--trust-file` in such a
+  directory.
+- **`install.sh` copies regular files only, and runs Python isolated.** A
+  symlink in the checkout (or the package directory being one) was copied as
+  a symlink into root-owned `/opt/probolos`, leaving the root service running
+  code its owner could still edit; it is now refused. The `pyudev` check and
+  `compileall` ran as root without `-I`, so a module in the directory `sudo`
+  was run from was imported as root; the script now runs from `/`, with `-I`.
+- **`release.yml` releases only a commit of main, after the checks.** Any
+  `v*` tag on any commit built and attested a draft release. A check job now
+  requires the tagged commit to be on `main` and runs ruff and the suite
+  first; the version must be in PEP 440 normal form (`1.0.0-beta.1` matched
+  its tag and built `1.0.0b1` files), and pre-release status comes from
+  PEP 440 (a/b/rc/dev) instead of a pattern on the tag, which missed
+  `.devN`. A 0.x final stays a normal release, as v0.9.0 to v0.11.0 were,
+  so it can be "Latest".
 
 ### Fixed
+
+- **A watchdog stall ends in a failure exit status.** After the watchdog
+  reopened the gate the process exited 0, so `Restart=on-failure` never
+  started it again and the unit read "inactive (dead)" while nothing was
+  gated. The panic file, the operator's own off switch, still exits 0.
+- **`--release` refuses while a gate is running,** where it admitted every
+  device the gate was holding or had refused and reopened the hubs under it.
+  It also exits 1 when a write fails, and reopens the hubs when no device is
+  blocked: it returned at "Nothing stranded" before the hub loop, so a gate
+  left closed by a `SIGKILL` with nothing plugged in stayed closed.
+- **One command per run; `--dry-run` changes nothing.** `--remove-trusted ""`
+  fell through every command and started the gate; `--list --release` ran the
+  first and dropped the second; `--dry-run` with `--release`,
+  `--remove-trusted` or `--remove-all` changed state anyway, and
+  `--dry-run --privsep` made the trust store readable and handed the ledger
+  directory to the analyzer. Each is now refused or skipped.
+- **"Always" is not offered over a trust store that failed to load** (direct
+  mode), where saving kept only what had been read -- after one stray comma,
+  nothing -- plus the new entry. The gate already refused this under
+  `--privsep`.
+- **A second failed "always" says so.** `TrustStore.save` returned success
+  for a failure that repeated the previous one, so the message read
+  "remembered for future admissions" with nothing on disk.
+- **A countdown window that died is no decision.** kdialog's and zenity's
+  notice read every exit as "closed", so a first window that crashed at once
+  ended the countdown as a refusal nobody made, which arms
+  `previously-rejected` for the next plug.
+- **The agent survives deeply nested JSON** (`RecursionError` in `_handle`).
+- **`--history` on an unreadable ledger says so** instead of "History is
+  empty".
+- **`install.sh`**: `--user 0` passed the check for root and left the service
+  restarting forever; a trailing `--user` exited silently; uninstalling
+  removed an administrator's `override.conf` with the drop-in directory; the
+  code is swapped by two renames instead of delete-then-move.
+
+### QA
+
+- New regression tests for each fix above, each shown to fail on 0.11.0, and
+  for contracts that mutation testing showed nothing pinned down: trust never
+  admits past a CRITICAL finding, `y` does not pass a CRITICAL terminal prompt,
+  stage 4 always ends with the device re-blocked, and `--dry-run` writes
+  nothing even for a protected device. The tkinter tests now run the
+  backend's real dialog scripts against a stub tkinter, so what each button
+  press produces is tested, not only the exit codes.
+- The suite no longer leaves temporary directories behind (33 per run), and
+  `unittest.main()` sits at the end of `test_trust.py` and `test_ledger.py`,
+  where running either file directly skipped the classes after it.
+- Deep property run (`HYPOTHESIS_PROFILE=deep`) on `ed0ad1a` and on the
+  0.12.0 tree: clean both times.
+
+### Documentation
+
+- `SECURITY.md` lists the weaknesses still open (below), corrects the agent
+  socket section (the `2750` directory stopped the desktop group, not other
+  `nobody` processes), and no longer says an analyzer compromise "cannot
+  escalate to root" as a lockout-safety layer. The last-resort recovery
+  command resets every root hub, not only `usb1`, and says that blocked
+  devices then need a replug.
+- `README.md`: no emoji; the recovery commands for an installed copy; the
+  shared-`nobody` caveat under `--privsep`; `--gate-fixed-ports` in the
+  internal-port note; no `pip install pyudev` before `sudo python3`.
+- `systemd/README.md`, the unit's comment and `testbed/README.md` match what
+  the code does (held, not denied; no system package yet; the report's
+  CRITICAL line).
+
+### Licensing
+
+- **GPL-3.0-or-later, stated.** "GPLv3" did not say whether later versions
+  of the GPL apply; they do, at the licensee's option. The package metadata is
+  now the SPDX expression (PEP 639) with `license-files`, so the wheel carries
+  `LICENSE`; the deprecated `license` table and the license classifier, which
+  setuptools would stop accepting after 2027-02-18, are gone. Building needs
+  setuptools 77 or newer. `README.md` and `CITATION.cff` say the same.
+
+### Known open issues
+
+Found by the same audit and not fixed here; each is a beta blocker or is
+listed in `ROADMAP.md` Phase 1.
+
+- Any process running as `nobody` can kill the `--privsep` analyzer, and the
+  gate then reopens every hub until the service restarts (`SECURITY.md`).
+- The analyzer's descendants can outlive the gate on a terminal run.
+- Any `nobody` process can take over the agent socket path and show its own
+  questions (it cannot approve anything).
+- `--timeout` under about 12 s and the agent's 10 s floor disagree; the
+  ledger's decision history is capped, so many replugs can push an old
+  refusal out of it; `--lock-policy deny` never asks about devices stranded
+  at a locked startup; with `--agent` requested but the socket failing, the
+  service denies instead of holding.
+
+### Before the audit
+
+The feature set is frozen at 0.11.0 (`CAPABILITIES.md` §1). Everything below
+is a fix, a security fix, testing, documentation or release work, and ships
+in 0.12.0.
+
+#### Fixed
 
 - **The CRITICAL notice says what is true, and is sent.** The agent's
   `MSG_CRITICAL` handler still said "cannot be approved from here. Use the
@@ -32,7 +178,7 @@ is a fix, a security fix, testing, documentation or release work.
   spawn docstring and an error hint, loaded only `dummy_hcd`; it is
   `modprobe -a` now.
 
-### QA
+#### QA
 
 - **The privilege boundary's refusal paths are tested**
   (`tests/test_boundary.py`): every failed step of the privilege drop (euid,
@@ -80,7 +226,7 @@ is a fix, a security fix, testing, documentation or release work.
   which moves to a new Ubuntu on its own; every job has a timeout.
   `coverage[toml]` (and `tomli` on Python 3.10) in `requirements-ci.txt`.
 
-### Documentation
+#### Documentation
 
 - **`SECURITY.md`**: the threat model of the gate-side trust write
   (`REQ_TRUST`); holding with no agent, the re-ask cap and replayed "add"
@@ -123,7 +269,7 @@ is a fix, a security fix, testing, documentation or release work.
   (switched on before 1.0.0) and Software Heritage (after it). ROADMAP ticks
   what is done.
 
-### Release engineering
+#### Release engineering
 
 - **`release.yml`**: on a `v*` tag, checks the tag against `pyproject.toml`
   and the `__init__.py` fallback, builds the sdist and wheel with a pinned
