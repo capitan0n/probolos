@@ -3,6 +3,53 @@
 All notable changes to Probolos. Versions follow PEP 440
 (`1.0.0b1` < `1.0.0rc1` < `1.0.0`).
 
+## [0.13.0] — 2026-10-05 · the analyzer's own account
+
+Still alpha, still frozen at the 0.11.0 feature set (`CAPABILITIES.md` §1).
+This release closes ROADMAP 1.11, the P1 left open by the 0.12.0 security
+audit, and with it 1.13 for the service.
+
+### Security
+
+- **The service's analyzer runs as its own account, not the shared
+  `nobody`.** Any other process running as `nobody` could kill the
+  `--privsep` analyzer; every analyzer exit reopens every hub, and the
+  devices attached before the service restarted became the next run's
+  untouched baseline. The same processes could take over the agent socket,
+  whose directory the analyzer's account owns. `probolos.service` now passes
+  `--privsep-user probolos`, a system account with no login that nothing else
+  runs as, declared in the new `systemd/probolos.sysusers`; `install.sh`
+  creates it with `systemd-sysusers` and refuses an existing `probolos` that
+  is not a system account of its own. The other option, keeping the hubs
+  closed when the analyzer is killed, was not taken: the analyzer's `SIGTERM`
+  handler reopens them itself, so it could not tell a kill from
+  `systemctl stop`, and it would turn an OOM kill into dead ports
+  (`SECURITY.md`).
+- **The unit's agent placeholder stays harmless.** `PROBOLOS_AGENT_USER`
+  shipped as `nobody`, which the gate refused only because it was also the
+  analyzer's account. With the analyzer on `probolos` it would have handed
+  the prompt to every `nobody` process; the placeholder is now `probolos`,
+  so an unconfigured unit still runs without the agent and holds devices.
+
+### QA
+
+- `tests/test_service.py`: the unit's analyzer account is not `nobody`, the
+  sysusers file declares it, `install.sh` creates it before starting the
+  service, the placeholder agent user is that account, and the unit's own
+  command line drops to it with the agent off. As root with
+  `systemd-sysusers`, the file is applied to a scratch root and must give a
+  system uid, no login shell and a locked password. The account, sysusers,
+  install and drop checks fail on 0.12.0; the two placeholder checks pass on
+  it and guard the regression this change would otherwise have brought.
+
+### Documentation
+
+- `SECURITY.md`, `README.md`, `CAPABILITIES.md` and `systemd/README.md` say
+  which account the analyzer runs as, how a manual install creates it, and
+  what is still open: a run by hand defaults to `nobody` unless it passes
+  `--privsep-user probolos`, and the analyzer's descendants can still outlive
+  the gate on a terminal run (1.12).
+
 ## [0.12.0] — 2026-10-05 · Phase 1 hardening
 
 Still alpha, still frozen at the 0.11.0 feature set (`CAPABILITIES.md` §1):

@@ -118,8 +118,11 @@ item as done in the issue when its change lands.
 | 1.3 | SECURITY.md: threat model for REQ_TRUST, holding, the textsafe cut, dialog exit codes | `docs`, `security` | Done |
 | 1.4 | Deep property run before each beta (`HYPOTHESIS_PROFILE=deep`) | `qa` | Clean on `aa2a0d3` (QA-LOG); repeat on the commit tagged b1 |
 | 1.5 | End-to-end run on a real kernel: QEMU + `dummy_hcd`/`raw_gadget` | `qa` | Open |
-| 1.6 | Review pass over everything since 0.10.0, root side first | `qa`, `security` | Open; log findings in `docs/QA-LOG.md` |
+| 1.6 | Review pass over everything since 0.10.0, root side first | `qa`, `security` | Done 2026-10-04 (`docs/QA-LOG.md`); fixed in 0.12.0 except 1.11 to 1.13 |
 | 1.7 | Leave hardware/GUI-only modules out of coverage; re-baseline | `qa` | Done |
 | 1.8 | Finish the PKGBUILD; build, install, uninstall cleanly on Manjaro | `packaging` | Open |
 | 1.9 | Release workflow: sdist + wheel, SHA256SUMS, provenance, draft pre-release | `release` | Done: `.github/workflows/release.yml` |
 | 1.10 | mypy on the root-side modules | `qa` | Done: `mypy.yml`, config in `pyproject.toml` |
+| 1.11 | The shared `nobody` account can kill the analyzer and reopen the gate | `security` | Done in 0.13.0: the unit's analyzer runs as `probolos` |
+| 1.12 | Reap the analyzer's whole process tree (subreaper in the gate) | `security` | Open |
+| 1.13 | Agent socket: another process with the analyzer's uid can take its place | `security` | Service done with 1.11; open for a run by hand as `nobody` |

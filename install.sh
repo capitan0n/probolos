@@ -11,6 +11,7 @@
 # What it sets up:
 #   /opt/probolos                      the code, root-owned (it runs as root)
 #   /usr/local/bin/probolos            so `sudo probolos --history` works anywhere
+#   probolos (system account)          what the analyzer runs as (sysusers.d)
 #   probolos.service                   the gate (system service, --privsep)
 #   probolos-agent.service             the KDE/GNOME prompt (user service)
 set -euo pipefail
@@ -26,6 +27,8 @@ UNIT=/etc/systemd/system/probolos.service
 DROPIN_DIR=/etc/systemd/system/probolos.service.d
 AGENT_UNIT=/etc/systemd/user/probolos-agent.service
 AGENT_DROPIN_DIR=/etc/systemd/user/probolos-agent.service.d
+SYSUSERS=/etc/sysusers.d/probolos.conf
+ANALYZER=probolos
 MARKER="# installed by probolos install.sh"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -38,7 +41,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --uninstall) action=uninstall ;;
         --user) [ $# -ge 2 ] || die "--user needs a NAME"; shift; user="$1" ;;
-        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
     shift
@@ -77,6 +80,26 @@ install_all() {
 from probolos import instance
 sys.exit(0 if instance.running() else 1)' "$SRC" 2>/dev/null; then
         die "probolos is already running (in a terminal?). Stop it with Ctrl-C first."
+    fi
+
+    # The analyzer's own account (probolos.service: --privsep-user probolos),
+    # before anything else changes. systemd-sysusers creates it if it is
+    # missing and leaves an existing one alone, so an account of that name
+    # made by someone else is checked, not trusted: a regular account, or the
+    # desktop one, would share the analyzer's uid with processes that can
+    # kill it and reopen the gate.
+    command -v systemd-sysusers >/dev/null || die "systemd-sysusers not found"
+    install -D -m 644 "$SRC/systemd/probolos.sysusers" "$SYSUSERS"
+    systemd-sysusers "$SYSUSERS" || die "could not create the $ANALYZER account"
+    local analyzer analyzer_uid uid_min
+    analyzer="$(getent passwd -- "$ANALYZER")" || die "no $ANALYZER account after systemd-sysusers"
+    analyzer_uid="$(printf '%s' "$analyzer" | cut -d: -f3)"
+    uid_min="$(awk '$1 == "UID_MIN" { print $2 }' /etc/login.defs 2>/dev/null || true)"
+    case "$uid_min" in ''|*[!0-9]*) uid_min=1000 ;; esac
+    case "$analyzer_uid" in ''|*[!0-9]*) die "the $ANALYZER account has no numeric uid" ;; esac
+    if [ "$analyzer_uid" -eq 0 ] || [ "$analyzer_uid" -ge "$uid_min" ] \
+        || [ "$analyzer_uid" -eq "$(printf '%s' "$entry" | cut -d: -f3)" ]; then
+        die "the existing $ANALYZER account (uid $analyzer_uid) is not a system account of its own; remove it and re-run"
     fi
 
     # The code. Root-owned and writable by nobody else: whoever can write the
@@ -175,7 +198,7 @@ uninstall_all() {
     systemctl --global disable --quiet probolos-agent.service 2>/dev/null || true
     user_systemctl stop probolos-agent.service || true
 
-    rm -f "$UNIT" "$AGENT_UNIT"
+    rm -f "$UNIT" "$AGENT_UNIT" "$SYSUSERS"
     # Only our own drop-in: an override.conf from `systemctl edit` is the
     # administrator's, and goes only if it is the last thing there.
     rm -f "$DROPIN_DIR/install.conf" "$AGENT_DROPIN_DIR/install.conf"
@@ -191,7 +214,8 @@ uninstall_all() {
     cat <<EOF
 Probolos is stopped and removed; the gate is open.
 History and remembered devices are kept in /var/lib/probolos
-(delete that folder to erase them too).
+(delete that folder to erase them too). The $ANALYZER account is kept with
+them, since it owns the history (sudo userdel $ANALYZER removes it).
 EOF
 }
 

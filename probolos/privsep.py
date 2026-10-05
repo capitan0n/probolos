@@ -31,8 +31,9 @@ After dropping, the code asserts it cannot regain root (setuid(0) must fail).
 A privilege drop you did not verify is a privilege drop you cannot rely on.
 
 The target user is 'nobody' by default -- present on every Linux system, owns
-nothing. A dedicated 'probolos' user is better for production and is what the
-systemd unit will use; this launcher accepts either.
+nothing. The systemd unit uses a dedicated 'probolos' system account instead
+(systemd/probolos.sysusers): any process with the analyzer's uid can signal
+it, and `nobody` is shared. This launcher accepts either.
 """
 
 from __future__ import annotations
