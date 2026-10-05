@@ -81,28 +81,45 @@ and then admits a keyboard over the air, with no USB event at all.
 These are real and are not hidden:
 
 **Privilege separation is optional.** With `--privsep`, the analyzer runs as
-`nobody`; the root gate handles sysfs writes and read-only device descriptors.
-Startup preparation and protocol/cleanup code also belong to the privileged
-boundary. A dedicated service account is preferable to shared `nobody`.
+`--privsep-user` (default `nobody`; the shipped service uses its own
+`probolos` account); the root gate handles sysfs writes and read-only device
+descriptors. Startup preparation and protocol/cleanup code also belong to the
+privileged boundary.
 
-**Any process running as `nobody` can open the gate (open).** The analyzer's
-uid is the shared `nobody` by default, so any other process with that uid may
-signal it. When the analyzer dies the gate does what it does for every
-analyzer exit: re-blocks what it switched on and sets `authorized_default`
-back to 1 on every hub. The service then restarts after `RestartSec=5`, and
-devices attached in between are admitted by the kernel and become part of the
-next run's untouched baseline. Killing the analyzer after every restart keeps
-the gate open most of the time; stopping it (`SIGSTOP`) instead freezes the
-prompts with the gate closed. Precondition: code execution as `nobody`.
-Mitigation today: `--privsep-user` with a dedicated account that nothing else
-uses (the shipped unit does not do this yet, and it is untested there). The
-fix -- telling an analyzer that exited from one that was killed, and keeping
-the hubs closed for the second -- changes the restore policy and is left for
-the beta.
+**Another process with the analyzer's uid can open the gate (fixed for the
+service in 0.13.0; open for a terminal run as `nobody`).** Any process may
+signal one with its own uid. When the analyzer dies the gate does what it does
+for every analyzer exit: re-blocks what it switched on and sets
+`authorized_default` back to 1 on every hub. Under the service, which restarts
+after `RestartSec=5`, devices attached in between were admitted by the kernel
+and became part of the next run's untouched baseline; killing the analyzer
+after every restart kept the gate open most of the time, and stopping it
+(`SIGSTOP`) froze the prompts with the gate closed. Precondition: code
+execution as the analyzer's account, which was the shared `nobody`.
+
+The service now runs the analyzer as `probolos`, a system account that
+nothing else runs as (`systemd/probolos.sysusers`, created by `install.sh`).
+That leaves root and the analyzer itself able to signal it, and neither needs
+to: root is root, and an analyzer that wants the gate open can simply exit.
+The same holds for the agent socket's directory, below.
+
+The other fix considered -- keeping the hubs closed when the analyzer is
+killed rather than exits -- was not made. It cannot tell the two apart: the
+analyzer's own `SIGTERM` handler reopens the hubs through the gate and exits
+0, so a `SIGTERM` from another process with its uid looks exactly like
+`systemctl stop`. And for the signals it could tell apart it trades a gate
+left open for ports left dead after exit, which ROADMAP §4 ranks the same
+(P0); the OOM killer would then lock a USB-keyboard machine out.
+
+Still open: `--privsep-user` defaults to `nobody`, so a run started by hand
+is exposed as before unless it passes `--privsep-user probolos` (after
+`install.sh`, or `sudo systemd-sysusers "$PWD/systemd/probolos.sysusers"`
+in the checkout, has created the account). A terminal run does not restart,
+so a kill there ends it, visibly.
 
 **The analyzer's descendants can outlive the gate (open).** The gate reaps
 the analyzer it forked, not processes that analyzer forked in turn. A
-compromised analyzer can leave a `nobody` process behind that keeps the
+compromised analyzer can leave a process of its account behind that keeps the
 operator's terminal open after Probolos has exited and reads what is typed
 next there, or that holds the gate's socket so the gate never sees the
 analyzer go. Under the systemd unit `KillMode=control-group` ends every
@@ -248,15 +265,16 @@ group, and the `0660` socket still lets that group open it. Dropping group
 write costs nothing: the analyzer owns the directory and still creates, chmods
 and unlinks its own socket there.
 
-**Still open: the directory's owner.** `2750` removed the group's write
-permission, not the owner's, and the owner is the analyzer's account --
-`nobody` by default, which other processes share. Any process running as
-`nobody` can still unlink `agent.sock` and listen in its place; the agent does
-not check who it connected to, so it would show that process's questions.
+**The directory's owner (closed for the service in 0.13.0).** `2750`
+removed the group's write permission, not the owner's, and the owner is the
+analyzer's account. While that was `nobody`, which other processes share, any
+of them could unlink `agent.sock` and listen in its place; the agent does not
+check who it connected to, so it would show that process's questions.
 Answers to them admit nothing (the real socket still checks `SO_PEERCRED`),
-but the real analyzer loses its agent and holds devices meanwhile. A dedicated
-`--privsep-user` account closes this; so would a root-owned directory with the
-socket bound by root before the drop.
+but the real analyzer lost its agent and held devices meanwhile. The service
+now runs the analyzer as its own `probolos` account, which owns the
+directory and which nothing else runs as. A terminal run under the default
+`--privsep-user nobody` is still exposed.
 
 Two smaller defects on the same path are fixed with it. The socket's mode was
 set with `os.chmod` on a bare, operator-supplied path (`--agent-socket`), which
@@ -277,7 +295,8 @@ agent anyway.
 
 The trust store decides whether a device is admitted **without asking**, so
 whoever can write it can admit hardware. Under `--privsep` the analyzer runs as
-`nobody` — a *shared* account — and that shapes the whole design here.
+`nobody` by default — a *shared* account — and that shapes the whole design
+here, which does not rely on the service's own `probolos` account.
 
 **The two stores are deliberately separated.** Directory write permission is
 stronger than it looks: it allows unlinking and replacing any file in that

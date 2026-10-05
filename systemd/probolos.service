@@ -28,17 +28,25 @@ Type=simple
 #   [Service]
 #   Environment=PROBOLOS_AGENT_USER=yourname
 #
-# Leaving it as `nobody` is deliberate: `nobody` owns no desktop session, so a
-# unit that was never configured fails the way it should -- visibly, with the
-# gate still closed -- instead of handing the prompt to whichever account
-# happened to be logged in when the service started.
-Environment=PROBOLOS_AGENT_USER=nobody
+# The placeholder is the analyzer's own account, deliberately: the gate never
+# lets the account the analyzer runs as answer (that would be the analyzer
+# approving its own questions), so a unit that was never configured fails the
+# way it should -- visibly, with the gate still closed -- instead of handing
+# the prompt to whichever account happened to be logged in when the service
+# started. It used to be `nobody`, while the analyzer ran as `nobody` too;
+# with the analyzer on its own account, `nobody` here would hand the prompt to
+# every process running as `nobody`.
+Environment=PROBOLOS_AGENT_USER=probolos
 # Unbuffered: Python block-buffers a pipe, so without this nothing
 # reached the journal until the process exited, and every line of a
 # run arrived at once with the exit's timestamp.
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 -m probolos --privsep --timeout 0 \
-          --agent --agent-user ${PROBOLOS_AGENT_USER}
+# --privsep-user probolos: the analyzer's own system account, created from
+# probolos.sysusers (install.sh does that). Not the default, the shared
+# `nobody`: any process with the analyzer's uid can kill it, and every
+# analyzer exit reopens the gate. The service does not start without it.
+ExecStart=/usr/bin/python3 -m probolos --privsep --privsep-user probolos \
+          --timeout 0 --agent --agent-user ${PROBOLOS_AGENT_USER}
 Restart=on-failure
 RestartSec=5
 

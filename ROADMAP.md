@@ -136,17 +136,21 @@ behaviour is a **feature**, and goes on the post-1.0 list.
 - [x] **1.6 S** Do a review pass over everything since `0.10.0`, root-side code
   first. Log every finding (§6). Done 2026-10-04 (`docs/QA-LOG.md`, "review
   (security audit)"); fixed in 0.12.0 except 1.11 to 1.13.
-- [ ] **1.11 M** The shared `nobody` account must not be able to open the
+- [x] **1.11 M** The shared `nobody` account must not be able to open the
   gate. Any process running as `nobody` can kill the analyzer, and the gate
   reopens every hub on any analyzer exit (`SECURITY.md`, "Known
   weaknesses"). Run the analyzer as a dedicated account in the shipped unit
   and `install.sh`, and/or keep the hubs closed when the analyzer dies rather
-  than exits. P1.
+  than exits. P1. Done in 0.13.0: the unit runs `--privsep-user probolos`
+  (`systemd/probolos.sysusers`, created by `install.sh`); keeping the hubs
+  closed was not taken (`SECURITY.md` says why).
 - [ ] **1.12 S** Reap the analyzer's whole process tree: a subreaper in the
   gate, so nothing the analyzer forked outlives it on a terminal run. P1.
 - [ ] **1.13 S** The agent socket: a directory the analyzer cannot write, or
   the agent checking `SO_PEERCRED` of the server, so another `nobody`
-  process cannot take its place. P2.
+  process cannot take its place. P2. The service is covered by 1.11 (the
+  directory's owner is `probolos`, which nothing else runs as); a run by hand
+  as `nobody` is not.
 - [x] **1.7 S** Leave hardware- and GUI-only modules out of coverage
   (`interrogate.py`, `countdown_dialog.py`), with the reason written next to
   the setting, then re-baseline both floors.

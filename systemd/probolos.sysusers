@@ -1,0 +1,12 @@
+# The account the --privsep analyzer runs as (probolos.service passes
+# --privsep-user probolos).
+#
+# Its own account, not the shared `nobody`. Any process may signal, ptrace or
+# replace the files of another process with its uid, so under `nobody` every
+# other `nobody` process could kill the analyzer (the gate then reopened every
+# hub) or take over the agent socket. Nothing else runs as `probolos`.
+#
+# A system user and group, no home, no login shell, password locked.
+# install.sh copies this file to /etc/sysusers.d/probolos.conf; a package
+# ships it as /usr/lib/sysusers.d/probolos.conf.
+u probolos - "Probolos USB analyzer" - -

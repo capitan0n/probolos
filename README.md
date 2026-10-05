@@ -92,8 +92,9 @@ through a separate gate. The trusted code also includes startup preparation,
 protocol handling and cleanup; it is not a 150-line security boundary.
 `nobody` is shared: any other process running as `nobody` can kill the
 analyzer, and the gate then reopens (`SECURITY.md`, "Known weaknesses").
-`--privsep-user` takes a dedicated account instead; the shipped unit does not
-use one yet.
+`--privsep-user` takes a dedicated account instead: the service runs the
+analyzer as `probolos`, a system account `install.sh` creates, and a run by
+hand can pass `--privsep-user probolos` once it exists.
 `--agent` moves the prompt into a desktop dialog: one dialog for a plain
 storage device, a second confirmation for anything that can type or carry
 traffic or showed a warning, and a 10-second countdown before "Allow anyway"
@@ -176,6 +177,7 @@ of watched readers read-only and switch those readers off. See `SECURITY.md`.
 |---|---|
 | `--observe SEC` | length of the behavioural quarantine (`0` disables stage 3) |
 | `--privsep` | run the analyzer as `nobody` behind a separate root gate |
+| `--privsep-user USER` | the analyzer's account instead of `nobody` (the service: `probolos`) |
 | `--agent` | ask via a desktop dialog instead of the terminal |
 | `--dry-run` | report everything, change nothing |
 | `--list` | read-only inventory of attached devices; never closes the gate |
@@ -292,6 +294,7 @@ Builders and fixtures used by more than one file are in `tests/_support.py`.
 | `test_properties.py` | property-based (Hypothesis), across modules: descriptor, medium and protocol parsing, `textsafe`, the state files, the agent socket |
 | `test_quarantine.py` | `quarantine`, `payload`, `deferred_bind` |
 | `test_rules.py` | `rules`, `analyzers`, `report` |
+| `test_service.py` | the shipped service: `systemd/probolos.service`, `systemd/probolos.sysusers`, `install.sh` |
 | `test_storage.py` | `storage`, `storage_hardening`, `mediawatch` |
 | `test_sysfs.py` | `sysfs` |
 | `test_testbed.py` | `testbed.spawn`, `testbed.emulate`: every preset builds and raises what `testbed/README.md` promises (for the drift pair: same identity, different fingerprint) |
@@ -332,7 +335,7 @@ Short version:
   and hardened, but the report descriptor is not in the sysfs blob and has no
   source wired to it. `CAPABILITIES.md` §2.2 and §3.2.
 
-Status: **alpha, 0.12.0**, feature-frozen since 0.11.0 on the way to 1.0
+Status: **alpha, 0.13.0**, feature-frozen since 0.11.0 on the way to 1.0
 ([`ROADMAP.md`](ROADMAP.md)). The tree has been through several security
 review passes, the latest on 2026-10-04 ([`docs/QA-LOG.md`](docs/QA-LOG.md));
 each fixed finding has a regression test named after the defect, under

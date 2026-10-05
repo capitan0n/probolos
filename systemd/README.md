@@ -15,9 +15,11 @@ sudo ./install.sh --uninstall    # stop and remove; /var/lib/probolos is kept
 
 It does what the manual steps below do, and more: code to `/opt/probolos`
 (root-owned, since a root service must not run code its user can edit), a
-`probolos` command in `/usr/local/bin`, both units with local settings in
-drop-ins (`PROBOLOS_AGENT_USER` = the account that ran `sudo`), and it starts
-both. It refuses while a probolos started by hand is still running.
+`probolos` command in `/usr/local/bin`, the `probolos` system account the
+analyzer runs as, both units with local settings in drop-ins
+(`PROBOLOS_AGENT_USER` = the account that ran `sudo`), and it starts both. It
+refuses while a probolos started by hand is still running. Uninstalling keeps
+the `probolos` account, which owns the kept history.
 
 **By hand.** Put the source at `/opt/probolos`, owned by root. (No
 distribution package exists yet; ROADMAP 1.8.) Then install the units and give each the settings `install.sh`
@@ -26,6 +28,10 @@ because it installs the agent for every account; a unit in your own
 `~/.config/systemd/user` runs only for you and does not need it.)
 
 ```bash
+# the analyzer's own account: the unit runs --privsep-user probolos, and does
+# not start without it
+sudo install -D -m 644 systemd/probolos.sysusers /etc/sysusers.d/probolos.conf
+sudo systemd-sysusers /etc/sysusers.d/probolos.conf
 # the gate, as root
 sudo cp systemd/probolos.service /etc/systemd/system/
 sudo systemctl edit probolos.service
@@ -34,9 +40,9 @@ sudo systemctl edit probolos.service
 ```ini
 [Service]
 Environment=PYTHONPATH=/opt/probolos
-# The account whose desktop answers. The unit ships the placeholder `nobody`,
-# the analyzer's own account, so the gate turns the agent off: every new
-# device is then held blocked, with nobody asked.
+# The account whose desktop answers. The unit ships the placeholder
+# `probolos`, the analyzer's own account, so the gate turns the agent off:
+# every new device is then held blocked, with nobody asked.
 Environment=PROBOLOS_AGENT_USER=yourname
 ```
 
@@ -79,7 +85,7 @@ and then fails to start its agent will leave you approving devices from a
 terminal you have to find. Run it by hand until you are satisfied:
 
 ```bash
-sudo python -m probolos --privsep --agent
+sudo python -m probolos --privsep --privsep-user probolos --agent
 python -m probolos.agent
 ```
 

@@ -222,8 +222,9 @@ and the agent shows a display-only "still blocked, replug it" notice
 A separate root gate (`gate_server.py`) performs the only privileged operations —
 writing `authorized`, opening input and block nodes read-only — and passes file
 descriptors over a `SEQPACKET` socket with `SCM_RIGHTS` to an analyzer running
-as `nobody`. The privilege drop is verified, including that `setuid(0)` fails
-afterwards.
+as `nobody`, or the account `--privsep-user` names (the systemd service: its
+own `probolos` system account). The privilege drop is verified, including
+that `setuid(0)` fails afterwards.
 
 The gate distinguishes temporary activation from final admission. Read scope
 follows the USB device ancestor, skipping interface nodes, and requires blocked
