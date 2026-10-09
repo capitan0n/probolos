@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import pwd
+import re
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -229,6 +230,49 @@ class VersionHasOneSource(unittest.TestCase):
         self.assertTrue(
             probolos.__version__ in (declared, declared + "+source"),
             f"{probolos.__version__!r} does not match pyproject {declared!r}")
+
+
+# ==========================================================================
+# README.md is the PyPI project page too
+# ==========================================================================
+
+class ReadmeLinksWorkOnPyPI(unittest.TestCase):
+    """
+    PyPI shows README.md with no repository around it, so a relative link
+    such as `ROADMAP.md` points nowhere there. Every link must be an absolute
+    https URL or an anchor on the page, and every reference link needs its
+    definition: a missing one renders as plain text, on GitHub too.
+    """
+
+    REPO = "https://github.com/capitan0n/probolos/blob/main/"
+
+    def setUp(self):
+        self.root = Path(__file__).resolve().parent.parent
+        self.text = (self.root / "README.md").read_text(encoding="utf-8")
+        # [label]: target
+        self.defined = {
+            label.lower(): target for label, target in re.findall(
+                r"^ {0,3}\[([^\]]+)\]:\s*(\S+)", self.text, re.M)}
+
+    def test_every_link_is_absolute(self):
+        # [text](target), and the targets of the definitions
+        targets = re.findall(r"\]\(\s*<?([^)\s>]+)", self.text)
+        targets += self.defined.values()
+        self.assertTrue(targets, "no links found: the pattern is broken")
+        relative = [t for t in targets
+                    if not t.startswith(("https://", "mailto:", "#"))]
+        self.assertEqual(relative, [])
+
+    def test_every_reference_link_is_defined(self):
+        used = {label.lower()
+                for label in re.findall(r"\]\[([^\]]+)\]", self.text)}
+        self.assertEqual(used - self.defined.keys(), set())
+
+    def test_links_into_the_repository_name_files_it_has(self):
+        for target in self.defined.values():
+            if target.startswith(self.REPO):
+                path = target[len(self.REPO):].split("#", 1)[0]
+                self.assertTrue((self.root / path).is_file(), target)
 
 
 class OneCommandPerRunAndDryRunChangesNothing(unittest.TestCase):

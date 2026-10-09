@@ -17,7 +17,7 @@ first list corresponds to code on an execution path that actually runs. Anything
 that exists in the tree but is not reachable is in the second list, not the
 first — that distinction is the point of this document.
 
-Status: **alpha**. Validated largely under software emulation
+Status: **beta**. Validated largely under software emulation
 (`dummy_hcd`/`raw_gadget`); real-hardware coverage is limited.
 
 ---

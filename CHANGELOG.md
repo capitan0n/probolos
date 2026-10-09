@@ -3,6 +3,52 @@
 All notable changes to Probolos. Versions follow PEP 440
 (`1.0.0b1` < `1.0.0rc1` < `1.0.0`).
 
+## [1.0.0b1] — 2026-10-09 · first beta
+
+The first beta. The feature set is still the one frozen at 0.11.0
+(`CAPABILITIES.md` §1), hardened by 0.12.0 and 0.13.0; nothing Probolos does
+has changed since 0.13.0. What is new is how it is released: on PyPI as well
+as on GitHub.
+
+### Packaging
+
+- **On PyPI.** `release.yml` uploads each tag's sdist and wheel by trusted
+  publishing, so there is no API token to store or leak: to TestPyPI as soon
+  as they are built, then to PyPI once the maintainer approves the `pypi`
+  environment, with the draft release and the TestPyPI upload there to be
+  checked first. Only the files the build job hashed and attested go up,
+  checked against its `SHA256SUMS`, and each carries a PEP 740 attestation
+  signed by the workflow that uploaded it. PyPI and GitHub are set up for it
+  by hand, once (`docs/GITHUB-SETUP.md`, ROADMAP 1.14).
+- The package metadata says `Development Status :: 4 - Beta`.
+
+### Documentation
+
+- `README.md` is also the project page on PyPI, where a relative link points
+  nowhere: its links to the other documents are absolute. It and
+  `CAPABILITIES.md` say beta.
+- `docs/GITHUB-SETUP.md`: the one-time PyPI setup (pending publishers on
+  PyPI and TestPyPI, the `testpypi` and `pypi` environments, the allowed
+  action) and the steps of each release. `ROADMAP.md`: 1.14, PyPI.
+
+### QA
+
+- `tests/test_cli.py`: every link in `README.md` is an absolute https URL or
+  an anchor, every reference link is defined, and the links into the
+  repository name files it has. The first fails on 0.13.0.
+- Deep property run (`HYPOTHESIS_PROFILE=deep`) on the 1.0.0b1 tree: clean
+  (`docs/QA-LOG.md`).
+
+### Known open issues
+
+Still open from ROADMAP Phase 1 (`SECURITY.md`, "Known weaknesses", has the
+full list):
+
+- The analyzer's descendants can outlive the gate on a terminal run (1.12).
+- A run by hand without `--privsep-user probolos` leaves the analyzer on the
+  shared `nobody` account, where any other `nobody` process can kill it,
+  which reopens the gate, or take over the agent socket (1.11, 1.13).
+
 ## [0.13.0] — 2026-10-05 · the analyzer's own account
 
 Still alpha, still frozen at the 0.11.0 feature set (`CAPABILITIES.md` §1).

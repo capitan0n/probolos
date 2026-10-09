@@ -1,7 +1,7 @@
 # GitHub setup for the road to 1.0.0
 
-ROADMAP 0.4 and 0.5, written out to be applied by hand in the repository
-settings. Nothing here changes code.
+ROADMAP 0.4 and 0.5, and the PyPI side of 1.14, written out to be applied by
+hand in the repository settings and on PyPI. Nothing here changes code.
 
 ## Labels (Issues → Labels)
 
@@ -83,10 +83,12 @@ flags stay editable. A deleted immutable release frees the tag but not the
 name: a bad published asset means a new patch version. Drafts stay mutable,
 which is how `release.yml` works (draft, check, publish).
 
-**5. Actions** (Settings → Actions → General): allow only actions created by
-GitHub and tick **Require actions to be pinned to a full-length commit
-SHA**. Every `uses:` in `.github/workflows/` is an `actions/*` action pinned
-to a SHA today, and Dependabot keeps the pins current.
+**5. Actions** (Settings → Actions → General): allow actions created by
+GitHub, plus `pypa/gh-action-pypi-publish@*` under **Allow specified actions
+and reusable workflows** (`release.yml`'s PyPI uploads), and tick **Require
+actions to be pinned to a full-length commit SHA**. Every `uses:` in
+`.github/workflows/` is an `actions/*` action or that one, pinned to a SHA,
+and Dependabot keeps the pins current.
 
 **6. Check what could not be read from here**: Settings → Advanced Security
 (Secret Protection with push protection, Dependabot alerts and security
@@ -97,6 +99,63 @@ Later, optional: a `release` environment (Settings → Environments; tag
 pattern `v*`; required reviewer the maintainer, "Prevent self-review" off)
 named in `release.yml`'s build and draft jobs, so nothing is attested or
 drafted without a click.
+
+## Publishing to PyPI (ROADMAP 1.14)
+
+`release.yml` uploads each tag's sdist and wheel twice: to TestPyPI as soon
+as they are built, and to PyPI once the maintainer approves. Both use trusted
+publishing: the index checks the job's OIDC token against a publisher
+registered for this repository, workflow and environment, and hands back an
+upload token that lives for minutes. There is no API token to create, store
+or leak. Set up once, before the first tag that should reach PyPI:
+
+**1. Accounts** on pypi.org and on test.pypi.org (two sites, two accounts),
+each with two-factor authentication.
+
+**2. Pending publishers.** On each site, Your account → Publishing
+(`/manage/account/publishing/`), add a pending publisher of type GitHub:
+
+| Field | pypi.org | test.pypi.org |
+|---|---|---|
+| PyPI Project Name | `probolos` | `probolos` |
+| Owner | `capitan0n` | `capitan0n` |
+| Repository name | `probolos` | `probolos` |
+| Workflow name | `release.yml` | `release.yml` |
+| Environment name | `pypi` | `testpypi` |
+
+A pending publisher does not reserve the name: until the first upload,
+anyone can register `probolos`. The first upload creates the project and
+makes the pending publisher its publisher.
+
+**3. Environments** (Settings → Environments → New environment). The
+publishers check the environment's name, so a job outside it cannot upload.
+
+- `testpypi`: Deployment branches and tags → Selected branches and tags →
+  add a rule of type Tag, pattern `v*`. No reviewers: a TestPyPI upload is a
+  rehearsal.
+- `pypi`: the same tag rule, and **Required reviewers**: the maintainer,
+  with "Prevent self-review" off (whoever pushed the tag must be able to
+  approve).
+
+**4. Allowed actions.** If step 5 of "Release protection" is applied, it
+must allow `pypa/gh-action-pypi-publish@*`, as written there.
+
+**Each release** then goes: tag → checks → build → the draft release and the
+TestPyPI upload → the `pypi` job waits for approval (Actions → the run →
+Review deployments). Before approving, look at
+https://test.pypi.org/project/probolos/ (the README renders, the metadata
+says what it should), and check that TestPyPI serves the file the draft
+holds:
+
+```bash
+pip download --no-deps --index-url https://test.pypi.org/simple/ \
+    --dest /tmp/probolos-check "probolos==1.0.0b1"
+sha256sum /tmp/probolos-check/*   # the same line as in the draft's SHA256SUMS
+```
+
+Then approve, and once PyPI has the files, publish the draft. Nothing on
+PyPI can be replaced: a deleted file keeps its name, so a bad upload means a
+new version (`1.0.0b2`), never the same one again.
 
 ## Archiving the 1.0.0 release (ROADMAP 4.2)
 
@@ -116,7 +175,7 @@ item as done in the issue when its change lands.
 | 1.1 | Test the gate's refusal paths; boundary coverage ≥ 90% | `qa` | Done: `tests/test_boundary.py`, boundary 95%, floors 93/83 |
 | 1.2 | `MSG_CRITICAL` says "Use the terminal" and `notify_critical` has no caller | `bug` | Done: made true (critical-urgency "still blocked" notice) |
 | 1.3 | SECURITY.md: threat model for REQ_TRUST, holding, the textsafe cut, dialog exit codes | `docs`, `security` | Done |
-| 1.4 | Deep property run before each beta (`HYPOTHESIS_PROFILE=deep`) | `qa` | Clean on `aa2a0d3` (QA-LOG); repeat on the commit tagged b1 |
+| 1.4 | Deep property run before each beta (`HYPOTHESIS_PROFILE=deep`) | `qa` | Clean on the 1.0.0b1 tree, 2026-10-09 (QA-LOG); repeat on the commit tagged b1 |
 | 1.5 | End-to-end run on a real kernel: QEMU + `dummy_hcd`/`raw_gadget` | `qa` | Open |
 | 1.6 | Review pass over everything since 0.10.0, root side first | `qa`, `security` | Done 2026-10-04 (`docs/QA-LOG.md`); fixed in 0.12.0 except 1.11 to 1.13 |
 | 1.7 | Leave hardware/GUI-only modules out of coverage; re-baseline | `qa` | Done |
@@ -126,3 +185,4 @@ item as done in the issue when its change lands.
 | 1.11 | The shared `nobody` account can kill the analyzer and reopen the gate | `security` | Done in 0.13.0: the unit's analyzer runs as `probolos` |
 | 1.12 | Reap the analyzer's whole process tree (subreaper in the gate) | `security` | Open |
 | 1.13 | Agent socket: another process with the analyzer's uid can take its place | `security` | Service done with 1.11; open for a run by hand as `nobody` |
+| 1.14 | Publish to PyPI: trusted publishing, TestPyPI first, approval for PyPI | `release`, `packaging` | Workflow done (`release.yml`); publishers and environments by hand (above); done when 1.0.0b1 is on PyPI |

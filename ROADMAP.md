@@ -72,6 +72,10 @@ behaviour is a **feature**, and goes on the post-1.0 list.
   `probolos/__init__.py`.
 - **Tag** each release with a signed tag (`git tag -s`), on a commit of
   `main`: `release.yml` refuses any other.
+- **PyPI** gets every tag from `1.0.0b1` on, betas and rcs included, once
+  the maintainer approves the upload (1.14). A file on PyPI can never be
+  uploaded again, not even after it is deleted: a bad upload means the next
+  version.
 - **`0.12.0`** is a release inside the freeze, not a new stage: the fixes
   from the 2026-10-04 security audit (Phase 1.6), no features. The beta still
   waits for the Phase 1 exit below.
@@ -162,10 +166,15 @@ behaviour is a **feature**, and goes on the post-1.0 list.
   - add a build-provenance attestation;
   - create a **draft** pre-release, which you publish yourself.
 - [x] **1.10 C** Run mypy on the root-side modules.
+- [ ] **1.14 S** Publish to PyPI. `release.yml` uploads each tag's sdist and
+  wheel by trusted publishing (no stored token): to TestPyPI at once, to
+  PyPI when the maintainer approves the `pypi` environment. The publishers
+  and environments are set up by hand (`docs/GITHUB-SETUP.md`). Done when
+  `1.0.0b1` is on PyPI.
 
 **Exit:** every M item done, and every S item done or consciously moved. CI is
-green. Then bump to `1.0.0b1`, update the changelog, tag it, and publish a
-pre-release.
+green. Then bump to `1.0.0b1`, update the changelog, tag it, approve the
+PyPI upload, and publish the pre-release.
 
 ### Phase 2: beta (`1.0.0b1`, `b2`, …)
 
@@ -215,6 +224,7 @@ are complete.
   - set the changelog date;
   - signed tag;
   - a GitHub release (not a pre-release);
+  - the PyPI upload, approved;
   - the AUR package, if 1.8 was done.
 - [ ] **4.2 S** Archive it for citation. Save the repository in Software
   Heritage, and mint a Zenodo DOI for the release; cite that DOI in the

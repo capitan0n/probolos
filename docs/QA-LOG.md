@@ -100,6 +100,7 @@ ROADMAP §4 (P0–P3). **Fix commit** is filled in once the fix is committed;
 | 2026-10-03 | `aa2a0d3` (0.11.0 and the first Phase 1 batch) | 26 property tests, 7500 examples each, Python 3.11 | Clean, 630 s; nothing found |
 | 2026-10-04 | `ed0ad1a` (before the 0.12.0 fixes) | 26 property tests, 7500 examples each, Python 3.11 | Clean, 659 s; nothing found |
 | 2026-10-04 | 0.12.0 working tree, uncommitted (the audit's fixes on `ed0ad1a`) | 26 property tests, 7500 examples each, Python 3.11 | Clean, 620 s; nothing found. Repeat on the commit tagged `v0.12.0` |
+| 2026-10-09 | 1.0.0b1 working tree, uncommitted (the release changes on `118c545`; no code change since 0.13.0) | 26 property tests, 7500 examples each, Python 3.13, Hypothesis 6.168.3 | Clean, 727 s; nothing found. Repeat on the commit tagged `v1.0.0b1` |
 
 ## Mutation testing
 

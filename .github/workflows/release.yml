@@ -3,8 +3,10 @@ name: release
 # A version tag (v0.12.0, v1.0.0b1, v1.0.0rc1, v1.0.0) on a commit of main
 # runs the checks, builds the sdist and the wheel, writes SHA256SUMS, attests
 # where they were built, and opens a DRAFT release with all of it attached.
-# Nothing is published: the maintainer reads the draft and publishes it by
-# hand. Nothing goes to PyPI.
+# The same sdist and wheel go to TestPyPI, then wait: PyPI gets them only
+# when the maintainer approves the `pypi` environment, and the GitHub release
+# is published by hand from the draft. Both uploads use trusted publishing,
+# an OIDC token with no stored secret; docs/GITHUB-SETUP.md sets them up.
 on:
   push:
     tags: ["v*"]
@@ -59,6 +61,7 @@ jobs:
       attestations: write
     outputs:
       prerelease: ${{ steps.version.outputs.prerelease }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -100,6 +103,7 @@ jobs:
             exit 1
           fi
           prerelease="$(python -c 'import sys; from packaging.version import Version; print(str(Version(sys.argv[1]).is_prerelease).lower())' "$version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
       # --no-isolation: build with the pinned setuptools just installed, not
       # whatever is newest on PyPI. SOURCE_DATE_EPOCH (the commit time) makes
@@ -147,3 +151,65 @@ jobs:
             --repo "$REPO" --draft "${kind[@]}" --verify-tag \
             --title "Probolos ${TAG#v}" \
             --notes "See CHANGELOG.md for what changed. Verify a download with \`sha256sum -c SHA256SUMS\` and \`gh attestation verify <file> --repo $REPO\`."
+
+  # The same two files to TestPyPI first: the upload rehearsed end to end (the
+  # publisher, the environment, the metadata and the README as PyPI renders
+  # it) on an index where a mistake costs nothing. No reviewer: a TestPyPI
+  # upload is not a release.
+  testpypi:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # The trusted publisher on test.pypi.org names this workflow and this
+    # environment; no other job, workflow or repository can upload through it.
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/probolos/${{ needs.build.outputs.version }}/
+    permissions:
+      # Trusted publishing: the OIDC token that TestPyPI exchanges for an
+      # upload token valid for minutes, and that signs the PEP 740
+      # attestations. Nothing else: the artifact comes from this same run.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      # Exactly the files the build job hashed and attested. SHA256SUMS goes
+      # once it has been checked: twine refuses a file that is not a
+      # distribution.
+      - name: The sdist and the wheel, as built
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS && rm SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # TestPyPI, like PyPI, never takes the same file name twice, even
+          # after a deletion. Without this, a second run for the same version
+          # (every job re-run, or the tag pushed again) would stop here and
+          # never reach PyPI. The price: TestPyPI keeps the first run's files.
+          skip-existing: true
+
+  # PyPI, which cannot be undone: a file uploaded there keeps its name
+  # forever, even after it is deleted, so a bad upload means a new version.
+  # The job waits for the maintainer to approve the `pypi` environment, with
+  # the draft and the TestPyPI upload there to be checked first.
+  pypi:
+    needs: [build, draft, testpypi]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/probolos/${{ needs.build.outputs.version }}/
+    permissions:
+      # As for TestPyPI: the OIDC token for trusted publishing, nothing else.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - name: The sdist and the wheel, as built
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS && rm SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

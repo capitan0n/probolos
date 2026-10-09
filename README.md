@@ -1,14 +1,14 @@
 # Probolos
 
-> **Alpha — under active development.** This is an early, research-stage
+> **Beta — feature-complete, still being tested.** This is a research-stage
 > project. The admission path has been exercised on real hardware and has
 > automated regression coverage, but **it has never been run against an actual
 > attack**: no BadUSB fixture (ATmega32u4, Raspberry Pi Zero, O.MG cable) has
 > been put through the behavioural quarantine, so the claim that matters most
 > is the one with the least evidence behind it. The feature set is frozen at
 > 0.11.0 on the way to 1.0: until then only fixes, tests and documentation go
-> in ([`ROADMAP.md`](ROADMAP.md)). Known open weaknesses are listed in
-> [`SECURITY.md`](SECURITY.md), "Known weaknesses".
+> in ([`ROADMAP.md`][roadmap]). Known open weaknesses are listed in
+> [`SECURITY.md`][security], "Known weaknesses".
 > **Do not rely on it as a security control on a machine you care about.** Treat
 > everything here as experimental and report anything that surprises you.
 
@@ -224,7 +224,7 @@ blocked, or authorize it with `echo 1 | sudo tee /sys/bus/usb/devices/<name>/aut
 
 ## Running as a service
 
-`sudo ./install.sh` does all of it. See [`systemd/README.md`](systemd/README.md)
+`sudo ./install.sh` does all of it. See [`systemd/README.md`][systemd]
 for what it sets up by hand: the two units (a system
 service for the gate, a user service for the agent) and what the sandboxing
 does.
@@ -309,11 +309,11 @@ CRITICAL paths can be exercised with no hardware.
 
 ## Scope
 
-[`CAPABILITIES.md`](CAPABILITIES.md) is the authoritative list of what Probolos
+[`CAPABILITIES.md`][capabilities] is the authoritative list of what Probolos
 does, what it does not do, and what may be built later. Read it first — it
 distinguishes between code that runs and code that merely exists in the tree.
 
-[`SECURITY.md`](SECURITY.md) covers the threat model and is explicit about what
+[`SECURITY.md`][security] covers the threat model and is explicit about what
 Probolos does **not** stop: USB stack vulnerabilities, a patient attacker,
 descriptor forgery, Thunderbolt/DMA, and wireless gateways.
 
@@ -335,9 +335,9 @@ Short version:
   and hardened, but the report descriptor is not in the sysfs blob and has no
   source wired to it. `CAPABILITIES.md` §2.2 and §3.2.
 
-Status: **alpha, 0.13.0**, feature-frozen since 0.11.0 on the way to 1.0
-([`ROADMAP.md`](ROADMAP.md)). The tree has been through several security
-review passes, the latest on 2026-10-04 ([`docs/QA-LOG.md`](docs/QA-LOG.md));
+Status: **beta, 1.0.0b1**, feature-frozen since 0.11.0 on the way to 1.0
+([`ROADMAP.md`][roadmap]). The tree has been through several security
+review passes, the latest on 2026-10-04 ([`docs/QA-LOG.md`][qa-log]);
 each fixed finding has a regression test named after the defect, under
 `tests/`, and the ones still open are listed in `SECURITY.md`.
 
@@ -358,9 +358,9 @@ ATmega32u4 in and watches what happens.
 
 Treat every real-world result as data rather than a guarantee, and report
 anything that surprises you. What is not done is listed in
-[`CAPABILITIES.md`](CAPABILITIES.md) §2.2 and §3, the plan to 1.0 is
-[`ROADMAP.md`](ROADMAP.md), and defects found since the freeze are logged in
-[`docs/QA-LOG.md`](docs/QA-LOG.md).
+[`CAPABILITIES.md`][capabilities] §2.2 and §3, the plan to 1.0 is
+[`ROADMAP.md`][roadmap], and defects found since the freeze are logged in
+[`docs/QA-LOG.md`][qa-log].
 
 ---
 
@@ -369,7 +369,17 @@ anything that surprises you. What is not done is listed in
 GPL-3.0-or-later: Probolos is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or (at your
-option) any later version. See [`LICENSE`](LICENSE).
+option) any later version. See [`LICENSE`][license].
 
-Note the warranty disclaimer in particular: this is alpha, security-relevant
+Note the warranty disclaimer in particular: this is beta, security-relevant
 software provided as-is. You are responsible for what you run it on.
+
+<!-- Absolute links: this file is also the project page on PyPI, where a
+     relative link points nowhere (tests/test_cli.py checks it). -->
+
+[capabilities]: https://github.com/capitan0n/probolos/blob/main/CAPABILITIES.md
+[license]: https://github.com/capitan0n/probolos/blob/main/LICENSE
+[qa-log]: https://github.com/capitan0n/probolos/blob/main/docs/QA-LOG.md
+[roadmap]: https://github.com/capitan0n/probolos/blob/main/ROADMAP.md
+[security]: https://github.com/capitan0n/probolos/blob/main/SECURITY.md
+[systemd]: https://github.com/capitan0n/probolos/blob/main/systemd/README.md
