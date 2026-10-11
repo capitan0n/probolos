@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import atomicio
+from . import atomicio, usbclass
 
 def default_path() -> Path:
     """
@@ -191,6 +191,9 @@ MAX_PORTS = 32            # more ports than any machine has
 # known_hashes, and the first element is kept for the same reason: it is the
 # baseline, and a slot fed enough different cards must not wash it out.
 MAX_MEDIA_LAYOUTS = 32
+# Distinct device types per identity. Same shape of bound as known_hashes, and
+# the first is kept for the same reason: it is what the device said it was.
+MAX_KNOWN_TYPES = 32
 
 
 @dataclass
@@ -224,6 +227,14 @@ class Entry:
     # CRITICAL rule fires on. The normalized fingerprint above is what the
     # alarm reads; this is only ever displayed.
     raw_hash: str = ""
+    # What the device's interfaces say it is, in short words: "mouse",
+    # "storage+keyboard". The most recent readable sighting; "" when no
+    # sighting could be parsed (or the entry predates this field).
+    device_type: str = ""
+    # Every distinct device_type seen under this identity, the first kept.
+    # Length > 1 is the readable form of the drift alarm: a flash drive that
+    # now also claims a keyboard shows up as "storage -> storage+keyboard".
+    known_types: List[str] = field(default_factory=list)
 
     @classmethod
     def from_raw(cls, raw) -> Optional["Entry"]:
@@ -335,6 +346,8 @@ class Entry:
             known_hashes=known,
             baseline_hash=baseline,
             raw_hash=as_str(raw.get("raw_hash")) or "",
+            device_type=as_str(raw.get("device_type")) or "",
+            known_types=as_str_list(raw.get("known_types")),
         )
 
 
@@ -457,6 +470,31 @@ def raw_descriptor_hash(dev) -> Optional[str]:
     """
     raw = getattr(dev, "raw_descriptors", None)
     return hashlib.sha256(raw).hexdigest() if raw else None
+
+
+def device_type(dev) -> str:
+    """
+    What a device's interfaces say it is, in short words joined by "+".
+
+    Built from the class codes through usbclass's fixed table, never from the
+    product string: that string is the device's own and can say anything,
+    while every word this returns is one Probolos wrote. "" when there is
+    nothing to go on (descriptors unparsed and no device class).
+    """
+    names: List[str] = []
+    ifaces = sorted(getattr(dev, "interfaces", None) or [],
+                    key=lambda i: (i.number, i.alternate))
+    for i in ifaces:
+        name = usbclass.short_name(i.interface_class, i.interface_subclass,
+                                   i.interface_protocol)
+        if name not in names:
+            names.append(name)
+    if not names:
+        # 0x00 means "see the interfaces", which we could not read.
+        cls = getattr(dev, "device_class", None)
+        if cls:
+            names.append(usbclass.short_name(cls, 0, 0))
+    return "+".join(names)
 
 
 def _bounded(items: List[str], limit: int) -> List[str]:
@@ -684,6 +722,7 @@ class Ledger:
         key = identity_of(dev)
         digest = descriptor_fingerprint(dev) or "-"
         raw = raw_descriptor_hash(dev) or "-"
+        kind = device_type(dev)
         # "-" is the placeholder for a device whose descriptors could not be
         # read. It must never become a baseline: the next readable appearance
         # would then differ from it and be reported as drift, which is a
@@ -703,6 +742,8 @@ class Ledger:
                 # never itself a finding.
                 baseline_hash=digest if pinnable else "",
                 raw_hash=raw,
+                device_type=kind,
+                known_types=[kind] if kind else [],
             )
             return
 
@@ -710,6 +751,13 @@ class Ledger:
         entry.times_seen += 1
         entry.descriptor_hash = digest      # most recent, for display only
         entry.raw_hash = raw                # ditto -- forensics only
+        # An unreadable sighting says nothing about the type, so it neither
+        # replaces the last one nor counts as a new one.
+        if kind:
+            entry.device_type = kind
+            if kind not in entry.known_types:
+                entry.known_types = _bounded(entry.known_types + [kind],
+                                             MAX_KNOWN_TYPES)
         if pinnable and (approved or not entry.baseline_hash):
             entry.baseline_hash = digest
         if digest not in entry.known_hashes:

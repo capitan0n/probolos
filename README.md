@@ -182,7 +182,7 @@ of watched readers read-only and switch those readers off. See `SECURITY.md`.
 | `--dry-run` | report everything, change nothing |
 | `--list` | read-only inventory of attached devices; never closes the gate |
 | `--trusted` / `--remove-trusted N\|all` | list and revoke remembered devices (history is kept) |
-| `--history [-v]` | every device seen, its decisions and descriptor drift |
+| `--history [-v]` | every device seen, its type, decisions and descriptor drift |
 | `--remove-all` | clear remembered devices **and** history; asks first, refuses while the daemon runs |
 | `--no-storage-scan` | skip stage 4 entirely |
 | `--watch-media` | inspect and alert on cards inserted into admitted readers (detection only) |

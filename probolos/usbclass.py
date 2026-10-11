@@ -239,6 +239,49 @@ def plain_name(cls: int, subcls: int, proto: int) -> str:
     return _PLAIN_NAMES.get(cls, class_name(cls).lower())
 
 
+# One word or so per class, for a table column (`--history`). Same facts as
+# _PLAIN_NAMES, cut to fit; the full words are for the prompt, where a person
+# has to decide something, and this is for a list they are scanning.
+_SHORT_NAMES = {
+    0x01: "audio",
+    0x02: "network",
+    0x05: "physical",
+    0x06: "camera",
+    0x07: "printer",
+    0x08: "storage",
+    0x09: "hub",
+    0x0A: "network",            # the data half of class 0x02
+    0x0B: "smartcard",
+    0x0D: "content-sec",
+    0x0E: "webcam",
+    0x0F: "healthcare",
+    0x10: "audio/video",
+    0x11: "billboard",
+    0x12: "typec-bridge",
+    0xDC: "diagnostic",
+    0xE0: "wireless",
+    0xEF: "misc",
+    0xFE: "app-specific",
+    0xFF: "vendor",
+}
+
+
+def short_name(cls: int, subcls: int, proto: int) -> str:
+    """
+    What one interface is, in a word or two.
+
+    An undeclared HID interface is "hid?", not "input": like plain_name(), it
+    has not said what it is, and it may well be a keyboard.
+    """
+    if cls == HID_CLASS:
+        if is_keyboard(cls, subcls, proto):
+            return "keyboard"
+        if is_mouse(cls, subcls, proto):
+            return "mouse"
+        return "hid?"
+    return _SHORT_NAMES.get(cls, f"class-{cls:02x}")
+
+
 def capability(cls: int) -> str:
     """What an interface of this class can do once switched on."""
     return _CAPABILITIES.get(

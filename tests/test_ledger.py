@@ -8,11 +8,13 @@ Covers probolos.ledger and probolos.history.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import io
 import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import asdict
@@ -64,6 +66,8 @@ GOOD = {
     "known_hashes": ["ab" * 32],
     "baseline_hash": "ab" * 32,
     "raw_hash": "ab" * 32,
+    "device_type": "storage",
+    "known_types": ["storage"],
 }
 
 
@@ -609,6 +613,122 @@ class OldLedgerMigration(unittest.TestCase):
         self.assertFalse(
             any(f.rule_id == "descriptor-drift" for f in findings),
             "same stick, different port -> no alarm even after migration")
+
+
+class DeviceTypeIsRecordedAndShown(unittest.TestCase):
+    """
+    `--history` listed 045e:00cb and nothing else: the ledger kept no type, so
+    telling a mouse from a flash drive meant looking the IDs up. The type comes
+    from the interface classes through Probolos's own words, never from the
+    product string the device wrote.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "ledger.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_type_comes_from_interface_classes(self):
+        self.assertEqual(ledger_mod.device_type(
+            make_device(descriptor_blob((0x03, 0x01, 0x02)))), "mouse")
+        self.assertEqual(ledger_mod.device_type(make_device()), "storage")
+        self.assertEqual(ledger_mod.device_type(make_device(descriptor_blob(
+            (0x08, 0x06, 0x50), (0x03, 0x01, 0x01)))), "storage+keyboard")
+
+    def test_undeclared_hid_is_not_called_harmless(self):
+        self.assertEqual(ledger_mod.device_type(
+            make_device(descriptor_blob((0x03, 0x00, 0x00)))), "hid?")
+
+    def test_product_string_is_ignored(self):
+        dev = make_device(product="Totally A Mouse")
+        self.assertEqual(ledger_mod.device_type(dev), "storage")
+
+    def test_unparsed_device_has_no_type(self):
+        self.assertEqual(ledger_mod.device_type(Dev()), "")
+
+    def test_type_survives_a_reload(self):
+        store = ledger_mod.Ledger(self.path)
+        dev = make_device(descriptor_blob((0x03, 0x01, 0x02)))
+        store.record(dev, "user approved", approved=True)
+        self.assertIsNone(store.save())
+        entry = ledger_mod.Ledger(self.path).lookup(dev)
+        self.assertEqual(entry.device_type, "mouse")
+        self.assertEqual(entry.known_types, ["mouse"])
+
+    def test_a_new_type_is_remembered_beside_the_old(self):
+        store = ledger_mod.Ledger(self.path)
+        store.record(make_device(), "user approved", approved=True)
+        store.record(make_device(descriptor_blob(
+            (0x08, 0x06, 0x50), (0x03, 0x01, 0x01))), "user rejected")
+        entry = store.lookup(make_device())
+        self.assertEqual(entry.device_type, "storage+keyboard")
+        self.assertEqual(entry.known_types, ["storage", "storage+keyboard"])
+
+    def test_an_unreadable_sighting_keeps_the_last_type(self):
+        store = ledger_mod.Ledger(self.path)
+        store.record(make_device(), "user approved", approved=True)
+        unread = dataclasses.replace(make_device(), descriptor_set=None,
+                                     raw_descriptors=None, device_class=None)
+        store.record(unread, "user rejected")
+        entry = store.lookup(make_device())
+        self.assertEqual(entry.device_type, "storage")
+        self.assertEqual(entry.known_types, ["storage"])
+
+    def test_known_types_are_bounded_and_keep_the_first(self):
+        store = ledger_mod.Ledger(self.path)
+        store.record(make_device(), "user approved", approved=True)
+        for cls in range(0x20, 0x20 + ledger_mod.MAX_KNOWN_TYPES + 10):
+            store.record(make_device(descriptor_blob((cls, 0, 0))),
+                         "user rejected")
+        types = store.lookup(make_device()).known_types
+        self.assertEqual(len(types), ledger_mod.MAX_KNOWN_TYPES)
+        self.assertEqual(types[0], "storage")
+
+    def test_history_shows_the_type_and_a_change_of_it(self):
+        from probolos import history
+        store = ledger_mod.Ledger(self.path)
+        store.record(make_device(), "user approved", approved=True)
+        store.record(make_device(descriptor_blob(
+            (0x08, 0x06, 0x50), (0x03, 0x01, 0x01))), "user rejected")
+        self.assertIsNone(store.save())
+        out = history.show_history(path=self.path)
+        self.assertIn("TYPE", out)
+        self.assertIn("storage+keyboard ", out)
+        self.assertIn("now claim a different type", out)
+        self.assertTrue(all(len(line) <= 80 for line in out.splitlines()))
+        out = history.show_history(verbose=True, path=self.path)
+        self.assertIn("type changed: storage -> storage+keyboard", out)
+
+    def test_an_entry_without_a_type_shows_a_dash(self):
+        from probolos import history
+        now = time.time()
+        entry = {"identity": "045e:00cb:-", "descriptor_hash": "a" * 64,
+                 "first_seen": now, "last_seen": now}
+        self.path.write_text(json.dumps(
+            {"schema": 1, "fingerprint_scheme": "normalized-v1",
+             "entries": {"045e:00cb:-": entry}}))
+        os.chmod(self.path, 0o600)
+        row = [line for line in history.show_history(path=self.path)
+               .splitlines() if "045e:00cb" in line][0]
+        self.assertEqual(row.split()[1], "-")
+
+    def test_type_fields_are_cleaned(self):
+        from probolos import history
+        now = time.time()
+        entry = {"identity": "0951:1665:ABC", "descriptor_hash": "x",
+                 "first_seen": now, "last_seen": now,
+                 "device_type": "\x1b]0;pwned\x07",
+                 "known_types": ["storage", "\x1b[2J"]}
+        self.path.write_text(json.dumps(
+            {"schema": 1, "fingerprint_scheme": "normalized-v1",
+             "entries": {"0951:1665:ABC": entry}}))
+        os.chmod(self.path, 0o600)
+        for verbose in (False, True):
+            out = history.show_history(verbose=verbose, path=self.path)
+            self.assertNotIn("\x1b", out)
+            self.assertNotIn("\x07", out)
 
 
 class HistoryDoesNotReplayLedgerEscapes(unittest.TestCase):
