@@ -753,6 +753,180 @@ class WatcherEnforcement(WatcherTestBase):
             mediawatch.MediaWatch(policy="block-the-card")
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class UnreadableCards(WatcherTestBase):
+    """
+    Field case (Genesys 05e3:0749): "Read Capacity(10) failed ... Incompatible
+    medium installed" leaves a card present at 0 bytes, and the kernel reports
+    nothing more. The media change that announced it was dropped without a
+    word, so neither the desktop nor Probolos said anything about the card.
+    """
+
+    def watcher(self, policy=mediawatch.POLICY_LOG, locked=False):
+        self.clock = FakeClock()
+        w = mediawatch.MediaWatch(
+            policy=policy, ledger=self.ledger, json_log=self.logfile,
+            is_locked=lambda: locked, log=self.lines.append,
+            on_deauthorized=lambda dev, f: self.deauthorized.append(dev),
+            clock=self.clock)
+        self.assertTrue(w.register(self.reader, "test"))
+        return w
+
+    def settled(self):
+        self.clock.now += mediawatch.SETTLE_SECONDS + 1
+
+    def test_a_change_that_stays_at_zero_bytes_is_reported(self):
+        self.size = 0
+        w = self.watcher()
+        self.settled()
+        self.change(w)
+        self.assertTrue(w.waiting())
+        w.tick()
+        self.assertNotIn("UNREADABLE", self.output(), "re-checked first")
+        self.clock.now += mediawatch.UNREADABLE_GRACE + 1
+        w.tick()
+        self.assertIn("UNREADABLE CARD", self.output())
+        self.assertFalse(w.waiting())
+        self.assertEqual(self.inspected, [])
+        entry = json.loads(self.logfile.read_text().splitlines()[-1])
+        self.assertEqual(entry["action"], "unreadable")
+        w.tick()
+        self.assertEqual(self.output().count("UNREADABLE CARD"), 1)
+
+    def test_a_capacity_that_arrives_late_is_handled_as_the_card(self):
+        self.size = 0
+        w = self.watcher()
+        self.settled()
+        self.change(w)
+        self.size = 62333952
+        w.tick()
+        self.assertIn("CARD CHANGE", self.output())
+        self.assertNotIn("UNREADABLE", self.output())
+        self.assertFalse(w.waiting())
+
+    def test_an_empty_slot_appearing_with_its_reader_is_silent(self):
+        """A reader plugged in with an empty slot: `add`, then a media change
+        at 0 bytes. That is the slot settling, not a card."""
+        lun = self.host / "1-2:1.0/host6/target6:0:0/6:0:0:2"
+        disk = lun / "block/sdx"
+        self.size = 0
+        w = self.watcher()
+        self.settled()
+        disk.mkdir(parents=True)
+        os.symlink(lun, disk / "device")
+        w.handle("add", str(disk), {"DEVTYPE": "disk"})
+        w.handle("change", str(disk),
+                 {"DEVTYPE": "disk", "DISK_MEDIA_CHANGE": "1"})
+        self.assertFalse(w.waiting())
+        self.clock.now += 60
+        w.tick()
+        self.assertNotIn("UNREADABLE", self.output())
+
+    def test_removing_a_card_present_at_registration_is_a_removal(self):
+        w = self.watcher()                   # self.size > 0: a card is in
+        self.size = 0
+        self.change(w)
+        self.assertIn("card removed", self.output())
+        self.assertFalse(w.waiting())
+
+    def test_a_slot_present_at_registration_settles_too(self):
+        """A reader approved this moment can already have its disk; its
+        attach-time media change at 0 bytes is not a card."""
+        self.size = 0
+        w = self.watcher()
+        self.change(w)
+        self.assertFalse(w.waiting())
+
+    def test_a_dead_slot_is_flagged_when_watching_begins(self):
+        (self.disk / "events").write_text("\n")
+        self.watcher()
+        self.assertIn("does not report media changes", self.output())
+
+
+class MediaBaselineIsJudgedBeforeItIsKept(WatcherTestBase):
+    """The first card ever seen in a slot became its permanent baseline,
+    recorded before it was judged -- a card that got the reader switched off
+    included -- and every ordinary card after it read as drift."""
+
+    def key(self):
+        return f"{ledger_mod.identity_of(self.reader)}#lun1"
+
+    def test_a_critical_card_is_never_the_baseline(self):
+        self.card = medium(**ESP_CARD)
+        w = self.watcher()
+        self.change(w)
+        self.assertNotIn(self.key(), self.ledger.media)
+        self.card = medium(**FAT_CARD)
+        self.change(w)
+        self.assertNotIn("never seen", self.output())
+        self.assertEqual(len(self.ledger.media[self.key()]), 1)
+
+    def test_a_returning_critical_card_is_not_familiar(self):
+        w = self.watcher()
+        self.change(w)                                  # ordinary baseline
+        self.card = medium(**ESP_CARD)
+        self.change(w)
+        self.card = medium(**FAT_CARD)
+        self.change(w)
+        self.card = medium(**ESP_CARD)
+        self.change(w)
+        self.assertEqual(self.output().count("A card this slot has never seen"),
+                         2)
+
+    def test_first_card_wording_follows_the_ledger(self):
+        w = self.watcher()
+        self.change(w)
+        self.assertIn("first card recorded for this slot", self.output())
+        self.lines.clear()
+        w2 = self.watcher()                  # a later run, same ledger
+        self.change(w2)
+        self.assertIn("CARD CHANGE", self.output())
+        self.assertNotIn("first card", self.output())
+
+
+class TheApprovedCardIsNotJudgedAgain(WatcherTestBase):
+    """A Ventoy card shown at admission and approved was judged again the
+    moment its disk appeared, and under --media-policy deauthorize the reader
+    was switched off seconds after a person had said yes to it."""
+
+    def register_approved(self, policy):
+        w = mediawatch.MediaWatch(
+            policy=policy, ledger=self.ledger, json_log=self.logfile,
+            log=self.lines.append,
+            on_deauthorized=lambda dev, f: self.deauthorized.append(dev))
+        self.assertTrue(w.register(self.reader, "approved", medium=self.card))
+        return w
+
+    def test_its_own_arrival_is_accepted_once(self):
+        self.card = medium(**ESP_CARD)
+        w = self.register_approved(mediawatch.POLICY_DEAUTHORIZE)
+        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})
+        self.assertIn("not judged again", self.output())
+        self.assertNotIn("CARD CHANGE", self.output())
+        self.assertEqual(self.writes, [])
+        self.size = 0
+        self.change(w)                       # taken out ...
+        self.size = 62333952
+        self.change(w)                       # ... and put back: judged
+        self.assertIn("CARD CHANGE", self.output())
+        self.assertEqual(self.writes, [(str(self.host), 0)])
+
+    def test_a_different_card_is_judged(self):
+        approved = medium(**FAT_CARD)
+        self.card = approved
+        w = self.register_approved(mediawatch.POLICY_LOG)
+        self.card = medium(**ESP_CARD)
+        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})
+        self.assertIn("CARD CHANGE", self.output())
+
+
 # ---------------------------------------------------------------------------
 # 5. Block device names
 # ---------------------------------------------------------------------------

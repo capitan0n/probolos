@@ -666,6 +666,14 @@ class Ledger:
     def lookup(self, dev) -> Optional[Entry]:
         return self.entries.get(identity_of(dev))
 
+    def peek_media(self, dev, lun: str, layout: str):
+        """(baseline, seen) as record_media() would return them, recording
+        nothing -- so a medium can be judged before it is remembered."""
+        layouts = self.media.get(f"{identity_of(dev)}#lun{lun}")
+        if not layouts:
+            return None, False
+        return layouts[0], layout in layouts
+
     def record_media(self, dev, lun: str, layout: str):
         """
         Remember a medium seen in one slot of a reader: (baseline, seen).

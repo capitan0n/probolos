@@ -749,6 +749,41 @@ class DeviceTypeIsRecordedAndShown(unittest.TestCase):
             self.assertNotIn("\x07", out)
 
 
+class EveryRecordedReasonHasAWord(unittest.TestCase):
+    """--history cut unknown reasons to 11 characters ("MEDIA POLIC"),
+    showed an allow-listed device as AUTHORIZED and counted a screen-lock
+    denial as a refusal nobody made."""
+
+    def verdict(self, reason):
+        from probolos import history
+        return history._verdict(Entry.from_raw(dict(GOOD, decisions=[reason])))
+
+    def test_each_reason_the_daemon_writes(self):
+        for reason, word in (
+                ("user approved", "AUTHORIZED"),
+                ("user rejected", "REJECTED"),
+                ("trusted", "TRUSTED"),
+                ("no answer", "NO ANSWER"),
+                ("admission failed", "FAILED"),
+                ("held: screen locked", "HELD"),
+                ("held: no desktop agent", "HELD"),
+                ("denied: screen locked", "DENIED"),
+                ("dry-run", "DRY-RUN"),
+                ("media policy: reader deauthorized", "READER OFF"),
+                ("protected: port 4-1 is on the operator allowlist",
+                 "PROTECTED"),
+                ("protected: device is on a non-removable (internal) port",
+                 "PROTECTED")):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.verdict(reason), word)
+                self.assertLessEqual(len(word), 11)
+
+    def test_older_wording_still_reads(self):
+        self.assertEqual(self.verdict("yes, approved"), "AUTHORIZED")
+        self.assertEqual(self.verdict("something else entirely"),
+                         "SOMETHING E")
+
+
 class HistoryDoesNotReplayLedgerEscapes(unittest.TestCase):
     """
     `--history -v` runs as root and prints the ledger, which the unprivileged

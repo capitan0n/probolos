@@ -3,6 +3,42 @@
 All notable changes to Probolos. Versions follow PEP 440
 (`1.0.0b1` < `1.0.0rc1` < `1.0.0`).
 
+## Unreleased
+
+### Added
+
+- **`--history` shows what each device is.** A TYPE column (`mouse`,
+  `storage+keyboard`, `camera+network+vendor`) built from the interface class
+  codes, never from the device's own product string. `-v` adds a `type` line,
+  and a `! type changed` line when a device has claimed more than one; the
+  `-v` details are aligned in one column and wrapped to 80 columns.
+
+### Fixed
+
+- **Unreadable cards were dropped silently.** A media change that left a
+  watched slot at 0 bytes -- what a card the reader cannot read looks like --
+  printed nothing and wrote no audit entry. It is re-checked for 15 s and then
+  reported as `UNREADABLE CARD`; a capacity that turns up late is handled as
+  the card. A reader's empty slot settling on attach stays silent.
+- **A hostile first card became the slot's baseline.** The media layout was
+  recorded before it was judged; a layout that raises a CRITICAL is no longer
+  recorded at all.
+- **The prompt and the media watcher disagreed.** With `--watch-media`, the
+  plug-in prompt now includes the media rules (EFI system / hidden partition),
+  and the card the operator approved there is not judged again when its disk
+  appears -- under `--media-policy deauthorize` that switched the reader off
+  seconds after approval.
+- **Devices left switched off were not mentioned on exit.** A refused device,
+  a reader switched off by the media policy, or one whose question was cut
+  short is now listed, with how to switch it back on.
+- **`--history` decision words.** Every recorded reason has its own word
+  (`READER OFF`, `HELD`, `NO ANSWER`, `FAILED`, `DENIED`); an allow-listed
+  device no longer reads as AUTHORIZED, and a screen-lock denial is no longer
+  counted as a refusal.
+- **"First card seen in this slot"** now follows the history, not the current
+  run; slots that cannot report media changes are flagged as soon as watching
+  begins.
+
 ## [1.0.0b1] — 2026-10-09 · first beta
 
 The first beta. The feature set is still the one frozen at 0.11.0

@@ -114,7 +114,7 @@ the desktop prompt as a user service for the account that ran `sudo`.
 ### Stop automount racing the scan
 
 Stage 4 must briefly authorize the device for its block node to appear, and
-udisks2 may automount the medium inside that window. Probolos itself only ever
+a desktop automounter may mount the medium (through udisks2) inside that window. Probolos itself only ever
 reads raw sectors and never mounts anything, but a desktop session will.
 
 The simplest answer is `--no-storage-scan`, which skips stage 4 entirely and
@@ -124,7 +124,7 @@ devices:
 ```bash
 sudo tee /etc/udev/rules.d/60-probolos-inhibit-automount.rules <<'EOF'
 # Probolos stage 4 authorizes a storage device just long enough to read its
-# partition table. udisks2 will automount it in that window unless told not to.
+# partition table. A desktop automounter may mount it in that window unless told not to.
 SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{UDISKS_AUTO}="0"
 EOF
 sudo udevadm control --reload
@@ -159,12 +159,26 @@ CRITICAL finding.
 Two things decide how much a report is worth, and each one says which case
 applied:
 
-- **Automount.** udisks2 mounts on the same event. Without the udev rule
-  above, the card may already be mounted when it is read, and the report is
-  post-hoc alerting, not prevention.
+- **Automount.** udisks2 never mounts by itself, but a desktop automounter
+  (or a click on the card) mounts through it on the same event. Without the
+  udev rule above, the card may already be mounted when it is read, and the
+  report is post-hoc alerting, not prevention.
 - **Latency.** Media detection rides on the kernel's disk-event polling,
   typically 1–2 s. Some readers do not report media changes at all; such a
-  slot is flagged when first seen.
+  slot is flagged as soon as watching begins.
+
+Three more things the watcher does:
+
+- **Unreadable cards are reported.** A card the reader cannot read ("Read
+  Capacity failed" in `dmesg`) sits in the slot at 0 bytes and the kernel says
+  nothing more. If a media change leaves the slot at 0 bytes for 15 s, the
+  watcher prints `UNREADABLE CARD` instead of staying silent.
+- **The prompt and the watcher agree.** With `--watch-media`, the plug-in
+  prompt for a storage device includes the same card rules (EFI system or
+  hidden partition), and the card you approved there is not judged a second
+  time when its disk appears.
+- **A CRITICAL card is never remembered.** The first card recorded in a slot
+  is its baseline for drift; a card that raised a CRITICAL never becomes it.
 
 Under `--privsep` this widens the gate: the analyzer may open the whole disks
 of watched readers read-only and switch those readers off. See `SECURITY.md`.

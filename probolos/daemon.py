@@ -274,6 +274,14 @@ class Probolos:
                     raise
                 continue
             self._stream_failing = False
+            # Slots whose media change left 0 bytes are re-checked on the loop's
+            # own one-second beat: a card that never becomes readable produces
+            # no further event to wait for.
+            try:
+                self._media_tick()
+            except Exception as exc:   # noqa: BLE001 -- see _dispatch below
+                print(f"[!] media watch: unhandled error while re-checking a "
+                      f"slot: {exc!r}")
             if device is None:
                 continue
             # One device must never be able to end the gate. Everything below
@@ -317,10 +325,34 @@ class Probolos:
         elif device.action == "remove":
             self._on_remove(device.sys_path)
 
-    def _watch_if_storage(self, dev: sysfs.UsbDevice, why: str) -> None:
-        """An admitted pure storage host: keep watching what is put in it."""
-        if self.media_watch is not None and not self.dry_run:
+    def _watch_if_storage(self, dev: sysfs.UsbDevice, why: str,
+                          medium: Optional["storage.MediumReport"] = None
+                          ) -> None:
+        """
+        An admitted pure storage host: keep watching what is put in it.
+
+        `medium` is what the operator was shown before approving. Without it,
+        the watcher judged that same card again the moment its disk appeared
+        -- and under --media-policy deauthorize switched the reader off
+        seconds after a person had approved it with the contents on screen.
+        """
+        if self.media_watch is None or self.dry_run:
+            return
+        if medium is None:
             self.media_watch.register(dev, why)
+        else:
+            self.media_watch.register(dev, why, medium=medium)
+
+    def _media_tick(self) -> None:
+        """Let the watcher re-check slots that are waiting on a capacity."""
+        if (self.media_watch is None or self.dry_run
+                or not self.media_watch.waiting()):
+            return
+        if self.watchdog:
+            with self.watchdog.paused():
+                self.media_watch.tick()
+        else:
+            self.media_watch.tick()
 
     def _media_policy_deauthorized(self, dev: sysfs.UsbDevice,
                                    findings) -> None:
@@ -578,6 +610,13 @@ class Probolos:
                     analyzers.Context(device=dev, config=self.rule_config,
                                       extra={"medium": medium}),
                     analyzers=[analyzers.StorageAnalyzer()])
+                # With --watch-media the same medium is judged by the media
+                # rules (EFI system / hidden partition) the moment its disk
+                # appears. The prompt has to show them too: a card that looked
+                # clean here was switched off seconds after being approved.
+                if self.media_watch is not None and not self.dry_run:
+                    storage_findings = storage_findings + rules.media_findings(
+                        medium, config=self.rule_config)
                 print()
                 print(report.render_medium(medium, storage_findings))
                 print()
@@ -642,7 +681,7 @@ class Probolos:
             if getattr(self, "_remember", False) and self.trust is not None:
                 self._remember_admitted(dev)
             print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
-            self._watch_if_storage(dev, "approved")
+            self._watch_if_storage(dev, "approved", medium)
         else:
             # "user rejected" only when someone actually said no. A timeout,
             # an EOF (the service's stdin is /dev/null) or an unanswered
@@ -769,15 +808,33 @@ class Probolos:
         saying so is how a tool earns a reputation for breaking things, and the
         user has no way to guess why a stick stopped working.
         """
-        if not self.pending:
-            return
-        print(f"\n[!] {len(self.pending)} device(s) are still blocked because "
-              f"no decision was made:")
-        for name in self.pending:
-            print(f"      {name}")
-        print("    They stay blocked on purpose. Start Probolos again and you "
-              "will be asked,")
-        print("    or release them now with:  sudo python -m probolos --release")
+        # Not only the undecided ones. A refused device, a reader the media
+        # policy switched off, or one whose question was cut short by Ctrl-C
+        # also stays at authorized=0 after the gate reopens -- the gate
+        # restores the hubs' default, never a device -- and used to be left
+        # dead without a word.
+        try:
+            blocked = gate.unauthorized_devices()
+        except OSError:
+            blocked = []
+        left_off = [d for d in blocked if d.name not in self.pending]
+        if self.pending:
+            print(f"\n[!] {len(self.pending)} device(s) are still blocked "
+                  f"because no decision was made:")
+            for name in self.pending:
+                print(f"      {name}")
+            print("    They stay blocked on purpose. Start Probolos again and "
+                  "you will be asked,")
+            print("    or release them now with:  sudo python -m probolos "
+                  "--release")
+        if left_off:
+            print(f"\n[!] {len(left_off)} device(s) are left switched off "
+                  f"(refused, switched off by the media policy, or not "
+                  f"decided before exit):")
+            for dev in left_off:
+                print(f"      {report.one_liner(dev)}")
+            print("    They stay off until unplugged and plugged back in, or "
+                  "switched on with:  sudo python -m probolos --release")
 
     def _hold(self, dev: sysfs.UsbDevice, reason: str, findings=(),
               medium: Optional["storage.MediumReport"] = None, *,

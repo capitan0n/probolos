@@ -365,6 +365,30 @@ class TestStrandedDevicesAtStartup(unittest.TestCase):
         self.assertIn("3-4", engine.known)
         self.assertEqual(engine.pending, {})
 
+    def test_exit_reports_devices_left_switched_off(self):
+        """A refused device, or a reader the media policy switched off, stays
+        at authorized=0 after the gate reopens; it was never mentioned."""
+        engine = daemon_mod.Probolos(observe=0)
+        off = self.make("4-1", 0)
+        with mock.patch.object(daemon_mod.gate, "unauthorized_devices",
+                               return_value=[off]), \
+             mock.patch.object(daemon_mod.report, "one_liner",
+                               return_value="05e3:0749 reader"), \
+             mock.patch("builtins.print") as printed:
+            engine.report_blocked_on_exit()
+        text = " ".join(str(c) for c in printed.call_args_list)
+        self.assertIn("left switched off", text)
+        self.assertIn("05e3:0749 reader", text)
+        self.assertIn("--release", text)
+
+    def test_exit_says_nothing_when_nothing_is_off(self):
+        engine = daemon_mod.Probolos(observe=0)
+        with mock.patch.object(daemon_mod.gate, "unauthorized_devices",
+                               return_value=[]), \
+             mock.patch("builtins.print") as printed:
+            engine.report_blocked_on_exit()
+        printed.assert_not_called()
+
     def test_exit_reports_what_is_left_blocked(self):
         """Leaving hardware dead without saying so is how a tool gets a name
         for breaking things."""
@@ -785,6 +809,38 @@ class DaemonWiring(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.engine._on_remove("/sys/bus/usb/devices/1-2")
         self.watch.unregister.assert_called_once_with("1-2")
+
+    def test_the_approved_medium_goes_to_the_watcher(self):
+        from probolos import storage
+        dev = make_stage_device()
+        esp = storage.MediumReport(
+            device="/dev/sdz", size_sectors=62333952, scheme="mbr",
+            partitions=[storage.Partition(0, False, 0xEF, 2048, 1048576)])
+        engine = daemon_mod.Probolos(monitor=session.AlwaysUnlocked(),
+                                     observe=0, inspect_storage=True,
+                                     media_watch=self.watch)
+        shown = []
+
+        def ask(_dev, findings):
+            shown.extend(f.rule_id for f in findings)
+            return True
+
+        with mock.patch.object(daemon_mod.sysfs, "admit_device"), \
+             mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(engine, "_load_with_retry", return_value=dev), \
+             mock.patch.object(engine, "_inspect_medium", return_value=esp), \
+             mock.patch.object(engine, "_ask", side_effect=ask), \
+             mock.patch.object(daemon_mod.report, "one_liner",
+                               return_value="x"), \
+             mock.patch.object(daemon_mod.report, "render",
+                               return_value="x"), \
+             redirect_stdout(io.StringIO()):
+            engine._on_add(str(dev.syspath))
+        # The prompt shows what the watcher would say about the same card ...
+        self.assertIn("media-efi-system-partition", shown)
+        # ... and the watcher is told this card was approved.
+        self.watch.register.assert_called_once_with(dev, "approved",
+                                                    medium=esp)
 
     def test_a_policy_deauthorization_puts_the_reader_back_behind_the_gate(self):
         dev = make_device("1-2")

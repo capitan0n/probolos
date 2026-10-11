@@ -85,28 +85,47 @@ def _type_changed(entry) -> bool:
     return len(getattr(entry, "known_types", None) or []) > 1
 
 
+# Every reason the daemon records, by how it starts, and the word shown for
+# it. Matched on the start, in this order, because the reasons carry free
+# text after a colon: "protected: port 4-1 is on the operator allowlist" used
+# to read as AUTHORIZED (it contains "allow"), "denied: screen locked" as
+# REJECTED (counted as a refusal nobody made), and the rest were cut to 11
+# characters ("MEDIA POLIC", "HELD: SCREE").
+_VERDICTS = (
+    ("protected", "PROTECTED"),
+    ("trusted", "TRUSTED"),
+    ("user approved", "AUTHORIZED"),
+    ("user rejected", "REJECTED"),
+    ("no answer", "NO ANSWER"),
+    ("denied", "DENIED"),
+    ("auto-denied", "DENIED"),
+    ("held", "HELD"),
+    ("admission failed", "FAILED"),
+    ("media policy", "READER OFF"),
+    ("dry-run", "DRY-RUN"),
+)
+
+
 def _verdict(entry) -> str:
     """
     The most recent decision for this device, in one word.
 
     Decisions are stored chronologically; the last is the current stance. A
     device once rejected and later approved shows 'AUTHORIZED' -- but the full
-    history (in -v) keeps both. Real strings the daemon writes: "user approved",
-    "user rejected", "trusted", "dry-run", "protected: ...", "auto-denied ...".
+    history (in -v) keeps both. Only "user rejected" is REJECTED: it is the
+    one decision a person made against the device.
     """
     if not entry.decisions:
         return "-"
     last = entry.decisions[-1].lower().strip()
-    if "trusted" in last:
-        return "TRUSTED"
-    if "approv" in last or "allow" in last:
+    for prefix, word in _VERDICTS:
+        if last.startswith(prefix):
+            return word
+    # Older or unknown wording: the gist if there is one, else the start.
+    if "approv" in last:
         return "AUTHORIZED"
-    if "reject" in last or "den" in last:
+    if "reject" in last:
         return "REJECTED"
-    if "protect" in last:
-        return "PROTECTED"
-    if "dry" in last:
-        return "DRY-RUN"
     return _clean(last.upper())[:11]
 
 
