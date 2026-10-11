@@ -15,6 +15,7 @@ Read-only: touches no device, needs no root beyond ledger access, runs no daemon
 
 from __future__ import annotations
 
+import textwrap
 import time
 from typing import List
 
@@ -56,6 +57,27 @@ def _clean(text: str) -> str:
 def _fit(text: str, width: int) -> str:
     """Cut `text` to `width` columns, marking the cut."""
     return (text[:width - 1] + "\u2026") if len(text) > width else text
+
+
+# The -v block under each row: labels in one column, values in the next, so the
+# eye can run down either. A "!" in the margin marks the lines that are
+# findings rather than facts.
+_LABEL_WIDTH = 20                         # "identity fingerprint", the longest
+_VALUE_COLUMN = 7 + _LABEL_WIDTH + 3      # margin, label, " : "
+
+
+def _detail(label: str, value: str, alarm: bool = False) -> List[str]:
+    """One `label : value` line of the -v block, wrapped to 80 columns."""
+    lead = ("     ! " if alarm else " " * 7) + f"{label:<{_LABEL_WIDTH}} : "
+    return textwrap.wrap(value, width=80, initial_indent=lead,
+                         subsequent_indent=" " * _VALUE_COLUMN,
+                         break_on_hyphens=False) or [lead.rstrip()]
+
+
+def _blank(lines: List[str]) -> None:
+    """End the current block with one empty line, never two."""
+    if lines and lines[-1] != "":
+        lines.append("")
 
 
 def _type_changed(entry) -> bool:
@@ -151,18 +173,18 @@ def format_table(entries: List, verbose: bool = False) -> str:
                      f"{last:<9} {verdict:<11} {drift}")
 
         if verbose:
+            lines.extend(_detail("type", kind))
             types = getattr(e, "known_types", None) or []
             if len(types) > 1:
                 shown = types if len(types) <= 6 else types[:1] + types[-5:]
-                lines.append("       ! type changed: "
-                             + " -> ".join(_clean(t) for t in shown))
-            else:
-                lines.append(f"       type: {kind}")
+                lines.extend(_detail("type changed",
+                                     " -> ".join(_clean(t) for t in shown),
+                                     alarm=True))
             ports = ", ".join(dict.fromkeys(_clean(p) for p in e.ports)) or "-"
-            lines.append(f"       ports: {ports}")
+            lines.extend(_detail("ports", ports))
             if e.decisions:
                 hist = " -> ".join(_clean(d) for d in e.decisions[-6:])
-                lines.append(f"       decision history: {hist}")
+                lines.extend(_detail("decision history", hist))
             hashes = getattr(e, "known_hashes", None) or []
             # The hashes shown here are the NORMALIZED fingerprints -- what
             # the drift alarm compares. Their labelling matters: a user who
@@ -174,16 +196,20 @@ def format_table(entries: List, verbose: bool = False) -> str:
             # Cleaned like every other field: the ledger is written by the
             # unprivileged analyzer, and these strings are printed to root.
             if len(hashes) > 1:
-                lines.append(f"       ! {len(hashes)} different identity "
-                             f"fingerprints (device changed what it claims):")
+                lines.extend(_detail(
+                    "identity fingerprint",
+                    f"{len(hashes)} different -- the device changed what it "
+                    f"claims", alarm=True))
                 for h in hashes:
-                    lines.append(f"           {_clean(h[:16])}\u2026")
+                    lines.append(" " * _VALUE_COLUMN
+                                 + f"{_clean(h[:16])}\u2026")
             elif hashes:
-                lines.append(f"       identity fingerprint : "
-                             f"{_clean(hashes[0][:16])}\u2026")
+                lines.extend(_detail("identity fingerprint",
+                                     f"{_clean(hashes[0][:16])}\u2026"))
             raw = getattr(e, "raw_hash", "") or ""
             if raw:
-                lines.append(f"       raw descriptor bytes : {_clean(raw[:16])}\u2026")
+                lines.extend(_detail("raw descriptor bytes",
+                                     f"{_clean(raw[:16])}\u2026"))
             lines.append("")
 
     if not verbose:
@@ -195,7 +221,7 @@ def format_table(entries: List, verbose: bool = False) -> str:
     retyped = sum(1 for e in entries if _type_changed(e))
     rejected = sum(1 for e in entries if _verdict(e) == "REJECTED")
     if drifted or retyped or rejected:
-        lines.append("")
+        _blank(lines)
         if drifted:
             lines.append(f"  ! {drifted} device(s) changed descriptors -- possible spoofing/reprogramming")
         if retyped:
@@ -204,7 +230,7 @@ def format_table(entries: List, verbose: bool = False) -> str:
         if rejected:
             lines.append(f"  ! {rejected} device(s) have been rejected before")
 
-    lines.append("")
+    _blank(lines)
     return "\n".join(lines)
 
 

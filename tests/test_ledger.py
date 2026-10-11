@@ -699,7 +699,25 @@ class DeviceTypeIsRecordedAndShown(unittest.TestCase):
         self.assertIn("now claim a different type", out)
         self.assertTrue(all(len(line) <= 80 for line in out.splitlines()))
         out = history.show_history(verbose=True, path=self.path)
-        self.assertIn("type changed: storage -> storage+keyboard", out)
+        self.assertRegex(out, r"! type changed +: storage -> storage\+keyboard")
+
+    def test_verbose_details_line_up_and_fit_80_columns(self):
+        """The -v labels were ragged ("type:", "identity fingerprint :") and a
+        long decision history ran off the screen."""
+        from probolos import history
+        store = ledger_mod.Ledger(self.path)
+        store.record(make_device(), "user approved", approved=True)
+        for _ in range(6):
+            store.record(make_device(descriptor_blob(
+                (0x08, 0x06, 0x50), (0x03, 0x01, 0x01))),
+                "auto-denied: drift on a device nobody approved again")
+        self.assertIsNone(store.save())
+        out = history.show_history(verbose=True, path=self.path)
+        lines = out.splitlines()
+        self.assertTrue(all(len(line) <= 80 for line in lines), out)
+        colons = {line.index(" : ") for line in lines if " : " in line}
+        self.assertEqual(len(colons), 1, out)
+        self.assertNotIn("\n\n\n", out)
 
     def test_an_entry_without_a_type_shows_a_dash(self):
         from probolos import history
