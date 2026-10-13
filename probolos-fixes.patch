@@ -1,0 +1,2465 @@
+diff --git a/CAPABILITIES.md b/CAPABILITIES.md
+index 85c3f1b..6d5ca2d 100644
+--- a/CAPABILITIES.md
++++ b/CAPABILITIES.md
+@@ -308,10 +308,13 @@ Rules (`rules.media_findings`), added to the stage 4 structural findings:
+ - `media-layout-drift` (WARNING for a layout never seen in the slot, NOTICE for one seen before)
+ 
+ Every report states whether automount was inhibited for the disk
+-(`UDISKS_IGNORE`/`UDISKS_AUTO` from udev) or the medium was already mounted
+-when read, in which case it is post-hoc alerting. Latency follows the kernel's
+-disk-event polling (typically 1–2 s); a slot whose `events` does not include
+-`media_change`, or that nobody polls, is flagged when first seen.
++(`UDISKS_IGNORE=1` from udev), only hinted off (`UDISKS_AUTO=0`, which KDE
++Plasma's automounter ignores), or the medium was already mounted when read, in
++which case it is post-hoc alerting. Latency follows the kernel's disk-event
++polling (typically 1–2 s); a slot whose `events` does not include
++`media_change`, or that nobody polls, is flagged as soon as watching begins.
++A media change that leaves the slot at 0 bytes is re-checked for 15 s and
++then reported as a card the reader could not read.
+ 
+ Not covered: SD/MMC readers that are not USB mass storage (`mmcblk`, e.g.
+ SDHCI or `rtsx`), composite readers, and filesystem-parser exploits (§2.1).
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 31965d6..6f94833 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,64 @@
+ All notable changes to Probolos. Versions follow PEP 440
+ (`1.0.0b1` < `1.0.0rc1` < `1.0.0`).
+ 
++## Unreleased
++
++### Added
++
++- **`--history` shows what each device is.** A TYPE column (`mouse`,
++  `storage+keyboard`, `camera+network+vendor`) built from the interface class
++  codes, never from the device's own product string. `-v` adds a `type` line,
++  and a `! type changed` line when a device has claimed more than one; the
++  `-v` details are aligned in one column and wrapped to 80 columns.
++
++### Fixed
++
++- **Unreadable cards were dropped silently.** A media change that left a
++  watched slot at 0 bytes -- what a card the reader cannot read looks like --
++  printed nothing and wrote no audit entry. It is re-checked for 15 s and then
++  reported as `UNREADABLE CARD`; a capacity that turns up late is handled as
++  the card. A reader's empty slot settling on attach stays silent.
++- **A hostile first card became the slot's baseline.** The media layout was
++  recorded before it was judged; a layout that raises a CRITICAL is no longer
++  recorded at all.
++- **The prompt and the media watcher disagreed.** With `--watch-media`, the
++  plug-in prompt now includes the media rules (EFI system / hidden partition),
++  and the card the operator approved there is not judged again when its disk
++  appears -- under `--media-policy deauthorize` that switched the reader off
++  seconds after approval.
++- **Devices left switched off were not mentioned on exit.** A refused device,
++  a reader switched off by the media policy, or one whose question was cut
++  short is now listed, with how to switch it back on.
++- **`--history` decision words.** Every recorded reason has its own word
++  (`READER OFF`, `HELD`, `NO ANSWER`, `FAILED`, `DENIED`); an allow-listed
++  device no longer reads as AUTHORIZED, and a screen-lock denial is no longer
++  counted as a refusal.
++- **"First card seen in this slot"** now follows the history, not the current
++  run; slots that cannot report media changes are flagged as soon as watching
++  begins.
++- **A forked storage reader could reopen the gate.** The child that reads a
++  medium inherited the armed gate and its signal handlers; ended with SIGTERM
++  after a stall, it wrote `authorized_default=1` to every root hub while the
++  daemon believed the gate closed. Only the process that closed the gate may
++  reopen it now, and the reader drops the inherited handlers.
++- **One card, reported three times.** A reader announcing the same card again
++  (no removal, same layout and findings, screen unlocked) prints one line
++  instead of a full report; a switch-off that failed is retried. The stage-4
++  disk events still queued at admission are ignored by sequence number; the
++  slot re-check runs after the event and gives udev's own event 1.5 s to
++  arrive, keeping its udisks hints. An approved card is accepted for 30 s from
++  the reader's first disk event, and stays accepted until it is taken out.
++- **An unplug no longer reads as a substituted reader**, and a tiny ISO 9660
++  volume no longer explains away a large gap before the first partition; a
++  planted ISO signature behind an MBR is reported like one without.
++- **`UDISKS_AUTO=0` was reported as "inhibited".** KDE Plasma's automounter
++  never reads it; only `UDISKS_IGNORE=1` counts now, and the README rule uses
++  it. Under `--media-policy log` a CRITICAL report says the card is not blocked.
++- **Isohybrid images.** An ISO 9660 filesystem at sector 0 behind an MBR (any
++  dd-written installer) is reported, instead of only "a large unused area".
++- **`--history` serials** show their last characters (`…000001532`, not
++  `00000000`); `-v` prints the whole serial.
++
+ ## [1.0.0b1] — 2026-10-09 · first beta
+ 
+ The first beta. The feature set is still the one frozen at 0.11.0
+diff --git a/README.md b/README.md
+index 9ae2dfd..2ba0df5 100644
+--- a/README.md
++++ b/README.md
+@@ -114,31 +114,39 @@ the desktop prompt as a user service for the account that ran `sudo`.
+ ### Stop automount racing the scan
+ 
+ Stage 4 must briefly authorize the device for its block node to appear, and
+-udisks2 may automount the medium inside that window. Probolos itself only ever
+-reads raw sectors and never mounts anything, but a desktop session will.
++a desktop automounter may mount the medium (through udisks2) inside that
++window. udisks2 never mounts on its own; the desktop's automounter asks it to.
++Probolos itself only ever reads raw sectors and never mounts anything.
+ 
+ The simplest answer is `--no-storage-scan`, which skips stage 4 entirely and
+-removes the window. If you want stage 4, tell udisks not to automount USB block
+-devices:
++removes the window. If you want stage 4 (or `--watch-media`), stop the desktop
++from automounting USB storage. Which switch works depends on the desktop:
++
++- **KDE Plasma:** turn automount off (System Settings → Disks & Cameras →
++  Device Auto-Mount, uncheck everything), or use the `UDISKS_IGNORE` rule
++  below. KDE's automounter never reads `UDISKS_AUTO`.
++- **GNOME** honours either rule.
+ 
+ ```bash
+ sudo tee /etc/udev/rules.d/60-probolos-inhibit-automount.rules <<'EOF'
+-# Probolos stage 4 authorizes a storage device just long enough to read its
+-# partition table. udisks2 will automount it in that window unless told not to.
+-SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{UDISKS_AUTO}="0"
++# Probolos reads USB storage before anything mounts it. UDISKS_IGNORE works on
++# KDE Plasma and GNOME; UDISKS_AUTO="0" is a softer hint only GNOME honours.
++SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{UDISKS_IGNORE}="1"
+ EOF
+ sudo udevadm control --reload
+-sudo udevadm trigger --subsystem-match=block
++# then unplug and replug the device (a blanket `udevadm trigger` re-reads
++# every block device on the machine)
+ ```
+ 
+ **Know what this costs.** The rule is system-wide and permanent: *every* USB
+ block device stops automounting, including ones Probolos has approved and ones
+-plugged in while it is not running. You mount them by hand afterwards. Remove
+-the file and reload to undo it.
++plugged in while it is not running. With `UDISKS_IGNORE` they are also hidden
++from the file manager and the device notifier; mount them by hand
++(`udisksctl mount -b /dev/sdX1`). Remove the file and reload to undo it.
+ 
+ It also only constrains **udisks**. Any other automounter on the machine is
+ unaffected, so verify the behaviour on your own system rather than assuming the
+-window is closed.
++window is closed. Each card report says which case applied.
+ 
+ ### Card readers: the card is not gated
+ 
+@@ -159,12 +167,44 @@ CRITICAL finding.
+ Two things decide how much a report is worth, and each one says which case
+ applied:
+ 
+-- **Automount.** udisks2 mounts on the same event. Without the udev rule
+-  above, the card may already be mounted when it is read, and the report is
+-  post-hoc alerting, not prevention.
++- **Automount.** udisks2 never mounts by itself, but a desktop automounter
++  (or a click on the card) mounts through it on the same event. Without the
++  udev rule above, the card may already be mounted when it is read, and the
++  report is post-hoc alerting, not prevention.
+ - **Latency.** Media detection rides on the kernel's disk-event polling,
+   typically 1–2 s. Some readers do not report media changes at all; such a
+-  slot is flagged when first seen.
++  slot is flagged as soon as watching begins.
++
++Three more things the watcher does:
++
++- **Unreadable cards are reported.** A card the reader cannot read ("Read
++  Capacity failed" in `dmesg`) sits in the slot at 0 bytes and the kernel says
++  nothing more. If a media change leaves the slot at 0 bytes for 15 s, the
++  watcher prints `UNREADABLE CARD` instead of staying silent.
++- **The prompt and the watcher agree.** With `--watch-media`, the plug-in
++  prompt for a storage device includes the same card rules (EFI system or
++  hidden partition), and the card you approved there is not judged a second
++  time when its disk appears (within 30 s of the reader's first disk event);
++  it stays accepted until it is taken out.
++- **A card is reported once.** A reader often announces the same card again
++  (after being switched on, or when something opens it). When the layout and
++  the findings are unchanged and no removal was seen, that prints one `not
++  reported again` line instead of a second report -- except while the screen is
++  locked, or when a switch-off is still to be done. Taking the card out and
++  putting it back is a new card and is judged again. A swap faster than the
++  reader reports the slot empty, to a card with the same layout and findings,
++  cannot be told apart.
++- **A CRITICAL card is never remembered.** The first card recorded in a slot
++  is its baseline for drift; a card that raised a CRITICAL never becomes it.
++
++What `--media-policy` does with a CRITICAL card:
++
++- `log` (default): reports it. **The card is not blocked** and the desktop
++  may mount it.
++- `deauthorize`: switches the **whole reader** off, every slot -- a card
++  mounted in the other slot is cut off mid-use. Replug the reader to get it
++  back; with the CRITICAL card still inside, the plug-in prompt shows the
++  finding before you decide.
+ 
+ Under `--privsep` this widens the gate: the analyzer may open the whole disks
+ of watched readers read-only and switch those readers off. See `SECURITY.md`.
+@@ -182,7 +222,7 @@ of watched readers read-only and switch those readers off. See `SECURITY.md`.
+ | `--dry-run` | report everything, change nothing |
+ | `--list` | read-only inventory of attached devices; never closes the gate |
+ | `--trusted` / `--remove-trusted N\|all` | list and revoke remembered devices (history is kept) |
+-| `--history [-v]` | every device seen, its decisions and descriptor drift |
++| `--history [-v]` | every device seen, its type, decisions and descriptor drift |
+ | `--remove-all` | clear remembered devices **and** history; asks first, refuses while the daemon runs |
+ | `--no-storage-scan` | skip stage 4 entirely |
+ | `--watch-media` | inspect and alert on cards inserted into admitted readers (detection only) |
+diff --git a/SECURITY.md b/SECURITY.md
+index f5460ca..355a9ba 100644
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -497,12 +497,14 @@ What that reading cannot give:
+ 
+ Two constraints, each reported on every media event rather than assumed:
+ 
+-- **The automounter consumes the same event.** udisks2 mounts on the very
+-  `change` the watcher reads. Unless automount is inhibited for the disk (the
+-  udev rule in the README), the medium may be mounted, and parsed by the
+-  kernel, before or while it is read. The report says whether automount was
+-  inhibited (`UDISKS_IGNORE`/`UDISKS_AUTO`) or the medium was already mounted;
+-  in the second case it is post-hoc alerting.
++- **The automounter consumes the same event.** udisks2 never mounts on its
++  own, but a desktop automounter asks it to on the very `change` the watcher
++  reads. Unless automount is inhibited for the disk (the udev rule in the
++  README), the medium may be mounted, and parsed by the kernel, before or while
++  it is read. The report says whether automount was inhibited
++  (`UDISKS_IGNORE=1`), only hinted off (`UDISKS_AUTO=0`, which KDE Plasma's
++  automounter ignores), or the medium was already mounted; in the last case it
++  is post-hoc alerting.
+ - **Latency.** Medium detection relies on the kernel's disk-event polling:
+   about 1–2 s, and some readers never report a media change. Such a slot is
+   flagged when first seen.
+@@ -543,7 +545,8 @@ the race is real. A udisks-specific inhibitor can suppress udisks automounting,
+ but not every other program capable of mounting a device. Holding the storage
+ interface at 0 also prevents the block node needed by the current scanner; it
+ is not a drop-in fix. README.md ("Stop automount racing the scan") gives a udev
+-rule that sets `UDISKS_AUTO=0` for USB storage; it inhibits udisks only.
++rule that sets `UDISKS_IGNORE=1` for USB storage (`UDISKS_AUTO=0` is ignored by
++KDE Plasma); it inhibits udisks only.
+ 
+ ## Lockout safety
+ 
+diff --git a/probolos/daemon.py b/probolos/daemon.py
+index 917fce8..f3d9796 100644
+--- a/probolos/daemon.py
++++ b/probolos/daemon.py
+@@ -274,27 +274,42 @@ class Probolos:
+                     raise
+                 continue
+             self._stream_failing = False
+-            if device is None:
+-                continue
+-            # One device must never be able to end the gate. Everything below
+-            # this line touches hardware that can vanish mid-call: sysfs writes
+-            # return ENODEV, a dialog backend dies, a descriptor read races the
+-            # unplug. Those raise OSError and worse, and until now they left
+-            # the loop entirely -- the daemon exited, every subsequent device
+-            # was admitted by the kernel with no question asked, and the user
+-            # saw a traceback rather than a closed gate. Handling it here keeps
+-            # the failure to the one device it belongs to.
+-            #
+-            # KeyboardInterrupt and SystemExit are deliberately NOT caught:
+-            # shutdown must stay immediate.
++            if device is not None:
++                self._dispatch_safely(device)
++            # Slots whose media change left 0 bytes are re-checked on the loop's
++            # own one-second beat: a card that never becomes readable produces
++            # no further event to wait for. AFTER the event, never before it:
++            # tick() ahead of the event that brought a capacity reported the
++            # card itself, and the event then reported it a second time.
+             try:
+-                self._dispatch(device)
+-            except Exception as exc:   # noqa: BLE001 -- see above
+-                import traceback
+-                print(f"[!] {Path(device.sys_path).name}: unhandled error "
+-                      f"while gating this device: {exc!r}")
+-                print("[!] It stays BLOCKED. The gate is still running.")
+-                traceback.print_exc()
++                self._media_tick()
++            except Exception as exc:   # noqa: BLE001 -- see _dispatch_safely
++                print(f"[!] media watch: unhandled error while re-checking a "
++                      f"slot: {exc!r}")
++
++    def _dispatch_safely(self, device) -> None:
++        """
++        One device must never be able to end the gate.
++
++        Everything _dispatch does touches hardware that can vanish mid-call:
++        sysfs writes return ENODEV, a dialog backend dies, a descriptor read
++        races the unplug. Those raise OSError and worse, and until now they
++        left the loop entirely -- the daemon exited, every subsequent device
++        was admitted by the kernel with no question asked, and the user saw a
++        traceback rather than a closed gate. Handling it here keeps the
++        failure to the one device it belongs to.
++
++        KeyboardInterrupt and SystemExit are deliberately NOT caught: shutdown
++        must stay immediate.
++        """
++        try:
++            self._dispatch(device)
++        except Exception as exc:   # noqa: BLE001 -- see above
++            import traceback
++            print(f"[!] {Path(device.sys_path).name}: unhandled error "
++                  f"while gating this device: {exc!r}")
++            print("[!] It stays BLOCKED. The gate is still running.")
++            traceback.print_exc()
+ 
+     def _dispatch(self, device) -> None:
+         """Route one uevent: USB devices to the gate, disks to the watcher."""
+@@ -317,10 +332,36 @@ class Probolos:
+         elif device.action == "remove":
+             self._on_remove(device.sys_path)
+ 
+-    def _watch_if_storage(self, dev: sysfs.UsbDevice, why: str) -> None:
+-        """An admitted pure storage host: keep watching what is put in it."""
+-        if self.media_watch is not None and not self.dry_run:
+-            self.media_watch.register(dev, why)
++    def _watch_if_storage(self, dev: sysfs.UsbDevice, why: str,
++                          medium: Optional["storage.MediumReport"] = None,
++                          fence: Optional[int] = None) -> None:
++        """
++        An admitted pure storage host: keep watching what is put in it.
++
++        `medium` is what the operator was shown before approving. Without it,
++        the watcher judged that same card again the moment its disk appeared
++        -- and under --media-policy deauthorize switched the reader off
++        seconds after a person had approved it with the contents on screen.
++        """
++        if self.media_watch is None or self.dry_run:
++            return
++        extra = {}
++        if medium is not None:
++            extra["medium"] = medium
++        if fence is not None:
++            extra["seqnum_fence"] = fence
++        self.media_watch.register(dev, why, **extra)
++
++    def _media_tick(self) -> None:
++        """Let the watcher re-check slots that are waiting on a capacity."""
++        if (self.media_watch is None or self.dry_run
++                or not self.media_watch.waiting()):
++            return
++        if self.watchdog:
++            with self.watchdog.paused():
++                self.media_watch.tick()
++        else:
++            self.media_watch.tick()
+ 
+     def _media_policy_deauthorized(self, dev: sysfs.UsbDevice,
+                                    findings) -> None:
+@@ -578,6 +619,13 @@ class Probolos:
+                     analyzers.Context(device=dev, config=self.rule_config,
+                                       extra={"medium": medium}),
+                     analyzers=[analyzers.StorageAnalyzer()])
++                # With --watch-media the same medium is judged by the media
++                # rules (EFI system / hidden partition) the moment its disk
++                # appears. The prompt has to show them too: a card that looked
++                # clean here was switched off seconds after being approved.
++                if self.media_watch is not None and not self.dry_run:
++                    storage_findings = storage_findings + rules.media_findings(
++                        medium, config=self.rule_config)
+                 print()
+                 print(report.render_medium(medium, storage_findings))
+                 print()
+@@ -629,6 +677,13 @@ class Probolos:
+                     and self.monitor.is_locked()):
+                 self._hold_until_unlocked(dev)
+                 return
++            # Stage 4 switched this reader on and off before the prompt; the
++            # disk events that caused are still queued. Numbered before the
++            # admission write, they can be told from the admitted disk's own.
++            fence = None
++            if self.media_watch is not None and medium is not None:
++                from .mediawatch import uevent_seqnum
++                fence = uevent_seqnum()
+             try:
+                 sysfs.admit_device(dev)
+             except OSError as exc:
+@@ -642,7 +697,7 @@ class Probolos:
+             if getattr(self, "_remember", False) and self.trust is not None:
+                 self._remember_admitted(dev)
+             print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
+-            self._watch_if_storage(dev, "approved")
++            self._watch_if_storage(dev, "approved", medium, fence)
+         else:
+             # "user rejected" only when someone actually said no. A timeout,
+             # an EOF (the service's stdin is /dev/null) or an unanswered
+@@ -769,15 +824,33 @@ class Probolos:
+         saying so is how a tool earns a reputation for breaking things, and the
+         user has no way to guess why a stick stopped working.
+         """
+-        if not self.pending:
+-            return
+-        print(f"\n[!] {len(self.pending)} device(s) are still blocked because "
+-              f"no decision was made:")
+-        for name in self.pending:
+-            print(f"      {name}")
+-        print("    They stay blocked on purpose. Start Probolos again and you "
+-              "will be asked,")
+-        print("    or release them now with:  sudo python -m probolos --release")
++        # Not only the undecided ones. A refused device, a reader the media
++        # policy switched off, or one whose question was cut short by Ctrl-C
++        # also stays at authorized=0 after the gate reopens -- the gate
++        # restores the hubs' default, never a device -- and used to be left
++        # dead without a word.
++        try:
++            blocked = gate.unauthorized_devices()
++        except OSError:
++            blocked = []
++        left_off = [d for d in blocked if d.name not in self.pending]
++        if self.pending:
++            print(f"\n[!] {len(self.pending)} device(s) are still blocked "
++                  f"because no decision was made:")
++            for name in self.pending:
++                print(f"      {name}")
++            print("    They stay blocked on purpose. Start Probolos again and "
++                  "you will be asked,")
++            print("    or release them now with:  sudo python -m probolos "
++                  "--release")
++        if left_off:
++            print(f"\n[!] {len(left_off)} device(s) are left switched off "
++                  f"(refused, switched off by the media policy, or not "
++                  f"decided before exit):")
++            for dev in left_off:
++                print(f"      {report.one_liner(dev)}")
++            print("    They stay off until unplugged and plugged back in, or "
++                  "switched on with:  sudo python -m probolos --release")
+ 
+     def _hold(self, dev: sysfs.UsbDevice, reason: str, findings=(),
+               medium: Optional["storage.MediumReport"] = None, *,
+diff --git a/probolos/gate.py b/probolos/gate.py
+index dd922b0..dd9bbbc 100644
+--- a/probolos/gate.py
++++ b/probolos/gate.py
+@@ -23,6 +23,7 @@ documents the one-line manual recovery.
+ from __future__ import annotations
+ 
+ import atexit
++import os
+ import signal
+ import threading
+ import sys
+@@ -40,6 +41,15 @@ class AuthorizationGate:
+         self.log = log
+         self._original: Dict[Path, int] = {}
+         self._armed = False
++        # Only the process that closed the gate may reopen it. A forked child
++        # -- the storage reader in inspect_safely -- inherits this object
++        # armed, the signal handlers that call restore(), and under --privsep
++        # the socket to the root gate. When the parent ended a stalled read
++        # with SIGTERM, the child ran the handler and wrote
++        # authorized_default=1 to every hub, while the parent went on
++        # believing the gate was closed: a fail-open a hostile medium could
++        # time.
++        self._owner_pid = os.getpid()
+         self._previous_handlers: Dict[int, object] = {}
+         # restore() has three callers that do not coordinate: the watchdog
+         # thread (on_stall -> opened.restore()), the main thread on the way out
+@@ -59,6 +69,7 @@ class AuthorizationGate:
+             raise RuntimeError("no USB root hubs found under /sys/bus/usb/devices")
+ 
+         self._armed = True
++        self._owner_pid = os.getpid()
+         self._install_handlers()
+         atexit.register(self.restore)
+         try:
+@@ -106,7 +117,7 @@ class AuthorizationGate:
+             self._restore_locked()
+ 
+     def _restore_locked(self) -> None:
+-        if not self._armed:
++        if not self._armed or os.getpid() != self._owner_pid:
+             return
+         remaining = {}
+         for hub, value in list(self._original.items()):
+@@ -146,6 +157,9 @@ class AuthorizationGate:
+         self._previous_handlers.clear()
+ 
+     def _on_signal(self, signum, _frame):
++        if os.getpid() != self._owner_pid:
++            # A forked child that kept the handler: end it, reopen nothing.
++            os._exit(128 + signum)
+         self.log(f"\n[signal {signal.Signals(signum).name}] shutting down")
+         self.restore()
+         # Re-raise as a normal exit so `finally` blocks upstream still run.
+diff --git a/probolos/history.py b/probolos/history.py
+index 91d8f37..68c6295 100644
+--- a/probolos/history.py
++++ b/probolos/history.py
+@@ -1,9 +1,9 @@
+ """
+ history.py — Show the recorded history of every USB device as a table.
+ 
+-The ledger.json already stores everything needed: identity, first/last seen,
+-count, ports, decisions, and every descriptor hash presented. This module only
+-READS it (never writes) and presents it.
++The ledger.json already stores everything needed: identity, device type,
++first/last seen, count, ports, decisions, and every descriptor hash presented.
++This module only READS it (never writes) and presents it.
+ 
+ Wired into __main__.py as a new command:
+ 
+@@ -15,6 +15,7 @@ Read-only: touches no device, needs no root beyond ledger access, runs no daemon
+ 
+ from __future__ import annotations
+ 
++import textwrap
+ import time
+ from typing import List
+ 
+@@ -53,28 +54,89 @@ def _clean(text: str) -> str:
+     return "".join(out)
+ 
+ 
++def _fit(text: str, width: int) -> str:
++    """Cut `text` to `width` columns, marking the cut."""
++    return (text[:width - 1] + "\u2026") if len(text) > width else text
++
++
++# The -v block under each row: labels in one column, values in the next, so the
++# eye can run down either. A "!" in the margin marks the lines that are
++# findings rather than facts.
++_LABEL_WIDTH = 20                         # "identity fingerprint", the longest
++_VALUE_COLUMN = 7 + _LABEL_WIDTH + 3      # margin, label, " : "
++
++
++def _detail(label: str, value: str, alarm: bool = False) -> List[str]:
++    """One `label : value` line of the -v block, wrapped to 80 columns."""
++    lead = ("     ! " if alarm else " " * 7) + f"{label:<{_LABEL_WIDTH}} : "
++    return textwrap.wrap(value, width=80, initial_indent=lead,
++                         subsequent_indent=" " * _VALUE_COLUMN,
++                         break_on_hyphens=False) or [lead.rstrip()]
++
++
++def _blank(lines: List[str]) -> None:
++    """End the current block with one empty line, never two."""
++    if lines and lines[-1] != "":
++        lines.append("")
++
++
++def _tail(serial: str, room: int) -> str:
++    """The end of a serial, where units of one model usually differ.
++
++    The head is often a run of zeros ("000000001532"), so cutting from the
++    front showed every such reader as "(00000000)".
++    """
++    if room < 4 or len(serial) <= room:
++        return serial
++    return "\u2026" + serial[-(room - 1):]
++
++
++def _type_changed(entry) -> bool:
++    """True if the device has claimed more than one type under this identity."""
++    return len(getattr(entry, "known_types", None) or []) > 1
++
++
++# Every reason the daemon records, by how it starts, and the word shown for
++# it. Matched on the start, in this order, because the reasons carry free
++# text after a colon: "protected: port 4-1 is on the operator allowlist" used
++# to read as AUTHORIZED (it contains "allow"), "denied: screen locked" as
++# REJECTED (counted as a refusal nobody made), and the rest were cut to 11
++# characters ("MEDIA POLIC", "HELD: SCREE").
++_VERDICTS = (
++    ("protected", "PROTECTED"),
++    ("trusted", "TRUSTED"),
++    ("user approved", "AUTHORIZED"),
++    ("user rejected", "REJECTED"),
++    ("no answer", "NO ANSWER"),
++    ("denied", "DENIED"),
++    ("auto-denied", "DENIED"),
++    ("held", "HELD"),
++    ("admission failed", "FAILED"),
++    ("media policy", "READER OFF"),
++    ("dry-run", "DRY-RUN"),
++)
++
++
+ def _verdict(entry) -> str:
+     """
+     The most recent decision for this device, in one word.
+ 
+     Decisions are stored chronologically; the last is the current stance. A
+     device once rejected and later approved shows 'AUTHORIZED' -- but the full
+-    history (in -v) keeps both. Real strings the daemon writes: "user approved",
+-    "user rejected", "trusted", "dry-run", "protected: ...", "auto-denied ...".
++    history (in -v) keeps both. Only "user rejected" is REJECTED: it is the
++    one decision a person made against the device.
+     """
+     if not entry.decisions:
+         return "-"
+     last = entry.decisions[-1].lower().strip()
+-    if "trusted" in last:
+-        return "TRUSTED"
+-    if "approv" in last or "allow" in last:
++    for prefix, word in _VERDICTS:
++        if last.startswith(prefix):
++            return word
++    # Older or unknown wording: the gist if there is one, else the start.
++    if "approv" in last:
+         return "AUTHORIZED"
+-    if "reject" in last or "den" in last:
++    if "reject" in last:
+         return "REJECTED"
+-    if "protect" in last:
+-        return "PROTECTED"
+-    if "dry" in last:
+-        return "DRY-RUN"
+     return _clean(last.upper())[:11]
+ 
+ 
+@@ -107,7 +169,8 @@ def format_table(entries: List, verbose: bool = False) -> str:
+     lines.append(f"  Recorded devices: {len(entries)}")
+     lines.append("")
+ 
+-    header = f"  {'IDENTITY':<22} {'SEEN':>5}  {'LAST':<9} {'DECISION':<11} {'NOTE'}"
++    header = (f"  {'IDENTITY':<22} {'TYPE':<16} {'SEEN':>5}  {'LAST':<9} "
++              f"{'DECISION':<11} {'NOTE'}")
+     lines.append(header)
+     lines.append("  " + "-" * (len(header) - 2))
+ 
+@@ -117,30 +180,46 @@ def format_table(entries: List, verbose: bool = False) -> str:
+         # show a cleaned serial only when present.
+         raw_id = _clean(e.identity)
+         parts = raw_id.split(":")
++        serial = ""
+         if len(parts) >= 3:
+             vidpid = ":".join(parts[:2])
+             serial = ":".join(parts[2:]).strip()
+-            if serial and serial != "-":
+-                identity = f"{vidpid} ({serial[:8]})"
++            if serial == "-":
++                serial = ""
++            if serial:
++                identity = f"{vidpid} ({_tail(serial, 22 - len(vidpid) - 3)})"
+             else:
+                 identity = vidpid
+         else:
+             identity = raw_id
+-        identity = (identity[:21] + "\u2026") if len(identity) > 22 else identity
++        identity = _fit(identity, 22)
++        # Words from Probolos's own table, but read from a file the
++        # unprivileged analyzer writes, so cleaned like everything else.
++        kind = _clean(getattr(e, "device_type", "") or "") or "-"
+ 
+         times = e.times_seen
+         last = _age(e.last_seen, now)
+         verdict = _verdict(e)
+         drift = _drift_flag(e)
+ 
+-        lines.append(f"  {identity:<22} {times:>5}  {last:<9} {verdict:<11} {drift}")
++        lines.append(f"  {identity:<22} {_fit(kind, 16):<16} {times:>5}  "
++                     f"{last:<9} {verdict:<11} {drift}")
+ 
+         if verbose:
++            if serial:
++                lines.extend(_detail("serial", serial))
++            lines.extend(_detail("type", kind))
++            types = getattr(e, "known_types", None) or []
++            if len(types) > 1:
++                shown = types if len(types) <= 6 else types[:1] + types[-5:]
++                lines.extend(_detail("type changed",
++                                     " -> ".join(_clean(t) for t in shown),
++                                     alarm=True))
+             ports = ", ".join(dict.fromkeys(_clean(p) for p in e.ports)) or "-"
+-            lines.append(f"       ports: {ports}")
++            lines.extend(_detail("ports", ports))
+             if e.decisions:
+                 hist = " -> ".join(_clean(d) for d in e.decisions[-6:])
+-                lines.append(f"       decision history: {hist}")
++                lines.extend(_detail("decision history", hist))
+             hashes = getattr(e, "known_hashes", None) or []
+             # The hashes shown here are the NORMALIZED fingerprints -- what
+             # the drift alarm compares. Their labelling matters: a user who
+@@ -152,16 +231,20 @@ def format_table(entries: List, verbose: bool = False) -> str:
+             # Cleaned like every other field: the ledger is written by the
+             # unprivileged analyzer, and these strings are printed to root.
+             if len(hashes) > 1:
+-                lines.append(f"       ! {len(hashes)} different identity "
+-                             f"fingerprints (device changed what it claims):")
++                lines.extend(_detail(
++                    "identity fingerprint",
++                    f"{len(hashes)} different -- the device changed what it "
++                    f"claims", alarm=True))
+                 for h in hashes:
+-                    lines.append(f"           {_clean(h[:16])}\u2026")
++                    lines.append(" " * _VALUE_COLUMN
++                                 + f"{_clean(h[:16])}\u2026")
+             elif hashes:
+-                lines.append(f"       identity fingerprint : "
+-                             f"{_clean(hashes[0][:16])}\u2026")
++                lines.extend(_detail("identity fingerprint",
++                                     f"{_clean(hashes[0][:16])}\u2026"))
+             raw = getattr(e, "raw_hash", "") or ""
+             if raw:
+-                lines.append(f"       raw descriptor bytes : {_clean(raw[:16])}\u2026")
++                lines.extend(_detail("raw descriptor bytes",
++                                     f"{_clean(raw[:16])}\u2026"))
+             lines.append("")
+ 
+     if not verbose:
+@@ -170,15 +253,19 @@ def format_table(entries: List, verbose: bool = False) -> str:
+ 
+     # Risk summary: how many devices show drift or a rejection.
+     drifted = sum(1 for e in entries if len(getattr(e, "known_hashes", []) or []) > 1)
++    retyped = sum(1 for e in entries if _type_changed(e))
+     rejected = sum(1 for e in entries if _verdict(e) == "REJECTED")
+-    if drifted or rejected:
+-        lines.append("")
++    if drifted or retyped or rejected:
++        _blank(lines)
+         if drifted:
+             lines.append(f"  ! {drifted} device(s) changed descriptors -- possible spoofing/reprogramming")
++        if retyped:
++            lines.append(f"  ! {retyped} device(s) now claim a different type "
++                         f"than before (--history -v)")
+         if rejected:
+             lines.append(f"  ! {rejected} device(s) have been rejected before")
+ 
+-    lines.append("")
++    _blank(lines)
+     return "\n".join(lines)
+ 
+ 
+diff --git a/probolos/ledger.py b/probolos/ledger.py
+index 86153cd..8a7e1fd 100644
+--- a/probolos/ledger.py
++++ b/probolos/ledger.py
+@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field, fields
+ from pathlib import Path
+ from typing import Dict, List, Optional
+ 
+-from . import atomicio
++from . import atomicio, usbclass
+ 
+ def default_path() -> Path:
+     """
+@@ -191,6 +191,9 @@ MAX_PORTS = 32            # more ports than any machine has
+ # known_hashes, and the first element is kept for the same reason: it is the
+ # baseline, and a slot fed enough different cards must not wash it out.
+ MAX_MEDIA_LAYOUTS = 32
++# Distinct device types per identity. Same shape of bound as known_hashes, and
++# the first is kept for the same reason: it is what the device said it was.
++MAX_KNOWN_TYPES = 32
+ 
+ 
+ @dataclass
+@@ -224,6 +227,14 @@ class Entry:
+     # CRITICAL rule fires on. The normalized fingerprint above is what the
+     # alarm reads; this is only ever displayed.
+     raw_hash: str = ""
++    # What the device's interfaces say it is, in short words: "mouse",
++    # "storage+keyboard". The most recent readable sighting; "" when no
++    # sighting could be parsed (or the entry predates this field).
++    device_type: str = ""
++    # Every distinct device_type seen under this identity, the first kept.
++    # Length > 1 is the readable form of the drift alarm: a flash drive that
++    # now also claims a keyboard shows up as "storage -> storage+keyboard".
++    known_types: List[str] = field(default_factory=list)
+ 
+     @classmethod
+     def from_raw(cls, raw) -> Optional["Entry"]:
+@@ -335,6 +346,8 @@ class Entry:
+             known_hashes=known,
+             baseline_hash=baseline,
+             raw_hash=as_str(raw.get("raw_hash")) or "",
++            device_type=as_str(raw.get("device_type")) or "",
++            known_types=as_str_list(raw.get("known_types")),
+         )
+ 
+ 
+@@ -459,6 +472,31 @@ def raw_descriptor_hash(dev) -> Optional[str]:
+     return hashlib.sha256(raw).hexdigest() if raw else None
+ 
+ 
++def device_type(dev) -> str:
++    """
++    What a device's interfaces say it is, in short words joined by "+".
++
++    Built from the class codes through usbclass's fixed table, never from the
++    product string: that string is the device's own and can say anything,
++    while every word this returns is one Probolos wrote. "" when there is
++    nothing to go on (descriptors unparsed and no device class).
++    """
++    names: List[str] = []
++    ifaces = sorted(getattr(dev, "interfaces", None) or [],
++                    key=lambda i: (i.number, i.alternate))
++    for i in ifaces:
++        name = usbclass.short_name(i.interface_class, i.interface_subclass,
++                                   i.interface_protocol)
++        if name not in names:
++            names.append(name)
++    if not names:
++        # 0x00 means "see the interfaces", which we could not read.
++        cls = getattr(dev, "device_class", None)
++        if cls:
++            names.append(usbclass.short_name(cls, 0, 0))
++    return "+".join(names)
++
++
+ def _bounded(items: List[str], limit: int) -> List[str]:
+     """Keep the first element and the newest rest, `limit` in all."""
+     if len(items) <= limit:
+@@ -628,6 +666,14 @@ class Ledger:
+     def lookup(self, dev) -> Optional[Entry]:
+         return self.entries.get(identity_of(dev))
+ 
++    def peek_media(self, dev, lun: str, layout: str):
++        """(baseline, seen) as record_media() would return them, recording
++        nothing -- so a medium can be judged before it is remembered."""
++        layouts = self.media.get(f"{identity_of(dev)}#lun{lun}")
++        if not layouts:
++            return None, False
++        return layouts[0], layout in layouts
++
+     def record_media(self, dev, lun: str, layout: str):
+         """
+         Remember a medium seen in one slot of a reader: (baseline, seen).
+@@ -684,6 +730,7 @@ class Ledger:
+         key = identity_of(dev)
+         digest = descriptor_fingerprint(dev) or "-"
+         raw = raw_descriptor_hash(dev) or "-"
++        kind = device_type(dev)
+         # "-" is the placeholder for a device whose descriptors could not be
+         # read. It must never become a baseline: the next readable appearance
+         # would then differ from it and be reported as drift, which is a
+@@ -703,6 +750,8 @@ class Ledger:
+                 # never itself a finding.
+                 baseline_hash=digest if pinnable else "",
+                 raw_hash=raw,
++                device_type=kind,
++                known_types=[kind] if kind else [],
+             )
+             return
+ 
+@@ -710,6 +759,13 @@ class Ledger:
+         entry.times_seen += 1
+         entry.descriptor_hash = digest      # most recent, for display only
+         entry.raw_hash = raw                # ditto -- forensics only
++        # An unreadable sighting says nothing about the type, so it neither
++        # replaces the last one nor counts as a new one.
++        if kind:
++            entry.device_type = kind
++            if kind not in entry.known_types:
++                entry.known_types = _bounded(entry.known_types + [kind],
++                                             MAX_KNOWN_TYPES)
+         if pinnable and (approved or not entry.baseline_hash):
+             entry.baseline_hash = digest
+         if digest not in entry.known_hashes:
+diff --git a/probolos/mediawatch.py b/probolos/mediawatch.py
+index 9455dba..5a40adf 100644
+--- a/probolos/mediawatch.py
++++ b/probolos/mediawatch.py
+@@ -27,11 +27,14 @@ It is a DETECTION layer, separate from the pre-authorization quarantine:
+ 
+ Two limits are stated wherever the result is shown rather than hidden here:
+ 
+-  * THE AUTOMOUNTER LISTENS TO THE SAME EVENT. udisks2 mounts on this very
+-    `change`. Unless automount is inhibited for the disk (the udev rule in the
+-    README sets UDISKS_AUTO=0), the medium may be mounted -- and the kernel fs
+-    driver may have parsed it -- before or while it is read, and the result is
+-    post-hoc alerting, not prevention. Each report says which case it was.
++  * THE AUTOMOUNTER LISTENS TO THE SAME EVENT. udisks2 never mounts on its
++    own, but a desktop automounter (KDE's, GNOME's) asks it to on this very
++    `change` when it is enabled, and a person can click the card open. Unless
++    automount is inhibited for the disk (the udev rule in the README sets
++    UDISKS_IGNORE=1; UDISKS_AUTO=0 is only a hint, which KDE Plasma ignores),
++    the medium may be mounted -- and the kernel fs driver may
++    have parsed it -- before or while it is read, and the result is post-hoc
++    alerting, not prevention. Each report says which case it was.
+   * LATENCY. Medium detection rides on the kernel's disk-event polling
+     (disk_check_events): typically one to two seconds, and some readers do
+     not report media changes at all. Such a slot is flagged when first seen.
+@@ -48,7 +51,7 @@ import re
+ import time
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Callable, Dict, Optional
++from typing import Callable, Dict, Optional, Set
+ 
+ from . import report, rules, storage, sysfs, usbclass
+ 
+@@ -64,6 +67,37 @@ EVENTS_DEFAULT_POLL = "/sys/module/block/parameters/events_dfl_poll_msecs"
+ 
+ EMPTY = "empty"
+ UNREADABLE = "unreadable"
++# A card that was already in the slot when watching began. It is not read --
++# the reader was admitted or found with it -- but taking it out is still a
++# removal, and must not read as a card arriving.
++PRESENT = "present"
++
++# A disk's own first events are the slot settling, not a card: a reader
++# plugged in with an empty slot reports `add` and then a media change at
++# 0 bytes within a fraction of a second.
++SETTLE_SECONDS = 5.0
++# How long a media change that left the slot at 0 bytes is re-checked before
++# it is reported as a card the reader could not read. Field data (Genesys
++# 05e3:0749): a card that "Read Capacity" failed on came good ~10 s later.
++UNREADABLE_GRACE = 15.0
++# How long the layout an operator approved at admission is accepted. Long
++# enough for a card whose capacity arrives late (~10 s seen in the field),
++# short enough that a card put back much later is judged.
++APPROVAL_SECONDS = 30.0
++# tick() reports a late capacity only once it has seen it for this long: udev
++# opens the disk (making the size visible) BEFORE it runs its rules and
++# broadcasts, and the event it then delivers is the better report -- it
++# carries the udisks hints.
++CAPACITY_CONFIRM = 1.5
++UEVENT_SEQNUM = "/sys/kernel/uevent_seqnum"
++
++
++def uevent_seqnum() -> Optional[int]:
++    """The kernel's latest uevent number, or None if it cannot be read."""
++    try:
++        return int(Path(UEVENT_SEQNUM).read_text().strip())
++    except (OSError, ValueError):
++        return None
+ 
+ 
+ @dataclass
+@@ -72,8 +106,37 @@ class Host:
+     dev: sysfs.UsbDevice
+     resolved: str
+     instance: tuple
+-    # disk name -> EMPTY, UNREADABLE or the layout fingerprint last seen
++    # disk name -> EMPTY, UNREADABLE, PRESENT or the layout fingerprint last
++    # seen
+     slots: Dict[str, str] = field(default_factory=dict)
++    # disk name -> when it was first seen, or when watching began for a disk
++    # that already existed (clock seconds)
++    first_seen: Dict[str, float] = field(default_factory=dict)
++    # disk name -> [deadline, sys_path, count, udisks hints, capacity first
++    # seen]: media changes that left the slot at 0 bytes, re-checked by tick()
++    # before anything is said
++    zero: Dict[str, list] = field(default_factory=dict)
++    # disk name -> (layout, findings, accepted) of the last card judged in the
++    # slot, cleared when the slot is seen empty. `accepted` marks the card the
++    # operator approved at admission: it stays accepted until it is removed.
++    verdicts: Dict[str, tuple] = field(default_factory=dict)
++    # Layouts the operator saw at admission and approved. The disk's own
++    # `add` right after admission is that same card, and judging it again
++    # would overrule a decision a person just made with the contents on screen.
++    approved: Set[str] = field(default_factory=set)
++    # Starts with the host's first event after admission, not at
++    # registration: the loop may be busy with another device's prompt for
++    # longer than the window before it reads the reader's own disk events.
++    approved_until: Optional[float] = None
++    # Disks a card has been reported for this run (for the wording only).
++    reported: Set[str] = field(default_factory=set)
++    # Block events numbered at or below this predate the reader's admission:
++    # stage 4 switched the reader on and off before the prompt, and the disk
++    # add/remove that caused are still queued when watching begins. SCSI host
++    # numbers and sd names are reused, so they carry the SAME sys_path as the
++    # admitted disk -- a stale `remove` erased the slot, a stale `add` read
++    # the new card. Only the sequence number tells them apart.
++    fence: Optional[int] = None
+ 
+ 
+ def layout_fingerprint(medium: storage.MediumReport) -> Optional[str]:
+@@ -148,7 +211,8 @@ class MediaWatch:
+     def __init__(self, policy: str = POLICY_LOG, ledger=None, json_log=None,
+                  rule_config: Optional[rules.RuleConfig] = None,
+                  is_locked: Optional[Callable[[], Optional[bool]]] = None,
+-                 on_deauthorized: Optional[Callable] = None, log=print):
++                 on_deauthorized: Optional[Callable] = None, log=print,
++                 clock: Callable[[], float] = time.monotonic):
+         if policy not in POLICIES:
+             raise ValueError(f"unknown media policy: {policy!r}")
+         self.policy = policy
+@@ -158,23 +222,65 @@ class MediaWatch:
+         self.is_locked = is_locked or (lambda: False)
+         self.on_deauthorized = on_deauthorized
+         self.log = log
++        self.clock = clock
+         self.hosts: Dict[str, Host] = {}
+ 
+     # ---- which hosts ----------------------------------------------------
+ 
+-    def register(self, dev: sysfs.UsbDevice, why: str) -> bool:
+-        """Start watching `dev` if it is a pure storage host. True if so."""
++    def register(self, dev: sysfs.UsbDevice, why: str,
++                 medium: Optional[storage.MediumReport] = None,
++                 seqnum_fence: Optional[int] = None) -> bool:
++        """
++        Start watching `dev` if it is a pure storage host. True if so.
++
++        `medium` is what stage 4 showed the operator before they approved the
++        device. Its layout is accepted once, for the disk's own arrival.
++        `seqnum_fence` is uevent_seqnum() read just before admission.
++        """
+         if not _is_storage_host(dev):
+             return False
+         try:
+             resolved = os.path.realpath(dev.syspath)
+         except (OSError, ValueError):
+             return False
+-        self.hosts[dev.name] = Host(dev=dev, resolved=resolved,
+-                                    instance=dev.instance_id)
++        host = Host(dev=dev, resolved=resolved, instance=dev.instance_id,
++                    fence=seqnum_fence)
++        approved = layout_fingerprint(medium) if medium is not None else None
++        if approved:
++            host.approved.add(approved)
++        self.hosts[dev.name] = host
+         self.log(f"[◉] watching media in {report.one_liner(dev)} ({why})")
++        self._survey(host)
+         return True
+ 
++    def _survey(self, host: Host) -> None:
++        """
++        Note the slots that already exist when watching begins.
++
++        A reader present at startup produces no event until a card moves, so
++        a slot that cannot report media changes was only ever flagged after
++        the card nobody saw. And a card already sitting in a slot has to be
++        known as one, or taking it out reads as an unreadable card arriving.
++        """
++        try:
++            disks = sorted(Path(host.resolved).glob("*/host*/target*/*/block/*"))
++        except OSError:
++            return
++        for disk_path in disks:
++            disk = disk_path.name
++            if not _WHOLE_DISK_NAME.match(disk) or disk in host.slots:
++                continue
++            size = storage.read_size_sectors(f"/dev/{disk}")
++            host.slots[disk] = PRESENT if size else EMPTY
++            # Settling counts from now: a reader approved this moment can
++            # already have its disks (UAS scans without usb-storage's delay),
++            # and their attach-time media change is not a card either.
++            host.first_seen[disk] = self.clock()
++            problem = event_reporting_problem(disk_path)
++            if problem:
++                self.log(f"[!] {host.dev.name} LUN {self._lun(disk_path)} "
++                         f"({disk}): {problem}")
++
+     def unregister(self, name: str) -> None:
+         self.hosts.pop(name, None)
+ 
+@@ -189,12 +295,17 @@ class MediaWatch:
+             # A sysfs name is a port. The instance is the device.
+             try:
+                 st = os.stat(host.resolved)
+-                same = (st.st_dev, st.st_ino) == host.instance
+             except OSError:
+-                same = False
+-            if not same:
++                # Gone: an ordinary unplug. Its disk `remove` arrives after
++                # the reader's directory has vanished, and the daemon reports
++                # the unplug itself; the alarm below is for a substitution.
+                 self.unregister(name)
+                 return None
++            if (st.st_dev, st.st_ino) != host.instance:
++                self.unregister(name)
++                self.log(f"[!] media watch: {name} is no longer the reader "
++                         f"that was admitted; it is no longer watched")
++                return None
+             return host
+         return None
+ 
+@@ -208,22 +319,35 @@ class MediaWatch:
+             return
+         if properties.get("DEVTYPE", "disk") != "disk":
+             return
+-        if action == "remove":
+-            for host in self.hosts.values():
+-                host.slots.pop(disk, None)
+-            return
+-        if action not in ("add", "change"):
++        if action not in ("add", "change", "remove"):
+             return
+         host = self._host_of(sys_path)
+         if host is None:
+             return
++        seqnum = properties.get("SEQNUM")
++        if host.fence is not None and seqnum is not None:
++            try:
++                if int(seqnum) <= host.fence:
++                    return                  # queued before admission
++            except ValueError:
++                pass
++        now = self.clock()
++        if host.approved and host.approved_until is None:
++            host.approved_until = now + APPROVAL_SECONDS
++        if action == "remove":
++            host.slots.pop(disk, None)
++            host.zero.pop(disk, None)
++            host.verdicts.pop(disk, None)
++            return
+ 
+         lun = self._lun(sys_path)
+-        first_sight = disk not in host.slots
+-        if first_sight:
++        if disk not in host.slots:
++            host.first_seen[disk] = now
+             problem = event_reporting_problem(sys_path)
+             if problem:
+                 self.log(f"[!] {host.dev.name} LUN {lun} ({disk}): {problem}")
++        settling = now - host.first_seen.get(disk, now) < SETTLE_SECONDS
++        media_change = properties.get("DISK_MEDIA_CHANGE") == "1"
+ 
+         size = storage.read_size_sectors(f"/dev/{disk}")
+         if not size:
+@@ -231,60 +355,206 @@ class MediaWatch:
+                 self.log(f"[◌] card removed — {host.dev.label()} "
+                          f"LUN {lun} ({disk})")
+                 self._audit(host, disk, lun, "removed")
++                host.zero.pop(disk, None)
++                host.verdicts.pop(disk, None)
++            elif media_change and not settling:
++                # The kernel says the medium changed, yet the slot reads
++                # 0 bytes. That used to be dropped here without a word -- and
++                # it is exactly what a card the reader cannot read looks like:
++                # "Read Capacity failed" leaves it present at 0 bytes, and
++                # nothing reports it again. Its capacity can also arrive late,
++                # so it is re-checked (tick) before anything is said.
++                pending = host.zero.get(disk)
++                if pending is None:
++                    hints = {k: properties[k] for k in
++                             ("UDISKS_IGNORE", "UDISKS_AUTO") if k in properties}
++                    host.zero[disk] = [now + UNREADABLE_GRACE, sys_path, 1,
++                                       hints, None]
++                    self.log(f"[…] {host.dev.label()} LUN {lun} ({disk}): "
++                             f"media change, but no capacity yet; re-checking "
++                             f"for {UNREADABLE_GRACE:.0f} s")
++                else:
++                    pending[2] += 1
+             host.slots[disk] = EMPTY
+             return
+-
+-        media_change = properties.get("DISK_MEDIA_CHANGE") == "1"
+-        inhibited = (properties.get("UDISKS_IGNORE") == "1"
+-                     or properties.get("UDISKS_AUTO") == "0")
++        host.zero.pop(disk, None)
++        # UDISKS_AUTO=0 is only udisks' HintAuto: GNOME honours it, KDE
++        # Plasma's automounter (Solid) never reads it. Only UDISKS_IGNORE=1
++        # (HintIgnore) stops both, so only that may be called inhibited.
++        ignored = properties.get("UDISKS_IGNORE") == "1"
++        hinted = properties.get("UDISKS_AUTO") == "0"
+         mounted_before = _mounted(disk)
+         medium = self._inspect(disk)
+         fingerprint = layout_fingerprint(medium)
+         state = fingerprint or UNREADABLE
+         # Partition rescans and repeated polls produce more than one `change`
+-        # for one medium. Only the kernel's own media-change flag, or a
+-        # different layout, is a new medium.
+-        if not media_change and host.slots.get(disk) == state:
++        # for one medium: without the kernel's media-change flag, the layout
++        # the slot already holds is not news. WITH the flag it is judged
++        # below, and only then may it be folded into one line.
++        previous = host.slots.get(disk)
++        if previous == state and not media_change:
+             return
+         host.slots[disk] = state
+-
++        locked = self.is_locked() is True
++        last = host.verdicts.get(disk)
++        # The card approved at admission keeps its acceptance until the slot
++        # is seen empty -- a unit attention after the window must not switch
++        # off a reader a person said yes to. Not while the screen is locked:
++        # nobody is there to have kept it in place.
++        still_accepted = (last is not None and last[2] and previous == state
++                          and last[0] == fingerprint and not locked)
++
++        # Judge first, record after. The ledger used to be written before
++        # the findings existed, so the first card ever seen in a slot became
++        # its permanent baseline whatever it was -- a card that got the reader
++        # switched off included -- and every ordinary card after it then read
++        # as drift from the hostile one.
+         drift = None
+         drift_known = False
++        slot_known = False
+         if self.ledger is not None and fingerprint is not None:
+-            baseline, seen = self.ledger.record_media(host.dev, lun,
+-                                                      fingerprint)
++            baseline, seen = self.ledger.peek_media(host.dev, lun, fingerprint)
++            slot_known = baseline is not None
+             if baseline is not None and baseline != fingerprint:
+                 drift, drift_known = baseline, seen
+-            error = self.ledger.save()
+-            if error:
+-                self.log(f"[!] could not write ledger: {error}")
+ 
++        # Any event may bring the approved card -- its own `add`, a unit
++        # attention, or tick() once a late capacity arrives -- but only for a
++        # while after approval.
++        approved = (fingerprint is not None and fingerprint in host.approved
++                    and host.approved_until is not None
++                    and now <= host.approved_until)
++        exempt = approved or still_accepted
+         findings = sorted(
+             rules.storage_findings(medium, self.rule_config)
+-            + rules.media_findings(medium, drift=drift,
++            + rules.media_findings(medium,
++                                   drift=None if exempt else drift,
+                                    drift_known=drift_known,
+-                                   locked=self.is_locked() is True,
++                                   locked=not exempt and locked,
+                                    config=self.rule_config),
+             key=lambda f: f.severity, reverse=True)
++        verdict = frozenset((f.rule_id, f.severity) for f in findings)
++
++        # A media change with the layout AND findings the slot already holds,
++        # and no removal seen in between: the reader announcing the same card
++        # again (a unit attention after re-configuration, or an open). Field
++        # case: one card reported three times in full. Folded into one line
++        # only when nothing would differ: not while locked, not when the
++        # findings changed (the layout does not cover everything a report
++        # shows), and not when a switch-off is still to be done.
++        if (media_change and previous == state and fingerprint is not None
++                and last is not None and last[0] == fingerprint
++                and last[1] == verdict and not locked
++                and (rules.worst(findings) < rules.Severity.CRITICAL
++                     or last[2] or self.policy != POLICY_DEAUTHORIZE)):
++            self.log(f"[◌] {report.one_liner(host.dev)} LUN {lun} ({disk}): "
++                     f"media change with the same layout and findings as the "
++                     f"card already here, no removal seen; not reported again")
++            self._audit(host, disk, lun, "re-announced",
++                        fingerprint=fingerprint, findings=findings)
++            return
+ 
+-        timing = self._timing(mounted_before, inhibited)
++        # A layout that earned a CRITICAL is never learned as "seen in this
++        # slot": it must not become the baseline, nor make a returning copy
++        # of itself read as familiar. Its structural findings fire anyway.
++        recorded = False
++        if (self.ledger is not None and fingerprint is not None
++                and rules.worst(findings) < rules.Severity.CRITICAL):
++            self.ledger.record_media(host.dev, lun, fingerprint)
++            recorded = True
++            error = self.ledger.save()
++            if error:
++                self.log(f"[!] could not write ledger: {error}")
++
++        if exempt:
++            # One use only: the same card taken out and put back is judged.
++            host.approved.discard(fingerprint)
++            host.verdicts[disk] = (fingerprint, verdict, True)
++            host.reported.add(disk)
++            self.log(f"[◉] {report.one_liner(host.dev)} LUN {lun} ({disk}): "
++                     f"the card shown when this reader was approved; not "
++                     f"judged again")
++            self._audit(host, disk, lun, "approved-at-admission",
++                        fingerprint=fingerprint)
++            return
++
++        if self.ledger is not None:
++            # Only when it WAS recorded: a CRITICAL card never is.
++            first = recorded and not slot_known
++            note = " — first card recorded for this slot" if first else ""
++        else:
++            first = disk not in host.reported
++            note = " — first card seen in this slot this run" if first else ""
++        host.reported.add(disk)
++
++        timing = self._timing(mounted_before, ignored, hinted)
+         self.log("")
+         self.log(f"[▣] CARD CHANGE — {report.one_liner(host.dev)} "
+-                 f"LUN {lun} ({disk})"
+-                 + (" — first card seen in this slot" if first_sight
+-                    else ""))
++                 f"LUN {lun} ({disk})" + note)
+         self.log(report.render_medium(medium, findings))
+         self.log(f"  {timing}")
+         if medium.scheme == "gpt" and not medium.gpt_entries_parsed:
+             self.log("  GPT entries are not where the header read reaches; "
+                      "EFI and hidden-partition checks did not run.")
+ 
++        host.verdicts[disk] = (fingerprint, verdict, False)
+         enforcement = self._enforce(host, findings)
+         self._audit(host, disk, lun, "inserted", medium=medium,
+                     fingerprint=fingerprint, drift=drift, findings=findings,
+                     timing=timing, enforcement=enforcement)
+         self.log("")
+ 
++    def waiting(self) -> bool:
++        """True while a slot is being re-checked (see tick)."""
++        return any(host.zero for host in self.hosts.values())
++
++    def tick(self) -> None:
++        """
++        Re-check slots where a media change left 0 bytes.
++
++        Called about once a second by the daemon. A capacity that turns up
++        is handled as the media change it was; one that never does is
++        reported as a card the reader could not read, once.
++        """
++        now = self.clock()
++        for host in list(self.hosts.values()):
++            for disk, entry in list(host.zero.items()):
++                deadline, sys_path, count, hints, seen_at = entry
++                if storage.read_size_sectors(f"/dev/{disk}"):
++                    # Seen first here, the capacity is usually udev still
++                    # processing the event that brought it; that event wins
++                    # (handle() clears this entry) unless it never comes.
++                    if seen_at is None:
++                        entry[4] = now
++                        continue
++                    if now - seen_at < CAPACITY_CONFIRM:
++                        continue
++                    host.zero.pop(disk, None)
++                    self.handle("change", sys_path,
++                                dict({"DEVTYPE": "disk",
++                                      "DISK_MEDIA_CHANGE": "1"}, **hints))
++                    continue
++                if now < deadline:
++                    continue
++                host.zero.pop(disk, None)
++                if self._host_of(sys_path) is not host:
++                    continue
++                lun = self._lun(sys_path)
++                times = "" if count == 1 else f" ({count} times)"
++                self.log("")
++                self.log(f"[?] UNREADABLE CARD — {report.one_liner(host.dev)} "
++                         f"LUN {lun} ({disk})")
++                self.log(f"  The reader reported a media change{times}, but "
++                         f"the slot still reads 0 bytes after "
++                         f"{UNREADABLE_GRACE:.0f} s.")
++                self.log("  If you inserted a card, the reader could not read "
++                         "it: badly seated, dirty contacts, or a card this "
++                         "reader does not support. Nothing was inspected.")
++                self.log("  Re-seat it firmly; `sudo dmesg | tail` shows the "
++                         "reader's own error.")
++                self.log("")
++                self._audit(host, disk, lun, "unreadable")
++
+     # ---- pieces ---------------------------------------------------------
+ 
+     @staticmethod
+@@ -316,15 +586,21 @@ class MediaWatch:
+         return medium
+ 
+     @staticmethod
+-    def _timing(mounted_before: bool, inhibited: bool) -> str:
++    def _timing(mounted_before: bool, ignored: bool, hinted: bool) -> str:
+         if mounted_before:
+             return ("automount: the card was ALREADY MOUNTED when it was "
+                     "read -- this is post-hoc alerting, not prevention")
+-        if inhibited:
+-            return ("automount: inhibited for udisks on this disk, so this "
+-                    "read came first (other automounters are not covered)")
+-        return ("automount: NOT inhibited on this disk -- udisks may mount it "
+-                "during or after this read; treat this as post-hoc alerting")
++        if ignored:
++            return ("automount: inhibited for udisks on this disk "
++                    "(UDISKS_IGNORE=1), so this read came first (automounters "
++                    "that bypass udisks are not covered)")
++        if hinted:
++            return ("automount: only hinted off (UDISKS_AUTO=0) -- GNOME "
++                    "honours that, KDE Plasma does not; the desktop may mount "
++                    "it during or after this read")
++        return ("automount: NOT inhibited on this disk -- the desktop may "
++                "mount it during or after this read; treat this as post-hoc "
++                "alerting")
+ 
+     def _enforce(self, host: Host, findings) -> str:
+         if rules.worst(findings) < rules.Severity.CRITICAL:
+@@ -332,6 +608,9 @@ class MediaWatch:
+         if self.policy != POLICY_DEAUTHORIZE:
+             self.log("  CRITICAL finding; --media-policy is 'log', so the "
+                      "reader stays authorized.")
++            self.log("  The card is NOT blocked: your desktop may mount it. "
++                     "--media-policy deauthorize switches the whole reader "
++                     "off instead.")
+             return "logged (policy: log)"
+         # The last look at the instance before the write: the direct backend
+         # has no gate to make this check for it.
+@@ -339,6 +618,9 @@ class MediaWatch:
+             st = os.stat(host.resolved)
+             if (st.st_dev, st.st_ino) != host.instance:
+                 self.unregister(host.dev.name)
++                self.log(f"[!] media watch: {host.dev.name} was replaced "
++                         f"before it could be switched off; nothing was "
++                         f"enforced and it is no longer watched")
+                 return "not enforced: the reader was replaced"
+             sysfs.set_authorized(host.dev.syspath, 0)
+         except OSError as exc:
+@@ -372,6 +654,11 @@ class MediaWatch:
+             "disk": disk,
+             "lun": lun,
+         }
++        if what in ("approved-at-admission", "re-announced"):
++            entry["layout"] = fingerprint
++        if what == "re-announced":
++            entry["verdict"] = rules.worst(findings).label
++            entry["findings"] = [f.rule_id for f in findings]
+         if what == "inserted":
+             entry.update({
+                 "layout": fingerprint,
+diff --git a/probolos/report.py b/probolos/report.py
+index b4cfa4f..dc9da83 100644
+--- a/probolos/report.py
++++ b/probolos/report.py
+@@ -243,6 +243,10 @@ def render_medium(medium, findings: Sequence[rules.Finding]) -> str:
+             else:
+                 out.append(INDENT + _dim("no partition table; "
+                                          "contains no known filesystem"))
++        if medium.scheme != "none" and medium.signatures.get(-1):
++            out.append(INDENT + _dim(
++                f"whole-device {medium.signatures[-1]} filesystem at sector 0 "
++                f"(isohybrid image: this is what a desktop mounts)"))
+         for part in real:
+             seen = medium.signatures.get(part.index)
+             boot = " · bootable" if part.bootable else ""
+diff --git a/probolos/rules.py b/probolos/rules.py
+index dc00584..eaed9dd 100644
+--- a/probolos/rules.py
++++ b/probolos/rules.py
+@@ -921,12 +921,28 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
+         first = min(partitions, key=lambda p: p.start_lba)
+         if first.start_lba > _ALIGNMENT_TOLERANCE_SECTORS:
+             mib = first.start_lba * storage_mod.SECTOR / (1024 * 1024)
++            whole = report.signatures.get(-1)
++            reach = getattr(report, "whole_device_sectors", None) or 0
++            hidden = ("space no filesystem describes, which is where data "
++                      "would go if it were meant not to be found by ordinary "
++                      "tools.")
++            if whole and reach >= first.start_lba - _ALIGNMENT_TOLERANCE_SECTORS:
++                why = (f"Here it holds a whole-device {whole} filesystem "
++                       "starting at sector 0: an isohybrid image, as written "
++                       "by every Linux installer, which is what a desktop "
++                       "mounts.")
++            elif whole:
++                # The volume's own size, not its presence, is what explains
++                # the gap: a tiny valid ISO must not vouch for gigabytes.
++                covers = reach * storage_mod.SECTOR / (1024 * 1024)
++                why = (f"A whole-device {whole} volume at sector 0 covers only "
++                       f"the first {covers:.1f} MiB; the rest is " + hidden)
++            else:
++                why = "A much larger gap is " + hidden
+             add("large-unallocated-gap", Severity.NOTICE,
+                 "A large unused area sits before the first partition",
+                 f"The first partition begins {mib:.1f} MiB into the device. "
+-                "Alignment normally accounts for 1 to 8 MiB. A much larger "
+-                "gap is space no filesystem describes, which is where data "
+-                "would go if it were meant not to be found by ordinary tools.")
++                f"Alignment normally accounts for 1 to 8 MiB. {why}")
+ 
+     # -- 5. A GPT that contradicts its own protective MBR --------------------
+     if report.scheme == "gpt":
+diff --git a/probolos/storage.py b/probolos/storage.py
+index 71818db..f8362bd 100644
+--- a/probolos/storage.py
++++ b/probolos/storage.py
+@@ -167,6 +167,9 @@ class MediumReport:
+     error: Optional[str] = None
+     detail: Optional[str] = None
+     timed_out: bool = False
++    # How far a whole-device ISO 9660 volume at sector 0 reaches, when there
++    # is one behind a partition table (an isohybrid image). None otherwise.
++    whole_device_sectors: Optional[int] = None
+ 
+     @property
+     def inspected(self) -> bool:
+@@ -432,6 +435,23 @@ def _both_endian(vd: bytes, offset: int, width: int) -> Optional[int]:
+     return le if le == be else None
+ 
+ 
++def _iso9660_extent(data: bytes) -> Optional[int]:
++    """Bytes the ISO 9660 volume at sector 16 says it covers (validated
++    first by _iso9660_problem), or None."""
++    for index in range(OPTICAL_MAX_DESCRIPTORS):
++        start = OPTICAL_VD_START + index * OPTICAL_VD_STRIDE
++        vd = data[start:start + OPTICAL_VD_STRIDE]
++        if len(vd) < OPTICAL_VD_STRIDE or vd[1:6] != ISO9660_ID:
++            return None
++        if vd[0] == ISO_VD_TERMINATOR:
++            return None
++        if vd[0] == ISO_VD_PRIMARY:
++            blocks = _both_endian(vd, 80, 4)
++            block_size = _both_endian(vd, 128, 2)
++            return blocks * block_size if blocks and block_size else None
++    return None
++
++
+ def _iso9660_problem(data: bytes, limit_bytes: Optional[int]) -> Optional[str]:
+     """
+     Why this is not an ISO 9660 volume, or None if it is one (ECMA-119).
+@@ -546,6 +566,15 @@ def _udf_vrs_problem(data: bytes) -> Optional[str]:
+ 
+ def _inspect_worker(device: str, conn, fd=None) -> None:
+     """Runs inspect() in a child so a stalled read can be killed."""
++    # The fork carries the parent's signal handlers -- the gate's among them,
++    # which reopen it. SIGTERM is how a stalled read is ended, and it must
++    # end THIS process, not run the parent's shutdown in it.
++    import signal
++    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
++        try:
++            signal.signal(sig, signal.SIG_DFL)
++        except (ValueError, OSError):
++            pass
+     try:
+         open_fn = (lambda _dev: fd) if fd is not None else None
+         conn.send(("ok", inspect(device, open_fn=open_fn)))
+@@ -715,6 +744,23 @@ def inspect(device: str, open_fn=None) -> MediumReport:
+         elif partitions:
+             report.scheme = "mbr"
+             report.partitions = partitions
++            # An isohybrid image -- every dd-written Linux installer -- is an
++            # ISO 9660 filesystem at LBA 0 that ALSO carries an MBR. Only the
++            # table was reported, so the volume a desktop actually mounts
++            # (MANJARO_KDE_2601, say) read as "a large unused area". Same
++            # structural check as for an unpartitioned medium.
++            chunk = _read_at(fd, 0, PARTITION_SNIFF_READ)
++            if len(chunk) > len(data):
++                limit = (report.size_sectors * SECTOR
++                         if report.size_sectors else None)
++                optical, note = _identify_optical(chunk, limit)
++                if optical:
++                    report.signatures[-1] = optical
++                    extent = _iso9660_extent(chunk)
++                    if extent:
++                        report.whole_device_sectors = extent // SECTOR
++                if note:
++                    report.hollow_signatures.append(f"whole device: {note}")
+         else:
+             # No partition table. Common and legitimate: many USB sticks are
+             # formatted as a "superfloppy", with a filesystem written directly
+diff --git a/probolos/usbclass.py b/probolos/usbclass.py
+index 464e5f1..143d571 100644
+--- a/probolos/usbclass.py
++++ b/probolos/usbclass.py
+@@ -239,6 +239,49 @@ def plain_name(cls: int, subcls: int, proto: int) -> str:
+     return _PLAIN_NAMES.get(cls, class_name(cls).lower())
+ 
+ 
++# One word or so per class, for a table column (`--history`). Same facts as
++# _PLAIN_NAMES, cut to fit; the full words are for the prompt, where a person
++# has to decide something, and this is for a list they are scanning.
++_SHORT_NAMES = {
++    0x01: "audio",
++    0x02: "network",
++    0x05: "physical",
++    0x06: "camera",
++    0x07: "printer",
++    0x08: "storage",
++    0x09: "hub",
++    0x0A: "network",            # the data half of class 0x02
++    0x0B: "smartcard",
++    0x0D: "content-sec",
++    0x0E: "webcam",
++    0x0F: "healthcare",
++    0x10: "audio/video",
++    0x11: "billboard",
++    0x12: "typec-bridge",
++    0xDC: "diagnostic",
++    0xE0: "wireless",
++    0xEF: "misc",
++    0xFE: "app-specific",
++    0xFF: "vendor",
++}
++
++
++def short_name(cls: int, subcls: int, proto: int) -> str:
++    """
++    What one interface is, in a word or two.
++
++    An undeclared HID interface is "hid?", not "input": like plain_name(), it
++    has not said what it is, and it may well be a keyboard.
++    """
++    if cls == HID_CLASS:
++        if is_keyboard(cls, subcls, proto):
++            return "keyboard"
++        if is_mouse(cls, subcls, proto):
++            return "mouse"
++        return "hid?"
++    return _SHORT_NAMES.get(cls, f"class-{cls:02x}")
++
++
+ def capability(cls: int) -> str:
+     """What an interface of this class can do once switched on."""
+     return _CAPABILITIES.get(
+diff --git a/tests/test_daemon.py b/tests/test_daemon.py
+index b8ffd55..e906898 100644
+--- a/tests/test_daemon.py
++++ b/tests/test_daemon.py
+@@ -365,6 +365,30 @@ class TestStrandedDevicesAtStartup(unittest.TestCase):
+         self.assertIn("3-4", engine.known)
+         self.assertEqual(engine.pending, {})
+ 
++    def test_exit_reports_devices_left_switched_off(self):
++        """A refused device, or a reader the media policy switched off, stays
++        at authorized=0 after the gate reopens; it was never mentioned."""
++        engine = daemon_mod.Probolos(observe=0)
++        off = self.make("4-1", 0)
++        with mock.patch.object(daemon_mod.gate, "unauthorized_devices",
++                               return_value=[off]), \
++             mock.patch.object(daemon_mod.report, "one_liner",
++                               return_value="05e3:0749 reader"), \
++             mock.patch("builtins.print") as printed:
++            engine.report_blocked_on_exit()
++        text = " ".join(str(c) for c in printed.call_args_list)
++        self.assertIn("left switched off", text)
++        self.assertIn("05e3:0749 reader", text)
++        self.assertIn("--release", text)
++
++    def test_exit_says_nothing_when_nothing_is_off(self):
++        engine = daemon_mod.Probolos(observe=0)
++        with mock.patch.object(daemon_mod.gate, "unauthorized_devices",
++                               return_value=[]), \
++             mock.patch("builtins.print") as printed:
++            engine.report_blocked_on_exit()
++        printed.assert_not_called()
++
+     def test_exit_reports_what_is_left_blocked(self):
+         """Leaving hardware dead without saying so is how a tool gets a name
+         for breaking things."""
+@@ -786,6 +810,91 @@ class DaemonWiring(unittest.TestCase):
+             self.engine._on_remove("/sys/bus/usb/devices/1-2")
+         self.watch.unregister.assert_called_once_with("1-2")
+ 
++    def test_the_approved_medium_goes_to_the_watcher(self):
++        from probolos import storage
++        dev = make_stage_device()
++        esp = storage.MediumReport(
++            device="/dev/sdz", size_sectors=62333952, scheme="mbr",
++            partitions=[storage.Partition(0, False, 0xEF, 2048, 1048576)])
++        engine = daemon_mod.Probolos(monitor=session.AlwaysUnlocked(),
++                                     observe=0, inspect_storage=True,
++                                     media_watch=self.watch)
++        shown = []
++
++        def ask(_dev, findings):
++            shown.extend(f.rule_id for f in findings)
++            return True
++
++        order = []
++
++        def fence():
++            order.append("fence")
++            return 4242
++
++        with mock.patch.object(daemon_mod.sysfs, "admit_device",
++                               side_effect=lambda d: order.append("admit")), \
++             mock.patch.object(mediawatch, "uevent_seqnum", side_effect=fence), \
++             mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
++             mock.patch.object(engine, "_load_with_retry", return_value=dev), \
++             mock.patch.object(engine, "_inspect_medium", return_value=esp), \
++             mock.patch.object(engine, "_ask", side_effect=ask), \
++             mock.patch.object(daemon_mod.report, "one_liner",
++                               return_value="x"), \
++             mock.patch.object(daemon_mod.report, "render",
++                               return_value="x"), \
++             redirect_stdout(io.StringIO()):
++            engine._on_add(str(dev.syspath))
++        # The prompt shows what the watcher would say about the same card ...
++        self.assertIn("media-efi-system-partition", shown)
++        # ... and the watcher is told this card was approved, with the fence
++        # that keeps stage 4's own queued disk events out.
++        self.watch.register.assert_called_once()
++        args, kwargs = self.watch.register.call_args
++        self.assertEqual(args, (dev, "approved"))
++        self.assertIs(kwargs["medium"], esp)
++        # Read BEFORE the admission write, or the admitted disk's own events
++        # could fall at or below it and be dropped as stale.
++        self.assertEqual(order, ["fence", "admit"])
++        self.assertEqual(kwargs["seqnum_fence"], 4242)
++
++    def test_the_event_is_handled_before_the_slots_are_rechecked(self):
++        """tick() ahead of the event that brought a capacity reported the
++        card itself; the event then reported it a second time."""
++        stop = threading.Event()
++        order = []
++        event = mock.Mock(subsystem="block", action="change",
++                          sys_path="/sys/x/block/sdb", properties={})
++
++        class OneEvent:
++            def __init__(self):
++                self.given = False
++
++            def filter_by(self, **_kw):
++                pass
++
++            def start(self):
++                pass
++
++            def poll(self, timeout=None):
++                if self.given:
++                    stop.set()
++                    return None
++                self.given = True
++                return event
++
++        fake_pyudev = mock.Mock()
++        fake_pyudev.Monitor.from_netlink.return_value = OneEvent()
++        engine = daemon_mod.Probolos(monitor=session.AlwaysUnlocked(),
++                                     stop_event=stop, media_watch=self.watch)
++        with mock.patch.object(daemon_mod, "pyudev", fake_pyudev), \
++             mock.patch.object(engine, "_dispatch_safely",
++                               side_effect=lambda d: order.append("event")), \
++             mock.patch.object(engine, "_media_tick",
++                               side_effect=lambda: order.append("tick")), \
++             mock.patch("builtins.print"):
++            engine.run()
++        self.assertEqual(order[:2], ["event", "tick"])
++
+     def test_a_policy_deauthorization_puts_the_reader_back_behind_the_gate(self):
+         dev = make_device("1-2")
+         self.engine.known.add("1-2")
+diff --git a/tests/test_ledger.py b/tests/test_ledger.py
+index 283dff2..301d57f 100644
+--- a/tests/test_ledger.py
++++ b/tests/test_ledger.py
+@@ -8,11 +8,13 @@ Covers probolos.ledger and probolos.history.
+ from __future__ import annotations
+ 
+ import copy
++import dataclasses
+ import io
+ import json
+ import os
+ import shutil
+ import tempfile
++import time
+ import unittest
+ from contextlib import redirect_stdout
+ from dataclasses import asdict
+@@ -64,6 +66,8 @@ GOOD = {
+     "known_hashes": ["ab" * 32],
+     "baseline_hash": "ab" * 32,
+     "raw_hash": "ab" * 32,
++    "device_type": "storage",
++    "known_types": ["storage"],
+ }
+ 
+ 
+@@ -611,6 +615,196 @@ class OldLedgerMigration(unittest.TestCase):
+             "same stick, different port -> no alarm even after migration")
+ 
+ 
++class DeviceTypeIsRecordedAndShown(unittest.TestCase):
++    """
++    `--history` listed 045e:00cb and nothing else: the ledger kept no type, so
++    telling a mouse from a flash drive meant looking the IDs up. The type comes
++    from the interface classes through Probolos's own words, never from the
++    product string the device wrote.
++    """
++
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.path = Path(self.tmp.name) / "ledger.json"
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def test_type_comes_from_interface_classes(self):
++        self.assertEqual(ledger_mod.device_type(
++            make_device(descriptor_blob((0x03, 0x01, 0x02)))), "mouse")
++        self.assertEqual(ledger_mod.device_type(make_device()), "storage")
++        self.assertEqual(ledger_mod.device_type(make_device(descriptor_blob(
++            (0x08, 0x06, 0x50), (0x03, 0x01, 0x01)))), "storage+keyboard")
++
++    def test_undeclared_hid_is_not_called_harmless(self):
++        self.assertEqual(ledger_mod.device_type(
++            make_device(descriptor_blob((0x03, 0x00, 0x00)))), "hid?")
++
++    def test_product_string_is_ignored(self):
++        dev = make_device(product="Totally A Mouse")
++        self.assertEqual(ledger_mod.device_type(dev), "storage")
++
++    def test_unparsed_device_has_no_type(self):
++        self.assertEqual(ledger_mod.device_type(Dev()), "")
++
++    def test_type_survives_a_reload(self):
++        store = ledger_mod.Ledger(self.path)
++        dev = make_device(descriptor_blob((0x03, 0x01, 0x02)))
++        store.record(dev, "user approved", approved=True)
++        self.assertIsNone(store.save())
++        entry = ledger_mod.Ledger(self.path).lookup(dev)
++        self.assertEqual(entry.device_type, "mouse")
++        self.assertEqual(entry.known_types, ["mouse"])
++
++    def test_a_new_type_is_remembered_beside_the_old(self):
++        store = ledger_mod.Ledger(self.path)
++        store.record(make_device(), "user approved", approved=True)
++        store.record(make_device(descriptor_blob(
++            (0x08, 0x06, 0x50), (0x03, 0x01, 0x01))), "user rejected")
++        entry = store.lookup(make_device())
++        self.assertEqual(entry.device_type, "storage+keyboard")
++        self.assertEqual(entry.known_types, ["storage", "storage+keyboard"])
++
++    def test_an_unreadable_sighting_keeps_the_last_type(self):
++        store = ledger_mod.Ledger(self.path)
++        store.record(make_device(), "user approved", approved=True)
++        unread = dataclasses.replace(make_device(), descriptor_set=None,
++                                     raw_descriptors=None, device_class=None)
++        store.record(unread, "user rejected")
++        entry = store.lookup(make_device())
++        self.assertEqual(entry.device_type, "storage")
++        self.assertEqual(entry.known_types, ["storage"])
++
++    def test_known_types_are_bounded_and_keep_the_first(self):
++        store = ledger_mod.Ledger(self.path)
++        store.record(make_device(), "user approved", approved=True)
++        for cls in range(0x20, 0x20 + ledger_mod.MAX_KNOWN_TYPES + 10):
++            store.record(make_device(descriptor_blob((cls, 0, 0))),
++                         "user rejected")
++        types = store.lookup(make_device()).known_types
++        self.assertEqual(len(types), ledger_mod.MAX_KNOWN_TYPES)
++        self.assertEqual(types[0], "storage")
++
++    def test_history_shows_the_type_and_a_change_of_it(self):
++        from probolos import history
++        store = ledger_mod.Ledger(self.path)
++        store.record(make_device(), "user approved", approved=True)
++        store.record(make_device(descriptor_blob(
++            (0x08, 0x06, 0x50), (0x03, 0x01, 0x01))), "user rejected")
++        self.assertIsNone(store.save())
++        out = history.show_history(path=self.path)
++        self.assertIn("TYPE", out)
++        self.assertIn("storage+keyboard ", out)
++        self.assertIn("now claim a different type", out)
++        self.assertTrue(all(len(line) <= 80 for line in out.splitlines()))
++        out = history.show_history(verbose=True, path=self.path)
++        self.assertRegex(out, r"! type changed +: storage -> storage\+keyboard")
++
++    def test_verbose_details_line_up_and_fit_80_columns(self):
++        """The -v labels were ragged ("type:", "identity fingerprint :") and a
++        long decision history ran off the screen."""
++        from probolos import history
++        store = ledger_mod.Ledger(self.path)
++        store.record(make_device(), "user approved", approved=True)
++        for _ in range(6):
++            store.record(make_device(descriptor_blob(
++                (0x08, 0x06, 0x50), (0x03, 0x01, 0x01))),
++                "auto-denied: drift on a device nobody approved again")
++        self.assertIsNone(store.save())
++        out = history.show_history(verbose=True, path=self.path)
++        lines = out.splitlines()
++        self.assertTrue(all(len(line) <= 80 for line in lines), out)
++        colons = {line.index(" : ") for line in lines if " : " in line}
++        self.assertEqual(len(colons), 1, out)
++        self.assertNotIn("\n\n\n", out)
++
++    def test_an_entry_without_a_type_shows_a_dash(self):
++        from probolos import history
++        now = time.time()
++        entry = {"identity": "045e:00cb:-", "descriptor_hash": "a" * 64,
++                 "first_seen": now, "last_seen": now}
++        self.path.write_text(json.dumps(
++            {"schema": 1, "fingerprint_scheme": "normalized-v1",
++             "entries": {"045e:00cb:-": entry}}))
++        os.chmod(self.path, 0o600)
++        row = [line for line in history.show_history(path=self.path)
++               .splitlines() if "045e:00cb" in line][0]
++        self.assertEqual(row.split()[1], "-")
++
++    def test_type_fields_are_cleaned(self):
++        from probolos import history
++        now = time.time()
++        entry = {"identity": "0951:1665:ABC", "descriptor_hash": "x",
++                 "first_seen": now, "last_seen": now,
++                 "device_type": "\x1b]0;pwned\x07",
++                 "known_types": ["storage", "\x1b[2J"]}
++        self.path.write_text(json.dumps(
++            {"schema": 1, "fingerprint_scheme": "normalized-v1",
++             "entries": {"0951:1665:ABC": entry}}))
++        os.chmod(self.path, 0o600)
++        for verbose in (False, True):
++            out = history.show_history(verbose=verbose, path=self.path)
++            self.assertNotIn("\x1b", out)
++            self.assertNotIn("\x07", out)
++
++
++class SerialsShowTheirDistinguishingEnd(unittest.TestCase):
++    """'000000001532' was shown as '(00000000)' -- the digits that tell
++    units of one model apart were the ones cut off."""
++
++    def row(self, identity, verbose=False):
++        from probolos import history
++        entry = Entry.from_raw(dict(GOOD, identity=identity))
++        return history.format_table([entry], verbose=verbose)
++
++    def test_the_tail_is_kept(self):
++        out = self.row("05e3:0749:000000001532")
++        self.assertIn("05e3:0749 (\u2026000001532)", out)
++
++    def test_a_short_serial_is_whole(self):
++        self.assertIn("1234:5678 (ABC123)", self.row("1234:5678:ABC123"))
++
++    def test_verbose_shows_the_whole_serial(self):
++        out = self.row("05e3:0749:000000001532", verbose=True)
++        self.assertRegex(out, r"serial +: 000000001532")
++
++
++class EveryRecordedReasonHasAWord(unittest.TestCase):
++    """--history cut unknown reasons to 11 characters ("MEDIA POLIC"),
++    showed an allow-listed device as AUTHORIZED and counted a screen-lock
++    denial as a refusal nobody made."""
++
++    def verdict(self, reason):
++        from probolos import history
++        return history._verdict(Entry.from_raw(dict(GOOD, decisions=[reason])))
++
++    def test_each_reason_the_daemon_writes(self):
++        for reason, word in (
++                ("user approved", "AUTHORIZED"),
++                ("user rejected", "REJECTED"),
++                ("trusted", "TRUSTED"),
++                ("no answer", "NO ANSWER"),
++                ("admission failed", "FAILED"),
++                ("held: screen locked", "HELD"),
++                ("held: no desktop agent", "HELD"),
++                ("denied: screen locked", "DENIED"),
++                ("dry-run", "DRY-RUN"),
++                ("media policy: reader deauthorized", "READER OFF"),
++                ("protected: port 4-1 is on the operator allowlist",
++                 "PROTECTED"),
++                ("protected: device is on a non-removable (internal) port",
++                 "PROTECTED")):
++            with self.subTest(reason=reason):
++                self.assertEqual(self.verdict(reason), word)
++                self.assertLessEqual(len(word), 11)
++
++    def test_older_wording_still_reads(self):
++        self.assertEqual(self.verdict("yes, approved"), "AUTHORIZED")
++        self.assertEqual(self.verdict("something else entirely"),
++                         "SOMETHING E")
++
++
+ class HistoryDoesNotReplayLedgerEscapes(unittest.TestCase):
+     """
+     `--history -v` runs as root and prints the ledger, which the unprivileged
+diff --git a/tests/test_storage.py b/tests/test_storage.py
+index 1a9be6a..97e8065 100644
+--- a/tests/test_storage.py
++++ b/tests/test_storage.py
+@@ -677,9 +677,18 @@ class WatcherBehaviour(WatcherTestBase):
+ 
+     def test_the_report_says_when_automount_was_inhibited(self):
+         w = self.watcher()
+-        self.change(w, {"UDISKS_AUTO": "0"})
++        self.change(w, {"UDISKS_IGNORE": "1"})
+         self.assertIn("inhibited for udisks", self.output())
+ 
++    def test_udisks_auto_alone_is_not_called_inhibited(self):
++        """UDISKS_AUTO=0 is udisks' HintAuto: GNOME honours it, KDE Plasma's
++        automounter never reads it. Calling it inhibited told KDE users their
++        read came first when the card was being mounted."""
++        w = self.watcher()
++        self.change(w, {"UDISKS_AUTO": "0"})
++        self.assertNotIn("inhibited for udisks", self.output())
++        self.assertIn("KDE Plasma does not", self.output())
++
+     def test_the_report_says_when_automount_was_not_inhibited(self):
+         w = self.watcher()
+         self.change(w)
+@@ -753,6 +762,521 @@ class WatcherEnforcement(WatcherTestBase):
+             mediawatch.MediaWatch(policy="block-the-card")
+ 
+ 
++class FakeClock:
++    def __init__(self):
++        self.now = 1000.0
++
++    def __call__(self):
++        return self.now
++
++
++class UnreadableCards(WatcherTestBase):
++    """
++    Field case (Genesys 05e3:0749): "Read Capacity(10) failed ... Incompatible
++    medium installed" leaves a card present at 0 bytes, and the kernel reports
++    nothing more. The media change that announced it was dropped without a
++    word, so neither the desktop nor Probolos said anything about the card.
++    """
++
++    def watcher(self, policy=mediawatch.POLICY_LOG, locked=False):
++        self.clock = FakeClock()
++        w = mediawatch.MediaWatch(
++            policy=policy, ledger=self.ledger, json_log=self.logfile,
++            is_locked=lambda: locked, log=self.lines.append,
++            on_deauthorized=lambda dev, f: self.deauthorized.append(dev),
++            clock=self.clock)
++        self.assertTrue(w.register(self.reader, "test"))
++        return w
++
++    def settled(self):
++        self.clock.now += mediawatch.SETTLE_SECONDS + 1
++
++    def test_a_change_that_stays_at_zero_bytes_is_reported(self):
++        self.size = 0
++        w = self.watcher()
++        self.settled()
++        self.change(w)
++        self.assertTrue(w.waiting())
++        w.tick()
++        self.assertNotIn("UNREADABLE", self.output(), "re-checked first")
++        self.clock.now += mediawatch.UNREADABLE_GRACE + 1
++        w.tick()
++        self.assertIn("UNREADABLE CARD", self.output())
++        self.assertFalse(w.waiting())
++        self.assertEqual(self.inspected, [])
++        entry = json.loads(self.logfile.read_text().splitlines()[-1])
++        self.assertEqual(entry["action"], "unreadable")
++        w.tick()
++        self.assertEqual(self.output().count("UNREADABLE CARD"), 1)
++
++    def test_a_capacity_that_arrives_late_is_handled_as_the_card(self):
++        self.size = 0
++        w = self.watcher()
++        self.settled()
++        self.change(w)
++        self.size = 62333952
++        w.tick()
++        self.assertNotIn("CARD CHANGE", self.output(), "udev gets its turn")
++        self.clock.now += mediawatch.CAPACITY_CONFIRM
++        w.tick()
++        self.assertIn("CARD CHANGE", self.output())
++        self.assertNotIn("UNREADABLE", self.output())
++        self.assertFalse(w.waiting())
++
++    def test_an_empty_slot_appearing_with_its_reader_is_silent(self):
++        """A reader plugged in with an empty slot: `add`, then a media change
++        at 0 bytes. That is the slot settling, not a card."""
++        lun = self.host / "1-2:1.0/host6/target6:0:0/6:0:0:2"
++        disk = lun / "block/sdx"
++        self.size = 0
++        w = self.watcher()
++        self.settled()
++        disk.mkdir(parents=True)
++        os.symlink(lun, disk / "device")
++        w.handle("add", str(disk), {"DEVTYPE": "disk"})
++        w.handle("change", str(disk),
++                 {"DEVTYPE": "disk", "DISK_MEDIA_CHANGE": "1"})
++        self.assertFalse(w.waiting())
++        self.clock.now += 60
++        w.tick()
++        self.assertNotIn("UNREADABLE", self.output())
++
++    def test_removing_a_card_present_at_registration_is_a_removal(self):
++        w = self.watcher()                   # self.size > 0: a card is in
++        self.size = 0
++        self.change(w)
++        self.assertIn("card removed", self.output())
++        self.assertFalse(w.waiting())
++
++    def test_a_slot_present_at_registration_settles_too(self):
++        """A reader approved this moment can already have its disk; its
++        attach-time media change at 0 bytes is not a card."""
++        self.size = 0
++        w = self.watcher()
++        self.change(w)
++        self.assertFalse(w.waiting())
++
++    def test_a_dead_slot_is_flagged_when_watching_begins(self):
++        (self.disk / "events").write_text("\n")
++        self.watcher()
++        self.assertIn("does not report media changes", self.output())
++
++
++class ReannouncedCardsAndStaleEvents(UnreadableCards):
++    """Field case: one card, never moved, reported three times in full."""
++
++    def test_the_same_card_announcing_itself_again_is_one_line(self):
++        w = self.watcher()
++        self.change(w)
++        self.change(w)
++        self.change(w)
++        self.assertEqual(self.output().count("CARD CHANGE"), 1)
++        self.assertEqual(self.output().count("not reported again"), 2)
++        entry = json.loads(self.logfile.read_text().splitlines()[-1])
++        self.assertEqual(entry["action"], "re-announced")
++        self.assertIn("verdict", entry)
++
++    def test_different_findings_are_reported_in_full(self):
++        """The layout does not cover everything a report shows: a swap the
++        reader never showed empty, to a card with the same table but a planted
++        signature, must not be folded into "the same card"."""
++        w = self.watcher()
++        self.change(w)
++        self.card = medium(**FAT_CARD)
++        self.card.hollow_signatures = [
++            "partition 1: ISO 9660 signature at sector 16, but planted"]
++        self.change(w)
++        self.assertEqual(self.output().count("CARD CHANGE"), 2)
++
++    def test_a_critical_card_under_log_is_reported_once(self):
++        """The field case: a Ventoy card, reported three times in full."""
++        self.card = medium(**ESP_CARD)
++        w = self.watcher()
++        self.change(w)
++        self.change(w)
++        self.change(w)
++        self.assertEqual(self.output().count("CARD CHANGE"), 1)
++
++    def test_a_failed_switch_off_is_retried(self):
++        self.card = medium(**ESP_CARD)
++        w = self.watcher(policy=mediawatch.POLICY_DEAUTHORIZE)
++        with mock.patch.object(sysfs, "set_authorized",
++                               side_effect=OSError("busy")):
++            self.change(w)
++            self.change(w)
++        self.assertEqual(self.output().count("COULD NOT DEAUTHORIZE"), 2)
++
++    def test_tick_waits_for_the_event_udev_is_still_processing(self):
++        self.size = 0
++        w = self.watcher()
++        self.settled()
++        self.change(w)
++        self.size = 62333952
++        w.tick()                             # capacity seen, event pending
++        self.change(w)                       # udev delivers it
++        self.clock.now += 5
++        w.tick()
++        self.assertEqual(self.output().count("CARD CHANGE"), 1)
++        self.assertNotIn("not reported again", self.output())
++
++    def test_tick_keeps_the_udisks_hints(self):
++        self.size = 0
++        w = self.watcher()
++        self.settled()
++        self.change(w, {"UDISKS_IGNORE": "1"})
++        self.size = 62333952
++        w.tick()
++        self.clock.now += mediawatch.CAPACITY_CONFIRM
++        w.tick()
++        self.assertIn("inhibited for udisks", self.output())
++
++    def test_a_removal_after_admission_is_honoured(self):
++        w = mediawatch.MediaWatch(ledger=self.ledger, json_log=self.logfile,
++                                  log=self.lines.append, clock=FakeClock())
++        self.assertTrue(w.register(self.reader, "approved", seqnum_fence=500))
++        w.handle("add", str(self.disk), {"DEVTYPE": "disk", "SEQNUM": "501"})
++        w.handle("remove", str(self.disk), {"DEVTYPE": "disk", "SEQNUM": "502"})
++        w.handle("add", str(self.disk), {"DEVTYPE": "disk", "SEQNUM": "503"})
++        self.assertEqual(self.output().count("CARD CHANGE"), 2)
++
++    def test_a_remove_touches_only_its_own_reader(self):
++        other_host = Path(self.tmp.name) / "sys/devices/pci0/usb1/1-3"
++        other_lun = other_host / "1-3:1.0/host7/target7:0:0/7:0:0:0"
++        (other_lun / "block/sdz").mkdir(parents=True)
++        w = self.watcher()
++        self.assertTrue(w.register(FakeReader(other_host), "test"))
++        w.handle("remove", str(self.disk), {"DEVTYPE": "disk"})
++        self.assertNotIn("sdz", w.hosts["1-2"].slots)
++        self.assertIn("sdz", w.hosts["1-3"].slots)
++
++    def test_an_unplug_is_not_called_a_substitution(self):
++        """The disk's remove arrives after the reader's directory is gone;
++        that printed the 'no longer the reader that was admitted' alarm on
++        every unplug."""
++        w = self.watcher()
++        shutil.rmtree(self.host)
++        w.handle("remove", str(self.disk), {"DEVTYPE": "disk"})
++        self.assertNotIn("[!]", self.output())
++        self.assertNotIn("1-2", w.hosts)
++
++    def test_a_reader_replaced_before_switch_off_is_said(self):
++        self.card = medium(**ESP_CARD)
++        w = self.watcher(policy=mediawatch.POLICY_DEAUTHORIZE)
++        host = w.hosts["1-2"]
++        host.instance = (0, 0)
++        result = w._enforce(host, rules.media_findings(self.card))
++        self.assertEqual(result, "not enforced: the reader was replaced")
++        self.assertIn("was replaced", self.output())
++        self.assertEqual(self.writes, [])
++
++    def test_a_removal_in_between_makes_it_a_new_card(self):
++        w = self.watcher()
++        self.change(w)
++        self.size = 0
++        self.change(w)
++        self.size = 62333952
++        self.change(w)
++        self.assertEqual(self.output().count("CARD CHANGE"), 2)
++
++    def test_while_locked_it_is_reported_in_full(self):
++        w = self.watcher(locked=True)
++        self.change(w)
++        self.change(w)
++        self.assertEqual(self.output().count("CARD CHANGE"), 2)
++
++    def test_events_queued_before_admission_are_ignored(self):
++        """Stage 4's own disk add/remove carry the SAME sys_path as the
++        admitted disk (host numbers and sd names are reused)."""
++        w = mediawatch.MediaWatch(ledger=self.ledger, json_log=self.logfile,
++                                  log=self.lines.append, clock=FakeClock())
++        self.assertTrue(w.register(self.reader, "approved", seqnum_fence=500))
++        props = {"DEVTYPE": "disk", "SEQNUM": "499"}
++        w.handle("remove", str(self.disk), props)
++        w.handle("add", str(self.disk), props)
++        self.assertEqual(self.inspected, [])
++        self.assertIn("sdz", w.hosts["1-2"].slots, "stale remove ignored")
++        w.handle("add", str(self.disk), {"DEVTYPE": "disk", "SEQNUM": "501"})
++        self.assertIn("CARD CHANGE", self.output())
++
++    def test_a_recheck_says_it_is_waiting(self):
++        self.size = 0
++        w = self.watcher()
++        self.settled()
++        self.change(w)
++        self.assertIn("no capacity yet; re-checking", self.output())
++
++    def test_a_replaced_reader_is_said_to_be_dropped(self):
++        w = self.watcher()
++        w.hosts["1-2"].instance = (0, 0)
++        self.change(w)
++        self.assertIn("no longer watched", self.output())
++
++
++class ApprovalWindow(WatcherTestBase):
++    """The approval was used up by the first matching event and needed that
++    event to carry no media-change flag; a card whose capacity arrived late
++    (tick, after the settle window) was judged again and, under deauthorize,
++    switched off after the operator said yes."""
++
++    def register(self, clock):
++        self.card = medium(**ESP_CARD)
++        w = mediawatch.MediaWatch(
++            policy=mediawatch.POLICY_DEAUTHORIZE, ledger=self.ledger,
++            json_log=self.logfile, log=self.lines.append, clock=clock,
++            on_deauthorized=lambda dev, f: self.deauthorized.append(dev))
++        self.size = 0
++        self.assertTrue(w.register(self.reader, "approved", medium=self.card))
++        return w
++
++    def test_a_late_capacity_within_the_window_is_the_approved_card(self):
++        clock = FakeClock()
++        w = self.register(clock)
++        clock.now += mediawatch.SETTLE_SECONDS + 1
++        self.change(w)                       # media change at 0 bytes
++        self.size = 62333952
++        w.tick()                             # capacity seen ...
++        clock.now += mediawatch.CAPACITY_CONFIRM
++        w.tick()                             # ... and synthesized
++        self.assertIn("not judged again", self.output())
++        self.assertEqual(self.writes, [])
++        self.change(w)                       # and a unit attention after it
++        self.assertEqual(self.writes, [])
++        self.assertIn("not reported again", self.output())
++
++    def test_the_window_starts_with_the_readers_own_disk(self):
++        """The loop can be busy with another device's prompt for longer than
++        the window before it reads the approved reader's disk events."""
++        clock = FakeClock()
++        w = self.register(clock)
++        clock.now += 120                     # another prompt, answered slowly
++        self.size = 62333952
++        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})
++        self.assertIn("not judged again", self.output())
++        self.assertEqual(self.writes, [])
++
++    def test_the_approved_card_stays_accepted_until_removed(self):
++        clock = FakeClock()
++        w = self.register(clock)
++        self.size = 62333952
++        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})
++        clock.now += mediawatch.APPROVAL_SECONDS * 4
++        self.change(w)                       # a unit attention much later
++        self.assertEqual(self.writes, [])
++        self.size = 0
++        self.change(w)                       # taken out ...
++        self.size = 62333952
++        self.change(w)                       # ... and put back: judged
++        self.assertEqual(self.writes, [(str(self.host), 0)])
++
++    def test_after_the_window_it_is_judged(self):
++        clock = FakeClock()
++        w = self.register(clock)
++        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})  # empty: window on
++        clock.now += mediawatch.APPROVAL_SECONDS + 1
++        self.size = 62333952
++        self.change(w)
++        self.assertIn("CARD CHANGE", self.output())
++        self.assertEqual(self.writes, [(str(self.host), 0)])
++
++
++class MediaBaselineIsJudgedBeforeItIsKept(WatcherTestBase):
++    """The first card ever seen in a slot became its permanent baseline,
++    recorded before it was judged -- a card that got the reader switched off
++    included -- and every ordinary card after it read as drift."""
++
++    def key(self):
++        return f"{ledger_mod.identity_of(self.reader)}#lun1"
++
++    def test_a_critical_card_is_never_the_baseline(self):
++        self.card = medium(**ESP_CARD)
++        w = self.watcher()
++        self.change(w)
++        self.assertNotIn(self.key(), self.ledger.media)
++        self.card = medium(**FAT_CARD)
++        self.change(w)
++        self.assertNotIn("never seen", self.output())
++        self.assertEqual(len(self.ledger.media[self.key()]), 1)
++
++    def test_a_returning_critical_card_is_not_familiar(self):
++        w = self.watcher()
++        self.change(w)                                  # ordinary baseline
++        self.card = medium(**ESP_CARD)
++        self.change(w)
++        self.card = medium(**FAT_CARD)
++        self.change(w)
++        self.card = medium(**ESP_CARD)
++        self.change(w)
++        self.assertEqual(self.output().count("A card this slot has never seen"),
++                         2)
++
++    def test_a_critical_card_is_not_called_recorded(self):
++        self.card = medium(**ESP_CARD)
++        w = self.watcher()
++        self.change(w)
++        self.assertNotIn("first card recorded", self.output())
++        self.assertIn("The card is NOT blocked", self.output())
++
++    def test_first_card_wording_follows_the_ledger(self):
++        w = self.watcher()
++        self.change(w)
++        self.assertIn("first card recorded for this slot", self.output())
++        self.lines.clear()
++        w2 = self.watcher()                  # a later run, same ledger
++        self.change(w2)
++        self.assertIn("CARD CHANGE", self.output())
++        self.assertNotIn("first card", self.output())
++
++
++class TheApprovedCardIsNotJudgedAgain(WatcherTestBase):
++    """A Ventoy card shown at admission and approved was judged again the
++    moment its disk appeared, and under --media-policy deauthorize the reader
++    was switched off seconds after a person had said yes to it."""
++
++    def register_approved(self, policy):
++        w = mediawatch.MediaWatch(
++            policy=policy, ledger=self.ledger, json_log=self.logfile,
++            log=self.lines.append,
++            on_deauthorized=lambda dev, f: self.deauthorized.append(dev))
++        self.assertTrue(w.register(self.reader, "approved", medium=self.card))
++        return w
++
++    def test_its_own_arrival_is_accepted_once(self):
++        self.card = medium(**ESP_CARD)
++        w = self.register_approved(mediawatch.POLICY_DEAUTHORIZE)
++        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})
++        self.assertIn("not judged again", self.output())
++        self.assertNotIn("CARD CHANGE", self.output())
++        self.assertEqual(self.writes, [])
++        self.size = 0
++        self.change(w)                       # taken out ...
++        self.size = 62333952
++        self.change(w)                       # ... and put back: judged
++        self.assertIn("CARD CHANGE", self.output())
++        self.assertEqual(self.writes, [(str(self.host), 0)])
++
++    def test_a_different_card_is_judged(self):
++        approved = medium(**FAT_CARD)
++        self.card = approved
++        w = self.register_approved(mediawatch.POLICY_LOG)
++        self.card = medium(**ESP_CARD)
++        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})
++        self.assertIn("CARD CHANGE", self.output())
++
++
++class IsohybridImages(_Inspect):
++    """Every dd-written Linux installer is ISO 9660 at sector 0 WITH an MBR.
++    Only the table was reported; the volume a desktop mounts read as "a large
++    unused area" (field case: MANJARO_KDE_2601)."""
++
++    def image(self):
++        data = _media.iso9660_image(DEVICE_BYTES)
++        data[:512] = mbr((0xEF, 200, 8, False))
++        return data
++
++    def test_the_whole_device_filesystem_is_reported(self):
++        medium_report = self.inspect(self.image())
++        self.assertEqual(medium_report.scheme, "mbr")
++        self.assertEqual(medium_report.signatures.get(-1), "ISO 9660")
++        text = report.render_medium(medium_report, [])
++        self.assertIn("isohybrid", text)
++
++    def gap(self, volume_blocks):
++        data = _media.iso9660_image(DEVICE_BYTES, volume_blocks=volume_blocks)
++        data[:512] = mbr((0xEF, 200, 8, False))
++        medium_report = self.inspect(data, sectors=200 * 1024)
++        medium_report.partitions[0].start_lba = 100000
++        found = [f for f in rules.storage_findings(medium_report)
++                 if f.rule_id == "large-unallocated-gap"]
++        self.assertTrue(found)
++        return found[0].explanation
++
++    def test_a_volume_reaching_the_partition_explains_the_gap(self):
++        self.assertIn("isohybrid", self.gap(volume_blocks=25000))
++
++    def test_a_tiny_volume_does_not_vouch_for_the_gap(self):
++        """A 128 KiB ISO must not make a 49 MiB gap read as an installer."""
++        why = self.gap(volume_blocks=64)
++        self.assertNotIn("isohybrid", why)
++        self.assertIn("covers only the first", why)
++        self.assertIn("no filesystem describes", why)
++
++    def test_bare_magic_is_still_not_a_filesystem(self):
++        data = bytearray(DEVICE_BYTES)
++        data[:512] = mbr((0x0C, 2048, 100, False))
++        data[0x8001:0x8006] = b"CD001"
++        medium_report = self.inspect(data)
++        self.assertNotIn(-1, medium_report.signatures)
++        # ... and the check that ran says so, as it does without a table.
++        self.assertTrue(any(h.startswith("whole device:")
++                            for h in medium_report.hollow_signatures))
++        self.assertIn("filesystem-signature-without-structure",
++                      [f.rule_id for f in
++                       rules.storage_findings(medium_report)])
++
++
++class TheReaderChildCannotReopenTheGate(unittest.TestCase):
++    """The forked reader inherited the gate's signal handlers and the armed
++    gate. Ended with SIGTERM after a stall, it ran the handler and wrote
++    authorized_default=1 to every hub while the parent believed the gate was
++    closed."""
++
++    def test_the_worker_drops_inherited_handlers(self):
++        import signal as signal_mod
++        previous = {s: signal_mod.getsignal(s)
++                    for s in (signal_mod.SIGTERM, signal_mod.SIGHUP)}
++        try:
++            for sig in previous:
++                signal_mod.signal(sig, lambda *_: None)
++            conn = mock.Mock()
++            with mock.patch.object(storage, "inspect",
++                                   return_value=storage.MediumReport("x")):
++                storage._inspect_worker("/dev/sdz", conn)
++            for sig in previous:
++                self.assertEqual(signal_mod.getsignal(sig), signal_mod.SIG_DFL)
++        finally:
++            for sig, handler in previous.items():
++                signal_mod.signal(sig, handler)
++            signal_mod.signal(signal_mod.SIGINT, signal_mod.default_int_handler)
++
++    def test_a_forked_child_that_gets_the_signal_exits_quietly(self):
++        import multiprocessing
++        import signal as signal_mod
++        from probolos import gate as gate_mod
++        g = gate_mod.AuthorizationGate(log=lambda *_: None)
++        g._original = {Path("/sys/bus/usb/devices/usb1"): 1}
++        g._armed = True
++        ctx = multiprocessing.get_context("fork")
++        proc = ctx.Process(target=g._on_signal,
++                           args=(signal_mod.SIGTERM, None))
++        proc.start()
++        proc.join(10)
++        self.assertEqual(proc.exitcode, 128 + signal_mod.SIGTERM)
++        self.assertTrue(g._armed, "the parent's gate is untouched")
++
++    def test_a_forked_child_cannot_restore_the_gate(self):
++        import multiprocessing
++        from probolos import gate as gate_mod
++        g = gate_mod.AuthorizationGate(log=lambda *_: None)
++        g._original = {Path("/sys/bus/usb/devices/usb1"): 1}
++        g._armed = True
++        writes = []
++        ctx = multiprocessing.get_context("fork")
++        parent, child = ctx.Pipe()
++
++        def in_child():
++            g.restore()
++            child.send(list(writes))
++
++        with mock.patch.object(gate_mod.sysfs, "set_authorized_default",
++                               side_effect=lambda hub, v: writes.append(v)):
++            proc = ctx.Process(target=in_child)
++            proc.start()
++            proc.join(10)
++            self.assertEqual(parent.recv(), [], "the child wrote the hubs")
++            g.restore()                      # the owner still can
++        self.assertEqual(writes, [1])
++
++
+ # ---------------------------------------------------------------------------
+ # 5. Block device names
+ # ---------------------------------------------------------------------------
