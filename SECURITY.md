@@ -1,590 +1,144 @@
-# Security policy and threat model
+# Security
 
-## Reporting
+## Reporting a vulnerability
 
-Report a vulnerability privately, through GitHub's private vulnerability
-reporting:
+Report it privately through GitHub:
 <https://github.com/capitan0n/probolos/security/advisories/new>. Please do not
-open a public issue for it. Anything that is already public can go in an
-ordinary issue.
+open a public issue for it; anything already public can go in a normal issue.
 
-A report is most useful with the distribution and kernel, the Probolos version
-(the release, or `git describe --tags --always` in the checkout you installed
-from), whether `--privsep` was on, and the device or input that triggered it.
-Fixes go through a private advisory first and are published with the release
-that carries them.
+Please include the distribution and kernel, the Probolos version (the release,
+or `git describe --tags --always` in your checkout), whether `--privsep` was
+on, and the device or input that triggered it. Fixes go through a private
+advisory and are published with the release that carries them.
 
-## Scope of this document
+## What Probolos defends against
 
-This file describes the **threat model**: what is being defended against and
-under what assumptions. For the feature-by-feature boundary — which capabilities
-are implemented and reachable, which exist in the tree but are not on any
-execution path, and which are merely under consideration — see
-[`CAPABILITIES.md`](CAPABILITIES.md). Where the two disagree, `CAPABILITIES.md`
-is the one kept current against the code.
+Someone with brief physical access leaves a USB device behind, or talks you
+into plugging one in, and the device is not what it claims to be. The classic
+case is a keystroke-injection device inside a USB-stick case.
 
-## What Probolos is trying to stop
+It assumes that:
 
-An attacker with brief physical access who leaves behind, or persuades someone
-to plug in, a USB device whose declared function differs from its real one.
-The canonical case is a keystroke-injection device in the body of a flash
-drive.
-
-## What it assumes
-
-- The machine and its kernel are trustworthy at the moment Probolos starts.
-- The operator can answer a prompt using an input device that was already
-  present and already trusted.
-- Root is not already compromised. Probolos is not a rootkit detector.
+- the machine and its kernel are trustworthy when Probolos starts;
+- you answer prompts with a keyboard (or an SSH session) that was already there;
+- root is not already compromised.
 
 ## What it does not stop
 
-**Vulnerabilities in the USB stack itself.** The gate acts *after* the kernel
-has parsed descriptors. A bug in that parsing is reached before Probolos sees
-anything. This defends against malicious device *functionality*, not against
-memory corruption during enumeration. Only a separate physical machine
-(`usbip` to a sacrificial host) removes this exposure.
-
-**A patient attacker.** A device that behaves perfectly for a week and attacks
-afterwards passes every check here. The ledger narrows this by detecting a
-device that changes its descriptors between visits, but a device that changes
-only its *behaviour* leaves nothing to compare.
-
-The comparison is a **normalized** fingerprint of the parsed device and
-interface descriptors: `idVendor`, `idProduct`, `bcdDevice`, the top-level
-class triple, and for every configuration and interface the counts and the
-class/subclass/protocol triple. It deliberately drops `bcdUSB`,
-`bMaxPacketSize0`, `bMaxPower`, endpoint descriptors and SuperSpeed
-companion descriptors, because those are negotiated per bus controller and
-change on legitimate port swaps — a Kingston DataTraveler moved from a
-USB 2 to a USB 3 port produces a different raw blob without being a
-different device. So the drift rule fires on added interfaces, changed
-class/subclass/protocol, firmware revision changes and configuration
-changes; it does not fire on speed renegotiation alone. The raw-byte hash
-is still recorded per entry (`raw_hash` in `ledger.json`) for forensics —
-`--history -v` shows both — but it is never the field the CRITICAL rule
-compares.
-
-**Descriptor forgery.** An O.MG cable declares exactly what a real cable
-declares. No identity-based check can separate them — which is the entire
-reason stages 3 and 4 exist, and why active interrogation is being
-investigated.
-
-**DMA-capable interfaces.** Thunderbolt and PCIe attacks bypass this entirely.
-That is what the IOMMU and `boltctl` are for.
-
-**Wireless gateways.** A Bluetooth adapter (class `0xE0`) passes every check
-and then admits a keyboard over the air, with no USB event at all.
-
-## Known weaknesses in the current implementation
-
-These are real and are not hidden:
-
-**Privilege separation is optional.** With `--privsep`, the analyzer runs as
-`--privsep-user` (default `nobody`; the shipped service uses its own
-`probolos` account); the root gate handles sysfs writes and read-only device
-descriptors. Startup preparation and protocol/cleanup code also belong to the
-privileged boundary.
-
-**Another process with the analyzer's uid can open the gate (fixed for the
-service in 0.13.0; open for a terminal run as `nobody`).** Any process may
-signal one with its own uid. When the analyzer dies the gate does what it does
-for every analyzer exit: re-blocks what it switched on and sets
-`authorized_default` back to 1 on every hub. Under the service, which restarts
-after `RestartSec=5`, devices attached in between were admitted by the kernel
-and became part of the next run's untouched baseline; killing the analyzer
-after every restart kept the gate open most of the time, and stopping it
-(`SIGSTOP`) froze the prompts with the gate closed. Precondition: code
-execution as the analyzer's account, which was the shared `nobody`.
-
-The service now runs the analyzer as `probolos`, a system account that
-nothing else runs as (`systemd/probolos.sysusers`, created by `install.sh`).
-That leaves root and the analyzer itself able to signal it, and neither needs
-to: root is root, and an analyzer that wants the gate open can simply exit.
-The same holds for the agent socket's directory, below.
-
-The other fix considered -- keeping the hubs closed when the analyzer is
-killed rather than exits -- was not made. It cannot tell the two apart: the
-analyzer's own `SIGTERM` handler reopens the hubs through the gate and exits
-0, so a `SIGTERM` from another process with its uid looks exactly like
-`systemctl stop`. And for the signals it could tell apart it trades a gate
-left open for ports left dead after exit, which ROADMAP §4 ranks the same
-(P0); the OOM killer would then lock a USB-keyboard machine out.
-
-Still open: `--privsep-user` defaults to `nobody`, so a run started by hand
-is exposed as before unless it passes `--privsep-user probolos` (after
-`install.sh`, or `sudo systemd-sysusers "$PWD/systemd/probolos.sysusers"`
-in the checkout, has created the account). A terminal run does not restart,
-so a kill there ends it, visibly.
-
-**The analyzer's descendants can outlive the gate (open).** The gate reaps
-the analyzer it forked, not processes that analyzer forked in turn. A
-compromised analyzer can leave a process of its account behind that keeps the
-operator's terminal open after Probolos has exited and reads what is typed
-next there, or that holds the gate's socket so the gate never sees the
-analyzer go. Under the systemd unit `KillMode=control-group` ends every
-process in the unit; a run from a terminal has no such backstop. The fix is a
-subreaper in the gate that kills what is left of the analyzer's tree.
-
-**Temporary activation is bound to the inspected instance.** Stage 3 and 4
-switch a device on by the kernel directory instance the identity checks read,
-in both modes (`sysfs.activate_device`), as final admission already was. They
-used to go by path: a device that re-enumerated at the same port in between
-was switched on in its place, for stage 4 with no input grab.
-
-**Temporary activation and admission are different operations.** The gate can
-open input/block nodes belonging to a blocked peripheral or to the same device
-instance it temporarily activated. Temporary open permission expires after
-30 seconds. Re-blocking clears it. Final `admit` activates the inspected instance
-without retaining read/deauthorization permission. An already-open descriptor
-is not revoked by a lease timer; the normal workflow revokes the device by
-re-blocking it before final admission. Baseline devices, non-USB disks and PS/2
-keyboards remain outside scope. An interface cannot be passed to the whole-device
-operation to bypass its parent-device checks.
-
-The analyzer still decides whether unknown hardware is admitted; this is not
-independent verification of a human decision by the gate. An analyzer compromise
-can also cause a denial of service or trigger the deliberate exit-time reopening
-policy. Privilege separation is not a guarantee that protection survives a
-compromised policy process.
-
-**Everything the gate changes, the gate puts back.** Devices it authorized are
-re-blocked and root hubs it closed are reopened when the analyzer disconnects,
-and interface authorization is now on that same list. It was not: an interface
-deauthorized through the gate survived the analyzer's death, leaving a device
-configured but with one function permanently driverless and nothing left that
-would ever touch it again. Restoration is refused when the kernel directory
-instance no longer matches the one recorded, so a recycled port is not
-re-authorized on the strength of an entry that belonged to different hardware.
-
-**The privilege drop is verified in full.** Supplementary groups are dropped
-first and are now asserted to be gone, alongside the uid and gid checks that
-were already made. A surviving `input` or `disk` membership would let the
-analyzer open every evdev node and every raw disk on the machine directly,
-without asking the gate for anything — the gate's entire scoping rule bypassed
-while every check that *was* made still passed.
-
-**Device nodes are validated in both deployment modes.** Under `--privsep` the
-gate refuses to open anything that is not `/dev/input/eventN` or a whole
-`/dev/sdX`, proves the node is the right kind of special file, and opens it
-`O_NOFOLLOW`. Running as plain root without `--privsep` — the default, and the
-documented `sudo python -m probolos` invocation — the same three checks now
-apply before the same `os.open`. Previously none of them did. Nothing in the
-tree sends a bad path there, but the paths arrive from pyudev, from a
-udev-populated `/dev`, and in the emulation trees from ordinary writable
-directories, and a guard that holds only because of where a path happens to
-come from is not a guard.
-
-**Observation temporarily activates the whole device.** Grabs protect only input
-channels successfully captured by Probolos. Storage/network functions of a
-composite device are live too. The cleanup path now re-blocks before releasing
-any grab and runs on exceptions as well. A grab failure aborts observation;
-late nodes continue to be discovered, but discovery is asynchronous.
-
-**The input race remains, including with `--close-race-window`.** Deferred
-binding delays driver attachment; it does not stop a driver from delivering
-input between attachment and the eventual `EVIOCGRAB`. Starting a udev monitor
-first cannot make the following operations atomic. The reported duration is
-authorization-to-first-grab latency. Time between Python discovering a node and
-grabbing it is not the true exposure interval, and a small displayed number
-cannot demonstrate that no keys escaped.
-
-The legacy flag remains experimental and incompatible with `--privsep`. It
-changes the bus-wide `drivers_autoprobe` switch and can leave it disabled after
-`SIGKILL` or a kernel failure. Use `--observe 0 --no-storage-scan` to avoid these
-pre-decision activation windows. That intentionally forgoes behavioural and
-storage evidence; it does not protect the earlier kernel enumeration phase.
-
-**Active interrogation can be a trigger.** The probes in `interrogate.py`
-deliberately send requests outside ordinary enumeration. A sophisticated
-implant can use exactly that as a wake-up signal. Probes are ordered so benign
-ones run first, but probing a device believed hostile is an active choice.
-
-## Behavioural analysis and mimicry
-
-Malboard (Farhi et al., *Computers & Security*, 2019) demonstrated a malicious
-USB keyboard that imitates a specific user's typing characteristics in order to
-defeat continuous keystroke-dynamics verification, evading the detection tools
-tested in 83–100% of cases.
-
-Probolos's timing statistics are vulnerable to exactly that technique, and the
-`machine-generated-keystrokes` rule should be assumed defeated by a
-sufficiently careful attacker.
-
-The quarantine is what survives it. Continuous-verification systems must
-separate an attacker's typing from the legitimate user's *while the user is
-present*, which is what makes imitation effective. During quarantine the ground
-truth is that nobody is touching the device, so a perfectly human rhythm buys
-the attacker nothing: `unprompted-typing` fires on the fact of typing, not on
-its cadence. That rule, not the timing analysis, is the one carrying the weight.
-
-## Keystroke capture and privacy
-
-Probolos can reconstruct what a quarantined device typed. That capability is
-constrained structurally, not by policy:
-
-1. **Devices attached before startup are recorded in a baseline and never
-   inspected.** Your own keyboard is never a candidate.
-2. **Quarantine runs strictly before the human decision.** Once a device is
-   authorized the grab is released and never retaken.
-3. **Key identity is discarded unless `--capture-payload` is passed.** By
-   default a `KeyPress` carries a timestamp and nothing else, so the default
-   configuration cannot reconstruct text even in memory. Timing analysis works
-   without it.
-
-Points 1–3 are asserted in `tests/test_quarantine.py`, by
-`BaselineDevicesAreNeverInspected`, `QuarantineRunsOnlyBeforeTheDecision` and
-`DefaultConfigurationRecordsNoKeyIdentity`.
-
-There is therefore no configuration in which Probolos records a device that
-somebody has approved and is using. If you find one, that is a security bug and
-should be reported as one.
-
-Operators in the EU should note that capturing input from a device attached to
-a corporate machine may still engage GDPR obligations even under these
-constraints, and that `--capture-payload` should be enabled deliberately.
-
-## The agent socket, and who may write the directory holding it
-
-The same "directory write is stronger than it looks" reasoning that separated
-the trust store from the ledger applies to `/run/probolos/`, and it was not
-applied there. The directory was mode `2770`: owned by the analyzer's account,
-group-owned by the desktop user's group, writable by both.
-
-Write permission on a directory is the right to unlink and replace any file
-inside it, whatever that file's own owner and mode. So every member of the
-desktop user's group could unlink `agent.sock` and bind its own listener at
-that path. The real agent would then connect to *that* listener, be
-asked its questions by it, and hand its answers to it. `SO_PEERCRED` does not
-help: the attacker is never a client of ours at all.
-
-`connect()` needs traverse permission on the path and write permission on the
-**socket inode**, never write permission on the directory. The directory is
-therefore `2750` — the setgid bit still makes the socket inherit the desktop
-group, and the `0660` socket still lets that group open it. Dropping group
-write costs nothing: the analyzer owns the directory and still creates, chmods
-and unlinks its own socket there.
-
-**The directory's owner (closed for the service in 0.13.0).** `2750`
-removed the group's write permission, not the owner's, and the owner is the
-analyzer's account. While that was `nobody`, which other processes share, any
-of them could unlink `agent.sock` and listen in its place; the agent does not
-check who it connected to, so it would show that process's questions.
-Answers to them admit nothing (the real socket still checks `SO_PEERCRED`),
-but the real analyzer lost its agent and held devices meanwhile. The service
-now runs the analyzer as its own `probolos` account, which owns the
-directory and which nothing else runs as. A terminal run under the default
-`--privsep-user nobody` is still exposed.
-
-Two smaller defects on the same path are fixed with it. The socket's mode was
-set with `os.chmod` on a bare, operator-supplied path (`--agent-socket`), which
-follows symlinks and runs as root without `--privsep`; it is now set relative
-to a held directory descriptor, after `lstat` confirms the name is still a
-socket — the discipline the adjacent `chown` already used. And `stop()`
-unlinked that path unconditionally, which is a privileged delete of whatever
-happens to be there; it now removes only a socket.
-
-What remains, deliberately: a process running as the desktop user can still
-occupy the agent slot and never answer. `ask()` times out into no decision,
-which is the safe direction: the terminal is asked if there is one, and
-otherwise the device stays blocked as "no answer" (see "Holding, and answers
-that are not decisions" below). A process with that uid can ptrace the real
-agent anyway.
-
-## State files: trust, ledger, and who may write them
-
-The trust store decides whether a device is admitted **without asking**, so
-whoever can write it can admit hardware. Under `--privsep` the analyzer runs as
-`nobody` by default — a *shared* account — and that shapes the whole design
-here, which does not rely on the service's own `probolos` account.
-
-**The two stores are deliberately separated.** Directory write permission is
-stronger than it looks: it allows unlinking and replacing any file in that
-directory regardless of the file's own owner. So while the ledger and the trust
-store shared one directory, handing it to `nobody` handed over trust as well.
-The ledger now lives in `/var/lib/probolos/state/`, which is the only directory
-given to the analyzer; `/var/lib/probolos/` itself stays root-owned and holds
-`trusted.json`. The analyzer reads trust and can neither rewrite nor replace it;
-under `--privsep` the root gate writes "always" on its behalf (next section).
-
-**Writes never follow a symlink.** State files are written with
-`O_NOFOLLOW | O_CREAT | O_EXCL` and renamed into place. Previously a `nobody`
-process could pre-plant `trusted.tmp` as a symlink to, say, a file under
-`/etc/cron.d`, and the next root-run save (`sudo … --remove-trusted N`) would write the
-store's JSON through it. Stores are created mode `0600`. Under `--privsep` the
-trust store is the exception: the launcher makes an existing one `0644` and the
-gate creates a new one `0644`, so the analyzer can read back what was
-remembered, and a rewrite keeps the read bits the file already has.
-
-**The launcher refuses to chown anything outside a fixed allowlist.**
-`--ledger /etc/x.json` would otherwise make `/etc` owned by an unprivileged
-account at mode `0700`, taking sudo, ssh and PAM with it on a running system.
-That needs no attacker; a typo is enough. Allowed ledger directories are
-`/var/lib/probolos/state` and `/run/probolos/state`, including descendants.
-The allowlist is lexical and every directory component is opened with
-`O_NOFOLLOW`; resolving an allowlisted symlink must not redefine the allowlist.
-Files must be regular and have one link. Ownership and mode changes use pinned
-file descriptors. Agent directory preparation is limited to `/run/probolos`.
-A root-run agent listener requires trusted ancestor directories and keeps its
-directory root-owned, so a desktop user cannot replace a socket with a symlink
-before a privileged chmod/chown on restart.
-
-**Trust entries are validated on load,** with the same discipline the ledger
-already used — the security-critical store was previously the unvalidated one.
-An entry whose fields are the wrong type, whose fingerprint is empty, or whose
-key disagrees with the name it is filed under is ignored and counted, not
-trusted. State readers reject non-object JSON, invalid encodings, non-finite
-timestamps, special files and inputs over 8 MiB. Reload clears previous entries
-before parsing. Trust checks apply to the opened inode and its directory chain.
-
-## The gate's one write: "always" under `--privsep` (`REQ_TRUST`)
-
-The trust store admits hardware without asking, so the one process that may
-write it under `--privsep` is the root gate, and the gate writes it only on
-terms it can check itself:
-
-- **Only the gate can write.** The request travels on the private
-  socketpair `privsep.start()` creates before `fork()`. No other process --
-  other `nobody` processes included -- can reach it, which a directory
-  writable by the analyzer could not promise. Which file is written comes from
-  the root side's command line (`trust_path`), never from the socket.
-- **Only a device it admitted.** The gate keeps its own record of final
-  admissions (`REQ_ADMIT`) on this connection. `REQ_TRUST` must name that
-  device's kernel directory instance, within `TRUST_WINDOW` (60 s), and the
-  record is spent by the first request that names it, whether or not that
-  request succeeds: a refusal is not an invitation to try another key. The
-  device must still be the same instance and still be authorized when the
-  entry is written.
-- **Only a fingerprint it measured.** Before the gate first writes
-  `authorized=1` for an instance, it hashes the device's descriptors and reads
-  `idVendor`, `idProduct` and `serial` through a pinned directory descriptor,
-  and computes the key with the same `trust.key_for` the analyzer uses. The
-  earliest fingerprint is kept: a device that changes what it presents once
-  running cannot have its later testimony trusted. The analyzer's key must
-  equal the gate's exactly; it is compared, never stored. The label is the
-  only value taken from the request, and the gate sanitises it; it decides
-  nothing.
-- **Persistence is all a compromised analyzer gains.** It can already admit
-  devices -- that is its job. Through `REQ_TRUST` it can make an admission
-  it was entitled to make permanent, for a device the gate measured, and
-  nothing else: not a device it did not admit, not a different fingerprint,
-  not a different file. The gate refuses to rewrite a store that fails its
-  own integrity checks, and caps the store at `MAX_TRUSTED` entries. A
-  CRITICAL device is never offered "always", and trust never overrides a
-  CRITICAL finding on the next plug.
-
-## Holding, and answers that are not decisions
-
-A missing answer must never become an approval, and should not become a
-refusal either: a refusal is recorded, and a recorded refusal makes the next
-plug of that device CRITICAL ("previously rejected").
-
-- **With no agent the device is held.** Under the service there is no
-  terminal (stdin is `/dev/null`). With no desktop agent connected, a new
-  device is held blocked -- before stages 3 and 4, which would switch it on
-  -- and asked about when an agent connects. A remembered device is still
-  admitted on trust; nothing else is admitted while held.
-- **The re-ask cap.** An agent that leaves mid-question holds the device
-  again. Each round can switch it on for inspection, so on the third lost
-  question for the same instance (`MAX_UNSEEN_ASKS`) it is refused as
-  unanswered instead: an agent that crashes on the question and is restarted
-  cannot have unknown hardware powered up indefinitely.
-- **A replayed "add" is ignored.** udev replays `add` events (`udevadm
-  trigger`, a settle, a rescan) for held devices too. The queue entry stands
-  unless a different kernel instance now sits at the port, so a replay can
-  neither ask twice nor skip the forced question after an unlock that would
-  otherwise let a remembered device in on trust.
-- **Dialog exit codes that are no decision.** Only the dialog's own buttons
-  are answers. kdialog killed by a signal (negative code -- Qt aborts when the
-  display goes away, as at logout), kdialog's own failures (254/255), zenity's
-  error exit (255), a Tk window that crashed, and a timeout are all no
-  decision. They used to read as "Keep blocked" and be recorded as a refusal
-  nobody made. A shown question nobody answered is recorded as "no answer",
-  is not re-queued, and the person is told to replug it. The countdown's
-  first window follows the same rule: one that died rather than being
-  closed is no decision (it used to end the countdown as a refusal).
-  Remaining limit: GTK exits 1 when it loses the display, which zenity
-  reports exactly like Cancel; that case is still read as a refusal.
-- **The tkinter fallback asks twice.** A Tk message box labels its buttons
-  Yes/No/Cancel whatever it asks, and "No" used to mean "Always allow" under
-  a question ending "Allow it?". It now asks "Allow it?" (No keeps the device
-  blocked) and then, separately, "Remember this device?" (No, the default,
-  allows it once).
-
-## Device strings are treated as hostile input
-
-A device chooses its own manufacturer, product and serial strings, and those
-strings reach the terminal, the approval dialog, the JSON log, the trust store
-and the ledger. They are sanitised at the single point where sysfs bytes become
-Python strings, not at each display site — a `cat probolos.jsonl` three days
-later would otherwise replay an escape-sequence attack in a terminal nobody was
-guarding.
-
-Control characters and bidi overrides are made visible rather than executed, so
-a device cannot scroll the report and overwrite the CRITICAL line the operator
-is reading. *Why* a string had to be cleaned is recorded and becomes a finding
-in its own right: `crafted-strings` (WARNING), escalating to `crafted-strings-hid`
-(CRITICAL) when a device that can type also disguises its own name — two things
-no honest keyboard does.
-
-**Cutting is a prefix.** A string over its limit is cut at the first token
-that does not fit, and nothing after it is appended. The cut used to skip
-only the token that did not fit and keep adding what still did, so a long
-escape was dropped and its neighbour shown in its place (`'\x1f0'` at a limit
-of 1 came out as `0...`) -- the control character gone from the text the
-operator reads, though still counted as a finding -- and the combining-mark
-limit reset. Scanning continues past the cut, so a control character hidden
-behind 126 harmless ones is still reported.
-
-Markup is escaped separately, in the dialog backends only. `kdialog` renders Qt
-rich text and `zenity` renders Pango, so an `iProduct` of
-`<a href="…">Kingston</a>` would otherwise draw a live link, or a reassuring
-verdict this tool never wrote, next to the Allow button. The terminal and
-tkinter backends deliberately do **not** escape: `<` and `&` are ordinary
-characters there, and a legitimate name like `A<B & C>D` must display as typed.
-
-## What the stage 4 verdict can and cannot carry
-
-The medium verdict is context, not a gate input. Two measured reasons:
-
-- **Coverage is a fixed known-set.** Filesystems outside it (f2fs, minix,
-  squashfs, ...) read as "no known filesystem", indistinguishable from a
-  medium with no recognisable structure.
-- **The device controls whether it is read at all.** The block node must
-  appear within the poll window, and the time to get there depends on the
-  device (a slow READ CAPACITY, medium-not-ready). In testing a replug fell
-  back to "judged on declared identity alone" at a 1 s interval and succeeded
-  at 3 s. A hostile device can force that fallback deterministically.
-
-The load-bearing checks are stages 1–2 (identity and consistency). Whether
-fs detection should grow (f2fs is the obvious candidate, being a mainstream
-flash filesystem) depends on whether it is ever meant to inform policy; as
-long as it is not, the known-set above is the documented boundary.
-
-## Card readers: the medium below the device
-
-The gate acts on USB devices. A card reader is one; the card is a SCSI medium
-inside it, one layer below. Inserting, removing or swapping a card produces a
-medium-change (unit attention) in the already-bound `usb-storage`/`uas`
-driver: no USB re-enumeration, no USB uevent, no `authorized` decision point.
-Trust a reader once and every later card enters unexamined. A USB stick is
-safer in this one respect: it re-enumerates on every connect and is asked
-about again.
-
-This matters when the attacker inserts a card into the victim's trusted
-reader (including a built-in USB reader present at boot). An attacker who
-brings their own reader brings a USB device, and that is gated normally.
-
-**The quarantine claim does not extend to cards.** There is no authorization
-step to delay and no per-medium `authorized` knob. What `--watch-media` adds
-is detection: the block-layer `change` is observed for admitted storage hosts,
-the medium is read exactly as stage 4 reads it, and the operator is told its
-layout, whether it carries an EFI system partition or a hidden partition, and
-whether it differs from what that slot has held before. Say "Probolos gates
-the device; for trusted storage hosts it inspects and alerts on media changes
-— read-only, no mount — but does not gate the medium." Do not say it gates
-cards.
-
-What that reading cannot give:
-
-- **Admission control.** The only lever is `--media-policy deauthorize`,
-  which switches the whole reader off on a CRITICAL media finding. There is
-  nothing in between.
-- **Malice detection.** A crafted exFAT that exploits the kernel exFAT driver
-  on mount looks like ordinary exFAT in a partition table. The layout check
-  catches structural anomalies, not parser exploits, and parser exploits are
-  kernel fs-driver bugs — out of scope, like USB-stack bugs.
-
-Two constraints, each reported on every media event rather than assumed:
-
-- **The automounter consumes the same event.** udisks2 mounts on the very
-  `change` the watcher reads. Unless automount is inhibited for the disk (the
-  udev rule in the README), the medium may be mounted, and parsed by the
-  kernel, before or while it is read. The report says whether automount was
-  inhibited (`UDISKS_IGNORE`/`UDISKS_AUTO`) or the medium was already mounted;
-  in the second case it is post-hoc alerting.
-- **Latency.** Medium detection relies on the kernel's disk-event polling:
-  about 1–2 s, and some readers never report a media change. Such a slot is
-  flagged when first seen.
-
-**Under `--privsep` this widens the gate, and only when asked.** Final
-admission normally leaves the analyzer no read or deauthorization permission,
-which would make the watcher silently dead in the recommended mode. With
-`--watch-media`, the root gate itself records storage hosts it admitted, plus
-storage hosts already live when it started, and for those allows whole-disk
-read-only opens and switching them **off** (never on), while the kernel
-directory instance is unchanged and every interface is still mass storage.
-The flag reaches the gate from the root side of the fork, never from the
-analyzer. The cost: a compromised analyzer can read the raw contents of cards
-and disks in those readers, and switch them off. Without the flag nothing
-changes.
-
-## Storage read deadlines and remaining limits
-
-Stage 4 reads the raw medium, and a device can stall a read indefinitely —
-ordinary for failing USB, deliberate for a hostile one. Unbounded, that freeze
-would trip the watchdog, and the watchdog's job is to reopen the gate: a stall
-in the security scan would become a system-wide fail-open.
-
-The read therefore runs in a child process under a hard time limit and is
-killed if it overruns, while the watchdog is paused for the duration. Both are
-required. A timeout alone leaves the watchdog counting legitimate work as a
-stall; pausing alone converts the fail-open into a permanent freeze. A device
-that will not let itself be inspected produces a finding — the silence is the
-result. This deadline covers the worker read/parse phase. Device authorization,
-opening a gate-provided block descriptor, and deauthorization occur outside that
-worker; a kernel operation stuck in uninterruptible sleep cannot be bounded or
-reliably killed by Python. The watchdog is not proof against every USB stall.
-
-Stage 4 must briefly authorize the device for its block node to appear, and
-udisks2 may automount the medium in that window. The window is kept as short as
-the kernel allows and the device is re-blocked the instant the read returns, but
-the race is real. A udisks-specific inhibitor can suppress udisks automounting,
-but not every other program capable of mounting a device. Holding the storage
-interface at 0 also prevents the block node needed by the current scanner; it
-is not a drop-in fix. README.md ("Stop automount racing the scan") gives a udev
-rule that sets `UDISKS_AUTO=0` for USB storage; it inhibits udisks only.
-
-## Lockout safety
-
-A tool that can leave someone without a keyboard does not get installed. Five
-independent layers:
-
-| Layer | Covers |
+| Threat | Why not |
 |---|---|
-| Protected devices | internal (`removable=fixed`) ports are never gated |
-| Port allowlist | `--allow-port` keeps a rescue port always open |
-| Watchdog | daemon alive but stuck; reopens the gate |
-| Panic file | `sudo touch /run/probolos.panic` from another TTY or over SSH |
-| Privilege separation | bounds what an analyzer compromise can make root do (see "Known weaknesses") |
+| Bugs in the kernel's USB code | the kernel reads the device's descriptors before Probolos sees it; only a separate machine (`usbip`) avoids that |
+| Malicious filesystems | a crafted FAT/exFAT/NTFS attacks the kernel when it is mounted; Probolos reads partition tables, not filesystems |
+| A patient device | one that behaves for days and attacks later passes every check; the history only catches changed *descriptors* |
+| A perfect copy | an O.MG cable declares exactly what a real cable does; only stage 3 can catch it, and only if it types while being checked |
+| Thunderbolt / PCIe DMA | another subsystem: use the IOMMU and `boltctl` |
+| Bluetooth and other wireless | a radio adapter passes the checks, then accepts a keyboard over the air |
+| Anything after you allow a device | Probolos stops watching it (cards: see `--watch-media`) |
+| Malicious hubs or controller chips | the bus itself is trusted |
 
-Plus the gate's own restore paths (context manager, signal handlers, `atexit`)
-which cover a daemon that dies, and `--release` for manual recovery.
+## Known weaknesses
 
-Cleanup is best effort. The root gate now restores state if its analyzer
-disconnects, including after an analyzer crash. Killing the root gate too,
-kernel failures, or failed sysfs writes still require manual recovery:
+Open, and listed on purpose. ROADMAP item numbers are in brackets.
 
-```bash
-for hub in /sys/bus/usb/devices/usb*/authorized_default; do echo 1 | sudo tee "$hub"; done
-```
+1. **The rescue port is held while the screen is locked.** The screen-lock
+   rule runs before the exemptions for internal ports and `--allow-port`, so a
+   keyboard plugged in at the lock screen stays blocked, even on the rescue
+   port. If your keyboard is USB, keep SSH access, or use
+   `--lock-policy ignore`.
+2. **Keystrokes can slip through during stage 3.** The device is switched on
+   before its input can be captured (`EVIOCGRAB`), and keys sent in that gap
+   reach your session. `--close-race-window` does not fix this. Stages 3 and 4
+   also switch on the device's other functions for a moment. To avoid both,
+   use `--observe 0 --no-storage-scan`.
+3. **Desktop automount can win the race.** While stage 4 reads a stick, or when
+   a card goes into an allowed reader, the desktop may mount it. The udev rule
+   in the README stops udisks-based automount only.
+4. **Cards are not gated.** A card in an allowed reader is a medium, not a
+   device. `--watch-media` detects it and, at most, switches the whole reader
+   off.
+5. **A `--privsep` run started by hand uses the shared `nobody` account** by
+   default. Any other process running as `nobody` can kill the analyzer, which
+   reopens the gate, or take over the desktop prompt's socket (it cannot
+   approve anything through it). The service runs the analyzer as its own
+   `probolos` account and is not affected; by hand, pass
+   `--privsep-user probolos` once that account exists [1.11, 1.13].
+6. **Processes started by a compromised analyzer can outlive it** on a run
+   from a terminal, and keep reading that terminal. Under the service, systemd
+   ends them with the unit [1.12].
+7. **The analyzer makes the decisions.** Privilege separation limits what a
+   compromised analyzer can make root do, but it can still allow or block
+   devices, or exit, which reopens the gate.
+8. **Typing rhythm can be faked.** A device can imitate human timing
+   (Malboard, 2019), so `machine-generated-keystrokes` should be assumed
+   beatable. The rule that matters is `unprompted-typing`: nobody should be
+   typing on a device in quarantine at all, however human it looks.
+9. **Stage 4 is a hint, not a gate.** It knows a fixed set of filesystems, and
+   a device can delay its storage until the check gives up. Decisions rest on
+   stages 1 and 2.
+10. **Root hubs added after start are not gated** (a new USB controller, for
+    example in a dock).
+11. **Smaller open items:**
+    - `--timeout` below about 12 s conflicts with the desktop prompt's 10 s minimum;
+    - after many replugs, an old refusal can drop out of a device's history;
+    - with `--lock-policy deny` and no desktop prompt, devices left blocked at
+      a start behind a locked screen are never asked about;
+    - with `--agent` and a socket that fails to open, devices are denied
+      instead of held;
+    - a zenity dialog that loses its display counts as "Keep blocked".
+12. **`--close-race-window` is experimental.** It turns off automatic driver
+    binding for the whole system and may leave it off after a `SIGKILL`; it
+    cannot be combined with `--privsep`.
 
-That only affects devices attached from then on: replug anything still
-blocked, or authorize it with `echo 1 | sudo tee /sys/bus/usb/devices/<name>/authorized`.
+## Privilege separation: what it bounds
 
-The panic file must be **root-owned, in a root-owned directory**, and is checked
-with `lstat` so a symlink or hardlink planted at that path is refused. An off
-switch any local account could throw is not an off switch; it is a way to
-disable the tool. It lives in `/run` (tmpfs) so a forgotten one cannot survive a
-reboot.
+With `--privsep` (always on in the service), a small root **gate** does the
+privileged work and an unprivileged **analyzer** does everything else:
 
-## Controller hotplug and deployment
+- The gate acts only on devices the kernel shows as blocked, or that it
+  switched on itself for inspection, and only on that exact device. It never
+  opens your existing keyboards, and never your disks unless `--watch-media`
+  is on (below).
+- When the analyzer goes away, the gate switches off what it had switched on
+  for inspection, puts back interfaces it turned off, and reopens the root
+  hubs. Devices you allowed stay on.
+- "Always allow" is written by the gate itself, only for a device it has just
+  allowed, and only with a fingerprint it measured itself.
+- With `--watch-media`, the analyzer may also read every USB storage device
+  that is watched (all storage-only devices present at start or allowed later:
+  card readers, sticks and USB disks) and switch it off, never on.
 
-Only root hubs discovered when the gate starts are closed by the current
-implementation. New host controllers/root hubs require separate boot/udev
-policy; do not assume their first devices are blocked by this daemon. The
-shipped systemd unit allows AF_NETLINK and stays in the host network namespace,
-because udev events arrive over host netlink. Live systemd/USB validation
-remains necessary; a static unit check is not an integration test.
+The details are in [docs/TECHNICAL-REFERENCE.md](docs/TECHNICAL-REFERENCE.md).
 
-Kernel authorization semantics: https://docs.kernel.org/usb/authorization.html
+## Keystroke privacy
+
+Probolos can record what a quarantined device typed (`--capture-payload`).
+That is limited by design, not just by settings:
+
+- devices attached before Probolos started, such as your own keyboard, are
+  never inspected;
+- quarantine runs only *before* you decide: an allowed device is never
+  recorded;
+- without `--capture-payload`, only the timing of keys is kept, never which
+  keys.
+
+Tests pin all three (`tests/test_quarantine.py`). A setup in which Probolos
+records a device somebody approved and is using is a security bug: please
+report it. In the EU, recording input on a work machine may still involve GDPR
+obligations, so turn `--capture-payload` on deliberately.
+
+## Not locking yourself out
+
+| Safety layer | What it covers |
+|---|---|
+| Internal ports | `removable=fixed` ports are not gated (unless `--gate-fixed-ports`), except while the screen is locked |
+| `--allow-port` | a rescue port that is never gated, except while the screen is locked |
+| Watchdog | reopens the gate if Probolos stops making progress (`--watchdog`, default 60 s) |
+| Panic file | `sudo touch /run/probolos.panic` from another terminal or SSH; the watchdog checks for it |
+| Exit handling | the gate reopens on exit, crash and signals; `--release` afterwards |
+
+The panic file must be owned by root, or any user could turn Probolos off with
+it; it lives in `/run`, so it is gone after a reboot. If even the root gate
+dies, recover by hand ("If something goes wrong" in the README).
+
+The kernel's documentation of USB authorization:
+<https://docs.kernel.org/usb/authorization.html>

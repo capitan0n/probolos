@@ -1,35 +1,63 @@
 # Running Probolos as a service
 
 Two units, because the two halves live in different places: the gate is a
-**system** service (it needs root and udev), and the agent is a **user** service
-(it needs your graphical session, which is the only place a dialog can appear).
+**system** service (it needs root and udev), and the desktop prompt (the
+agent) is a **user** service (a dialog can only appear in your graphical
+session).
+
+## Test in the foreground first
+
+Before you rely on it at boot, run it by hand until you are satisfied (stop
+the service first if it is already installed: `sudo systemctl stop probolos`;
+only one gate can run at a time):
+
+```bash
+sudo python3 -m probolos --privsep --agent --agent-user "$USER"
+python3 -m probolos.agent           # in your desktop session
+```
 
 ## Install
 
-**The easy way**, from the source tree:
-
 ```bash
-sudo ./install.sh                # install and start; re-run after pulling to update
+sudo ./install.sh                # install and start; re-run after `git pull` to update
+sudo ./install.sh --user NAME    # the account whose desktop answers (default: who ran sudo)
 sudo ./install.sh --uninstall    # stop and remove; /var/lib/probolos is kept
 ```
 
-It does what the manual steps below do, and more: code to `/opt/probolos`
-(root-owned, since a root service must not run code its user can edit), a
-`probolos` command in `/usr/local/bin`, the `probolos` system account the
-analyzer runs as, both units with local settings in drop-ins
-(`PROBOLOS_AGENT_USER` = the account that ran `sudo`), and it starts both. It
-refuses while a probolos started by hand is still running. Uninstalling keeps
-the `probolos` account, which owns the kept history.
+It installs:
 
-**By hand.** Put the source at `/opt/probolos`, owned by root. (No
-distribution package exists yet; ROADMAP 1.8.) Then install the units and give each the settings `install.sh`
-puts in its drop-ins. (`install.sh` also adds `ConditionUser=` to the agent,
-because it installs the agent for every account; a unit in your own
-`~/.config/systemd/user` runs only for you and does not need it.)
+- the code, root-owned, in `/opt/probolos` (a root service must not run code a
+  user can edit);
+- a `probolos` command in `/usr/local/bin` (`sudo probolos --history`);
+- the `probolos` system account the analyzer runs as;
+- both units, with your local settings in drop-ins, and starts them.
+
+It refuses while a Probolos started by hand is still running. Uninstalling
+keeps the `probolos` account, which owns the kept history.
+
+Check that both run:
 
 ```bash
-# the analyzer's own account: the unit runs --privsep-user probolos, and does
-# not start without it
+systemctl status probolos.service
+systemctl --user status probolos-agent.service
+sudo journalctl -u probolos -f
+```
+
+How the service asks:
+
+- With no desktop session (login screen, logout), new devices are **held**
+  and asked about once you are back. Remembered devices still get in.
+- The service runs with `--timeout 0`, but a desktop dialog still closes after
+  60 s. The device then stays blocked, recorded as "no answer" (not as a
+  refusal), and a notice tells you to replug it to be asked again.
+
+## By hand
+
+Put the source at `/opt/probolos`, owned by root (there is no distribution
+package yet; ROADMAP 1.8). Then:
+
+```bash
+# the analyzer's account: the unit runs --privsep-user probolos
 sudo install -D -m 644 systemd/probolos.sysusers /etc/sysusers.d/probolos.conf
 sudo systemd-sysusers /etc/sysusers.d/probolos.conf
 # the gate, as root
@@ -40,9 +68,9 @@ sudo systemctl edit probolos.service
 ```ini
 [Service]
 Environment=PYTHONPATH=/opt/probolos
-# The account whose desktop answers. The unit ships the placeholder
-# `probolos`, the analyzer's own account, so the gate turns the agent off:
-# every new device is then held blocked, with nobody asked.
+# Whose desktop answers. The shipped placeholder, `probolos`, turns the
+# prompt off: with no terminal either, every new device is then refused as
+# "no answer" (after the stage 3 and 4 checks), with nobody asked.
 Environment=PROBOLOS_AGENT_USER=yourname
 ```
 
@@ -61,69 +89,47 @@ Environment=PYTHONPATH=/opt/probolos
 WorkingDirectory=/
 ```
 
-`systemctl edit` reloads the units when you save.
-
-## Start
+`systemctl edit` reloads the units when you save. Start both:
 
 ```bash
 sudo systemctl enable --now probolos.service
 systemctl --user enable --now probolos-agent.service
 ```
 
-Check both:
-
-```bash
-systemctl status probolos.service
-systemctl --user status probolos-agent.service
-sudo journalctl -u probolos -f
-```
-
-## Before enabling it at boot
-
-**Test it in the foreground first.** A service that closes the USB gate at boot
-and then fails to start its agent will leave you approving devices from a
-terminal you have to find. Run it by hand until you are satisfied:
-
-```bash
-sudo python -m probolos --privsep --privsep-user probolos --agent
-python -m probolos.agent
-```
-
-Note the gate is started with `--timeout 0`, meaning a question waits
-indefinitely rather than expiring into a refusal. That is right for a background
-service: a device you plugged in and walked away from should still be waiting
-when you come back, not silently rejected. Set a timeout if you prefer the
-opposite.
+(`install.sh` also adds `ConditionUser=` to the agent, because it installs it
+for every account; a unit in your own `~/.config/systemd/user` does not need
+it.)
 
 ## What the sandboxing does
 
-The gate needs root, so the units restrict what root can still reach:
+The gate needs root, so its unit limits what root can still reach:
 
 | Setting | Effect |
 |---|---|
-| `ProtectSystem=strict` | the whole filesystem read-only except the state and runtime directories |
-| `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any` | no IP sockets or traffic; `PrivateNetwork` stays `no` because udev events arrive over host netlink |
-| `DevicePolicy=closed` | only input nodes and block devices; no sound, video, tty or GPU |
-| `MemoryDenyWriteExecute=yes` | no writable-executable memory |
-| `SystemCallFilter` | denies module loading, raw I/O, mounting, reboot, and the rest |
+| `ProtectSystem=strict` | the filesystem is read-only, except the state and runtime directories |
+| `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any` | no IP traffic; `PrivateNetwork` stays off because udev events arrive over host netlink |
+| `DevicePolicy=closed` | input devices, and block devices read-only; nothing else |
+| `MemoryDenyWriteExecute=yes` | no writable and executable memory |
+| `SystemCallFilter` | no module loading, raw I/O, mounting, rebooting, ... |
 | `CapabilityBoundingSet` | only the five capabilities the privilege drop and directory setup need |
 
-`ProtectKernelTunables` is deliberately **not** enabled: writing
-`/sys/bus/usb/devices/*/authorized` is the entire mechanism. That is the one
-broad permission the design cannot do without, and it is the reason the
-privileged half (`gate_server.py` and the protocol it serves) is kept separate
-from the analyzer, with its own tests and a coverage floor.
+`ProtectKernelTunables` is deliberately **off**: writing
+`/sys/bus/usb/devices/*/authorized` is the whole mechanism. That is the one
+broad permission the design cannot avoid, and the reason the privileged half
+is kept apart from the analyzer, with its own tests and a coverage floor.
 
 ## Removing it
 
 ```bash
+sudo ./install.sh --uninstall
+# or, for a manual install:
 sudo systemctl disable --now probolos.service
 systemctl --user disable --now probolos-agent.service
 ```
 
-Stopping the service reopens the gate, as every exit path does. If something has
-gone wrong and devices are left blocked:
+Stopping the service reopens the gate, as every exit does. If devices stay
+blocked:
 
 ```bash
-sudo probolos --release    # after install.sh; from a checkout: sudo python3 -m probolos --release
+sudo probolos --release    # from a checkout: sudo python3 -m probolos --release
 ```

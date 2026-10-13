@@ -1,10 +1,10 @@
-# Probolos: the road to 1.0.0
+# Roadmap to 1.0.0
 
-From here on, nothing new goes in. Every change before 1.0.0 is a fix, a
-security fix, testing, documentation or release work. The features that ship
-in 1.0 are the ones in the tree today; the work left is making them correct,
-proven and documented. A thesis needs that too: it describes one fixed system
-and the evidence that the system does what it claims.
+Until 1.0.0 nothing new goes in: every change is a fix, a security fix,
+testing, documentation or release work. The features of 1.0 are the ones in
+the tree; what is left is making them correct, proven and documented. That is
+also what the thesis needs: one fixed system, and the evidence that it does
+what it claims.
 
 ---
 
@@ -12,225 +12,161 @@ and the evidence that the system does what it claims.
 
 ### 1.1 What 1.0 is
 
-**`CAPABILITIES.md` §1, as of the `v0.11.0` tag, is the feature contract.**
-That covers:
-
-- the closed gate;
-- the four analysis stages;
-- the human decision, by terminal or desktop agent, with one dialog, two, or
-  the countdown;
-- the trust store, including "always" under `--privsep`;
-- the ledger and drift detection;
-- holding devices behind a locked screen or with no agent;
-- privilege separation;
-- lockout safety;
-- `--watch-media`;
-- the systemd service.
+`CAPABILITIES.md` §1 as of the `v0.11.0` tag: the closed gate; the four
+stages; the human decision (one dialog, two, or the countdown); the trust
+store, including "always" under `--privsep`; history and drift detection;
+holding devices behind a locked screen or with no agent; privilege
+separation; lockout safety; `--watch-media`; and the systemd service.
 
 ### 1.2 What 1.0 is not
 
-These are deferred to after 1.0. Record them in `CAPABILITIES.md` §3 so the
-decision is visible:
+Deferred, and recorded in `CAPABILITIES.md` §3.0 so the decision is visible:
 
 | Deferred | Was |
 |---|---|
 | A GUI for history and trust | T5 |
 | `--remove-history N\|PATTERN`, numbered `--history` | T7 |
-| A configurable dialog timeout (60 s stays the default) | T8 |
+| A configurable dialog timeout (60 s stays) | T8 |
 | HID report-descriptor analysis | `CAPABILITIES.md` §3.2 |
-| `--close-race-window` (deferred binding) | Stays in the tree, marked experimental, outside the 1.0 guarantees |
+| `--close-race-window` | stays in the tree, experimental, outside the 1.0 guarantees |
 
 ### 1.3 What counts as a fix
 
 A change that makes documented behaviour true is a **fix**. A change that adds
-behaviour is a **feature**, and goes on the post-1.0 list.
+behaviour is a **feature** and waits for after 1.0.
 
 | Allowed | Not allowed |
 |---|---|
-| bug fix, including a false positive or negative on real hardware | new command-line options |
-| security fix | new analyzers or rules (a rule that misfires may be *fixed*) |
+| bug fixes, including a false positive or negative on real hardware | new command-line options |
+| security fixes | new analyzers or rules (a rule that misfires may be *fixed*) |
 | tests, CI, linters, coverage | new UI or new prompts |
 | documentation | a behaviour change that is not a fix |
-| packaging, release engineering | refactoring without a fix that needs it |
+| packaging, release engineering | refactoring that no fix needs |
 
-**In doubt?** Open an issue, label it `post-1.0`, and move on.
+**In doubt?** Open an issue labelled `post-1.0` and move on.
 
 ---
 
-## 2. Versions and gates
+## 2. Versions
 
-| Stage | Version | Enter when | Leave when |
+| Stage | Versions | Enter when | Leave when |
 |---|---|---|---|
-| Freeze | `0.11.0`, `0.12.0` | now | Phase 1 done |
-| Beta | `1.0.0b1`, `b2`, … | hardening done | no open P0/P1, matrix passed, docs complete |
-| Release candidate | `1.0.0rc1`, `rc2`, … | beta exit met | two quiet weeks with no change |
+| Freeze | `0.11.0` to `0.13.0` | 2026-10-03 | Phase 1 done |
+| Beta | `1.0.0b1`, `b2`, … | hardening done | no open P0/P1, hardware matrix passed, docs complete |
+| Release candidate | `1.0.0rc1`, … | beta exit met | two quiet weeks with no change |
 | Final | `1.0.0` | the last rc, unchanged | — |
 
-- **Versions** follow PEP 440, and pacman sorts them the same way
+- Versions follow PEP 440, and pacman sorts them the same way
   (`1.0.0b1 < 1.0.0b10 < 1.0.0rc1 < 1.0.0`).
-- **Bump** the version in `pyproject.toml` *and* in the source fallback in
+- Bump the version in `pyproject.toml` *and* in the fallback in
   `probolos/__init__.py`.
-- **Tag** each release with a signed tag (`git tag -s`), on a commit of
-  `main`: `release.yml` refuses any other.
-- **PyPI** gets every tag from `1.0.0b1` on, betas and rcs included, once
-  the maintainer approves the upload (1.14). A file on PyPI can never be
-  uploaded again, not even after it is deleted: a bad upload means the next
-  version.
-- **`0.12.0`** is a release inside the freeze, not a new stage: the fixes
-  from the 2026-10-04 security audit (Phase 1.6), no features. The beta still
-  waits for the Phase 1 exit below.
+- Tag each release with a signed tag (`git tag -s`) on a commit of `main`;
+  `release.yml` refuses any other.
+- Every tag from `1.0.0b1` on goes to PyPI once the maintainer approves the
+  upload (1.14). A file on PyPI can never be uploaded again, even after it is
+  deleted: a bad upload means a new version.
 
 ---
 
-## 3. Step guide
+## 3. Steps
 
 **M** = must, **S** = should, **C** = could.
 
-### Phase 0: freeze (this week)
+### Phase 0: freeze
 
-- [x] **0.1 M** Write the `Unreleased` part of `CHANGELOG.md`, covering:
-  - gate-side "always" (T1);
-  - holding devices with no agent, and notices (T2–T4);
-  - the CI workflows;
-  - the QA tooling;
-  - every fix from the reviews.
-  Release it as `0.11.0`.
-- [x] **0.2 M** Add a "Feature freeze" note to the top of `CAPABILITIES.md`,
-  and move the §1.2 items into its §3.
-- [x] **0.3 M** Tag `v0.11.0`: the feature-complete snapshot the thesis
+- [x] **0.1 M** Write the changelog for the freeze; release it as `0.11.0`.
+- [x] **0.2 M** Add the feature-freeze note to `CAPABILITIES.md` and move the
+  deferred items to its §3.
+- [x] **0.3 M** Tag `v0.11.0`, the feature-complete snapshot the thesis
   describes.
-- [ ] **0.4 S** Set up GitHub:
-  - labels: `bug`, `security`, `qa`, `docs`, `packaging`, `release`,
-    `post-1.0`;
-  - milestones: `1.0.0b1`, `1.0.0rc1`, `1.0.0`;
-  - private vulnerability reporting, plus secret scanning with push
-    protection;
-  - two issue templates. The bug report asks for the distro, kernel,
-    Probolos version (release or `git describe`), desktop and
-    `journalctl -u probolos` output. The security one points to private
-    reporting.
-- [ ] **0.5 M** Open one issue for every item in Phase 1.
+- [ ] **0.4 S** Set up GitHub: labels, milestones, private vulnerability
+  reporting, secret scanning with push protection, and issue templates
+  (`docs/GITHUB-SETUP.md`).
+- [ ] **0.5 M** Open one issue for every Phase 1 item.
 
 ### Phase 1: hardening → `1.0.0b1`
 
-- [x] **1.1 M** Test the gate's refusal paths. Write tests for the `OSError`
-  and refusal branches of `gate_server.py`, and the fork/drop/wait error paths
-  of `privsep.py` (68% today) and `gate_client.py` (71%). Target: the coverage
-  "boundary" (the root-side code plus its protocol, measured by
-  `coverage.yml`) at ≥ 90%, up from 80%. Raise the floor in `coverage.yml` as
-  it climbs.
-- [x] **1.2 M** Remove the dead code. `AgentLink.notify_critical` has no
-  caller, and the agent's `MSG_CRITICAL` handler still says "Use the
-  terminal", which stopped being true when CRITICAL devices became approvable
-  with the countdown. Remove the path, or make it true.
-- [x] **1.3 M** Bring `SECURITY.md` up to date. Add the threat model for:
-  - the gate-side trust write (`REQ_TRUST`): only the gate can write; only a
-    device it admitted; only a fingerprint it measured; persistence is all
-    a compromised analyzer gains;
-  - the hold semantics: with no agent the device is held; the re-ask cap; a
-    replayed "add" is ignored;
-  - the `textsafe` cut fix;
-  - dialog exit codes that are no decision.
-- [ ] **1.4 M** Before every beta, run the deep property tests:
-  `HYPOTHESIS_PROFILE=deep`. They must be clean.
-- [ ] **1.5 S** Run an end-to-end test on a real kernel: a QEMU VM with
-  `dummy_hcd` and `raw_gadget`, using `testbed/`, so a fake keyboard and a
-  fake USB stick meet the real service. A scripted manual run before each
-  beta is enough; a CI job is optional.
-- [x] **1.6 S** Do a review pass over everything since `0.10.0`, root-side code
-  first. Log every finding (§6). Done 2026-10-04 (`docs/QA-LOG.md`, "review
-  (security audit)"); fixed in 0.12.0 except 1.11 to 1.13.
+- [x] **1.1 M** Test the gate's refusal paths; boundary coverage at least 90%
+  (it reached 95%), with the floor in `coverage.yml` raised to match.
+- [x] **1.2 M** Remove dead code: the agent's CRITICAL message said "Use the
+  terminal" (made true instead).
+- [x] **1.3 M** Bring `SECURITY.md` up to date: the gate-side trust write,
+  holding, the text cut, dialog exit codes.
+- [ ] **1.4 M** Before every beta, run the deep property tests
+  (`HYPOTHESIS_PROFILE=deep`); they must be clean.
+- [ ] **1.5 S** End-to-end test on a real kernel: a QEMU VM with `dummy_hcd`
+  and `raw_gadget`, so a fake keyboard and a fake stick meet the real service.
+  A scripted manual run before each beta is enough.
+- [x] **1.6 S** Review everything since `0.10.0`, root side first, and log
+  every finding (§6). Done 2026-10-04; fixed in 0.12.0 except 1.11 to 1.13.
+- [x] **1.7 S** Leave hardware- and GUI-only modules out of coverage, with the
+  reason next to the setting, and re-baseline the floors.
+- [ ] **1.8 S** Package (T6): finish the `PKGBUILD`, then build, install and
+  uninstall it cleanly on Manjaro.
+- [x] **1.9 S** Release workflow: on a `v*` tag, build the sdist and wheel,
+  write `SHA256SUMS`, attest provenance, and create a **draft** pre-release.
+- [x] **1.10 C** Run mypy on the root-side modules.
 - [x] **1.11 M** The shared `nobody` account must not be able to open the
-  gate. Any process running as `nobody` can kill the analyzer, and the gate
-  reopens every hub on any analyzer exit (`SECURITY.md`, "Known
-  weaknesses"). Run the analyzer as a dedicated account in the shipped unit
-  and `install.sh`, and/or keep the hubs closed when the analyzer dies rather
-  than exits. P1. Done in 0.13.0: the unit runs `--privsep-user probolos`
-  (`systemd/probolos.sysusers`, created by `install.sh`); keeping the hubs
-  closed was not taken (`SECURITY.md` says why).
+  gate (any `nobody` process could kill the analyzer, and the gate reopens on
+  any analyzer exit). P1. Done in 0.13.0: the service runs the analyzer as
+  `probolos`. Keeping the hubs closed instead was not taken
+  (`docs/TECHNICAL-REFERENCE.md` says why).
 - [ ] **1.12 S** Reap the analyzer's whole process tree: a subreaper in the
   gate, so nothing the analyzer forked outlives it on a terminal run. P1.
-- [ ] **1.13 S** The agent socket: a directory the analyzer cannot write, or
-  the agent checking `SO_PEERCRED` of the server, so another `nobody`
-  process cannot take its place. P2. The service is covered by 1.11 (the
-  directory's owner is `probolos`, which nothing else runs as); a run by hand
-  as `nobody` is not.
-- [x] **1.7 S** Leave hardware- and GUI-only modules out of coverage
-  (`interrogate.py`, `countdown_dialog.py`), with the reason written next to
-  the setting, then re-baseline both floors.
-- [ ] **1.8 S** Package (T6): finish the parked `PKGBUILD`, then build,
-  install and uninstall it cleanly on Manjaro.
-- [x] **1.9 S** Add a release workflow. On a `v*` tag it should:
-  - build the sdist and wheel;
-  - write `SHA256SUMS`;
-  - add a build-provenance attestation;
-  - create a **draft** pre-release, which you publish yourself.
-- [x] **1.10 C** Run mypy on the root-side modules.
-- [ ] **1.14 S** Publish to PyPI. `release.yml` uploads each tag's sdist and
-  wheel by trusted publishing (no stored token): to TestPyPI at once, to
-  PyPI when the maintainer approves the `pypi` environment. The publishers
-  and environments are set up by hand (`docs/GITHUB-SETUP.md`). Done when
+- [ ] **1.13 S** The agent socket: another process with the analyzer's uid can
+  take its place. P2. Done for the service with 1.11; open for a run by hand
+  as `nobody`.
+- [ ] **1.14 S** Publish to PyPI by trusted publishing: TestPyPI at once, PyPI
+  when the maintainer approves. The workflow is done; the publishers and
+  environments are set up by hand (`docs/GITHUB-SETUP.md`). Done when
   `1.0.0b1` is on PyPI.
 
-**Exit:** every M item done, and every S item done or consciously moved. CI is
-green. Then bump to `1.0.0b1`, update the changelog, tag it, approve the
-PyPI upload, and publish the pre-release.
+**Exit:** every M item done, every S item done or consciously moved, CI green.
+Then tag `1.0.0b1`, approve the PyPI upload and publish the pre-release. (The
+version was bumped to `1.0.0b1` on 2026-10-09.)
 
 ### Phase 2: beta (`1.0.0b1`, `b2`, …)
 
-- [ ] **2.1 M** Use it yourself. Run the service daily on your own machine
-  for at least four weeks, and open an issue for every surprise.
-- [ ] **2.2 M** Run the hardware matrix (T9) and record the results in a
-  new `TESTING.md`.
-  - **Desktops:** KDE on Wayland and on X11, and a GNOME/zenity desktop; each
-    with and without tk.
-  - **Devices:** USB stick, keyboard, mouse, phone (MTP and tethering), hub,
-    card reader.
-  - **Flows:** install; plug; allow; refuse; a refused device getting the
-    countdown; two copies refused; `--remove-all`; reboot; plugging in at the
-    login screen; uninstall.
-- [ ] **2.3 M** Write the docs (T10):
-  - `README.md` and `systemd/README.md`, ordered for the service user
-    (install → plug → answer);
-  - screenshots of the three prompt levels.
-- [ ] **2.4 M** Take the thesis measurements (`CAPABILITIES.md` §3.1), scripted
-  and repeatable:
-  - keystrokes that escape before the grab (procedure:
-    `testbed/hidexp/EXPERIMENT.md`);
-  - detection and miss rates;
-  - false positives on ordinary devices;
-  - how long each stage takes;
-  - recovery after failures.
-- [ ] **2.5 S** When fixes pile up, cut the next beta (`b2`, `b3`, …).
+- [ ] **2.1 M** Use it yourself: run the service daily for at least four
+  weeks and open an issue for every surprise.
+- [ ] **2.2 M** Run the hardware matrix (T9) and record it in a new
+  `TESTING.md`:
+  - **desktops:** KDE on Wayland and X11, and GNOME; each with and without tk;
+  - **devices:** USB stick, keyboard, mouse, phone (MTP and tethering), hub,
+    card reader;
+  - **flows:** install, plug, allow, refuse, a refused device getting the
+    countdown, two copies refused, `--remove-all`, reboot, plugging in at the
+    login screen, uninstall.
+- [ ] **2.3 M** Docs (T10): `README.md` and `systemd/README.md` ordered for
+  the service user (install → plug → answer), and screenshots of the three
+  prompt levels.
+- [ ] **2.4 M** Take the thesis measurements (`CAPABILITIES.md` §3.1),
+  scripted and repeatable: keystrokes that escape before the grab
+  (`testbed/hidexp/EXPERIMENT.md`), detection and miss rates, false positives
+  on ordinary devices, how long each stage takes, recovery after failures.
+- [ ] **2.5 S** Cut the next beta when fixes pile up.
 
 **Exit:** no open P0/P1; the matrix passed on at least two desktops; the docs
 are complete.
 
 ### Phase 3: release candidate (`1.0.0rc1`)
 
-- [ ] **3.1 M** The docs freeze as well. Only P0 and security fixes go in, and
+- [ ] **3.1 M** The docs freeze too. Only P0 and security fixes go in, and
   each one means a new rc.
-- [ ] **3.2 M** Final checks:
-  - the deep property run;
-  - coverage floors;
-  - actionlint and zizmor;
-  - a five-flow hardware smoke test;
-  - a fresh package install on a clean VM.
+- [ ] **3.2 M** Final checks: the deep property run, coverage floors,
+  actionlint and zizmor, a five-flow hardware smoke test, a fresh package
+  install on a clean VM.
 - [ ] **3.3 M** Two weeks with no change at all.
 
 ### Phase 4: `1.0.0`
 
-- [ ] **4.1 M** The final release is the last rc plus the version number:
-  - set the changelog date;
-  - signed tag;
-  - a GitHub release (not a pre-release);
-  - the PyPI upload, approved;
-  - the AUR package, if 1.8 was done.
-- [ ] **4.2 S** Archive it for citation. Save the repository in Software
-  Heritage, and mint a Zenodo DOI for the release; cite that DOI in the
-  thesis.
-- [ ] **4.3 C** After 1.0: new features go to `main` for 1.1. Create a
-  `maint/1.0` branch only if 1.0 needs fixes while 1.1 is in progress.
+- [ ] **4.1 M** The last rc plus the version number: changelog date, signed
+  tag, a GitHub release (not a pre-release), the approved PyPI upload, and the
+  AUR package if 1.8 was done.
+- [ ] **4.2 S** Archive it for citation: Software Heritage, and a Zenodo DOI
+  for the release, cited in the thesis.
+- [ ] **4.3 C** After 1.0, new features go to `main` for 1.1; a `maint/1.0`
+  branch only if 1.0 needs fixes meanwhile.
 
 ---
 
@@ -247,12 +183,12 @@ are complete.
 
 ## 5. Every change
 
-- [ ] An issue with a label and milestone. Security issues go through a
-      private advisory first.
+- [ ] An issue with a label and milestone; security issues go through a private
+      advisory first.
 - [ ] A regression test that fails before the fix and passes after it.
 - [ ] `python -m tests.run_all` and `ruff check .` pass locally, and CI is
       green, coverage floors included.
-- [ ] A line in `CHANGELOG.md` under `Unreleased`, in Fixed, Security or QA.
+- [ ] A line in `CHANGELOG.md` under `Unreleased`.
 - [ ] The docs corrected, if the bug was in what they promised.
 
 Rules for an LLM agent working on this repo:
@@ -266,14 +202,8 @@ Rules for an LLM agent working on this repo:
 
 ## 6. The thesis evidence
 
-Keep a new `docs/QA-LOG.md`, one row per defect found:
-
-| Date | What | How it was found | Severity | Fix commit |
-|---|---|---|---|---|
-| 2026-10-03 | `textsafe` cut skipped an escape and kept appending (`'\x1f0'` at limit 1 came out as `0...`) | property test, unaided | P2 | `ecb6453` |
-
-"How it was found" is review, property test, hardware matrix, dogfooding or a
-user report. Together with the coverage table (module → tests → coverage) and
-the matrix in `TESTING.md`, that log is the evaluation chapter's data: what
-each method found, on a system that did not change underneath the
-measurement.
+`docs/QA-LOG.md` keeps one row per defect found: date, what, how it was found
+(review, property test, hardware matrix, dogfooding or a user report),
+severity and fix commit. With the coverage table and the matrix in
+`TESTING.md`, that log is the data of the evaluation chapter: what each method
+found, on a system that did not change underneath the measurement.

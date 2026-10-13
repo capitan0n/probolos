@@ -1,8 +1,8 @@
-# Testbed — emulated USB devices, no hardware
+# Testbed: emulated USB devices, no hardware
 
-Uses `dummy_hcd` (a virtual USB host controller) and `raw_gadget` (a userspace
-gadget interface) to conjure arbitrary USB devices in software and plug them
-into the local kernel. This is how the CRITICAL and drift paths get tested
+Creates USB devices in software with `dummy_hcd` (a virtual USB host
+controller) and `raw_gadget` (a userspace gadget interface), and plugs them
+into the local kernel. This is how the CRITICAL and drift paths are tested
 without a Rubber Ducky.
 
 ## Setup
@@ -13,65 +13,18 @@ ls /sys/class/udc/          # expect dummy_udc.0
 ls -l /dev/raw-gadget       # expect a character device
 ```
 
-To load on every boot:
+To load both at every boot:
 
 ```bash
 echo -e "dummy_hcd\nraw_gadget" | sudo tee /etc/modules-load.d/probolos-testbed.conf
 ```
 
-## Preview without root or hardware
-
-Every preset can be parsed locally, printing what Probolos should conclude,
-without spawning anything:
-
-```bash
-python -m testbed.spawn badusb --preview
-```
-
-This separates "the emulated descriptors are wrong" from "the gadget failed to
-enumerate" — if the preview predicts CRITICAL but a live run stays silent, the
-problem is enumeration, not the rules.
-
-## The CRITICAL demo
-
-Two terminals.
-
-Terminal 1 — watch, block nothing:
-
-```bash
-sudo python -m probolos --dry-run
-```
-
-Terminal 2 — present the attack:
-
-```bash
-sudo python -m testbed.spawn badusb
-```
-
-Terminal 1 should show `✖ CRITICAL · Storage device that can also type`.
-
-Start with `--dry-run` on the Probolos side: a blocked device waiting for your
-answer is frozen mid-enumeration, which can stall the gadget. Once you have seen
-the report, switch to the real gate (`sudo python -m probolos`) and, because the
-finding is CRITICAL, the prompt will require you to type the whole word
-`authorize` rather than `y`.
-
-## The descriptor-drift demo
-
-The ledger remembers devices across plug-ins. Present an innocent stick, approve
-it, then present a weaponized one with the *same* identity:
-
-```bash
-sudo python -m testbed.spawn drift-innocent      # approve it
-sudo python -m testbed.spawn drift-weaponized    # same serial, new keyboard
-```
-
-The second should raise `descriptor-drift` at CRITICAL, because
-vendor:product:serial are identical but the descriptor hash changed.
+`dummy_hcd` adds a virtual root hub, so Probolos's startup lists an extra
+`usbN`. That is expected.
 
 ## Presets
 
-| preset | should trigger |
+| Preset | Should trigger |
 |---|---|
 | `flashdrive` | nothing |
 | `keyboard` | nothing, or the high-speed notice |
@@ -79,31 +32,50 @@ vendor:product:serial are identical but the descriptor hash changed.
 | `overpowered` | `power-exceeds-bus-limit` (WARNING) |
 | `drift-innocent` → `drift-weaponized` | `descriptor-drift` (CRITICAL) |
 
-## The leakage experiment
-
-`hidexp/` builds a real HID keyboard gadget through configfs and types a
-harmless payload through it, to count how many keystrokes reach the session
-before Probolos captures the device. The procedure and the results table are
-in [`hidexp/EXPERIMENT.md`](hidexp/EXPERIMENT.md).
-
-## If a device will not enumerate
-
-`raw_gadget` is low-level and `dummy_hcd` can wedge if a gadget is left
-half-initialised. Reset with:
+Preview what Probolos should conclude, without root and without spawning
+anything:
 
 ```bash
-sudo rmmod raw_gadget dummy_hcd
-sudo modprobe -a dummy_hcd raw_gadget
+python -m testbed.spawn badusb --preview
 ```
 
-The spawn tool always releases the gadget on exit, so this is only needed after
-a hard kill.
+If the preview predicts CRITICAL but a live run stays silent, the problem is
+the enumeration, not the rules.
 
-## Troubleshooting: `RUN failed: Errno 16 Device or resource busy`
+## The CRITICAL demo
 
-The UDC `dummy_udc.0` is already claimed — usually by dummy_hcd's own host
-side, or by a gadget left over from a previous run. raw-gadget needs the UDC
-free. Reset the modules:
+```bash
+sudo python -m probolos --dry-run          # terminal 1: report, block nothing
+sudo python -m testbed.spawn badusb        # terminal 2
+```
+
+Terminal 1 should show `✖ CRITICAL · Storage device that can also type`.
+
+Start with `--dry-run`: a blocked device waiting for an answer is frozen
+mid-enumeration, which can stall the gadget. With the real gate
+(`sudo python -m probolos`), a CRITICAL device needs the typed word
+`authorize` instead of `y`.
+
+## The drift demo
+
+```bash
+sudo python -m testbed.spawn drift-innocent      # approve it
+sudo python -m testbed.spawn drift-weaponized    # same serial, now with a keyboard
+```
+
+The second raises `descriptor-drift` (CRITICAL): the vendor, product and
+serial are the same, the descriptors are not.
+
+## The leakage experiment
+
+`hidexp/` builds a real HID keyboard gadget and counts how many keystrokes
+reach the session before Probolos captures it. See
+[hidexp/EXPERIMENT.md](hidexp/EXPERIMENT.md).
+
+## Troubleshooting
+
+A gadget that will not enumerate, or `RUN failed: Errno 16 Device or resource
+busy` (the UDC `dummy_udc.0` is still claimed): reset the modules.
 
 ```bash
 sudo rmmod raw_gadget dummy_hcd
@@ -111,9 +83,6 @@ sudo modprobe -a dummy_hcd raw_gadget
 cat /sys/class/udc/dummy_udc.0/state    # want: not attached
 ```
 
-If `state` reads `configured` or `addressed`, something still holds it; check
-`ls /sys/kernel/config/usb_gadget/` for a configfs gadget and remove it, or
-reboot to clear the module state entirely.
-
-Note that loading dummy_hcd adds a virtual root hub (you will see an extra
-`usbN` in Probolos's baseline). That is expected and harmless.
+If `state` still reads `configured` or `addressed`, remove any configfs gadget
+in `/sys/kernel/config/usb_gadget/`, or reboot. The spawn tool releases its
+gadget on exit, so this is only needed after a hard kill.

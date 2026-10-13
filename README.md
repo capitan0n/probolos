@@ -1,399 +1,268 @@
 # Probolos
 
-> **Beta — feature-complete, still being tested.** This is a research-stage
-> project. The admission path has been exercised on real hardware and has
-> automated regression coverage, but **it has never been run against an actual
-> attack**: no BadUSB fixture (ATmega32u4, Raspberry Pi Zero, O.MG cable) has
-> been put through the behavioural quarantine, so the claim that matters most
-> is the one with the least evidence behind it. The feature set is frozen at
-> 0.11.0 on the way to 1.0: until then only fixes, tests and documentation go
-> in ([`ROADMAP.md`][roadmap]). Known open weaknesses are listed in
-> [`SECURITY.md`][security], "Known weaknesses".
-> **Do not rely on it as a security control on a machine you care about.** Treat
-> everything here as experimental and report anything that surprises you.
+**A deny-by-default USB gate for Linux.** New USB devices stay switched off
+until you decide. While a device waits, Probolos checks what it claims to be,
+whether those claims add up and, optionally, what it does and what its storage
+holds.
 
-**A deny-by-default USB admission gate for Linux.**
+*Probolos* (πρόβολος) is Greek for a barrier set in front: the thing you must
+get past first.
 
-*Probolos* (πρόβολος) — Greek for a jutting barrier: the thing set in front that
-must be got past first.
+> **Beta (1.0.0b1).** It runs on real hardware, but it has **never been tested
+> against a real attack device** (Rubber Ducky, O.MG cable). Do not make it
+> your only protection. Its known weak spots are listed in
+> [SECURITY.md][security].
 
-New USB devices are held for a decision. Identity checks run while blocked;
-optional behavioural and storage inspection temporarily activate the device.
-Remembered devices and configured safety exemptions may be admitted automatically.
+## How it works
 
-```
-identity · consistency · behaviour
-```
+Linux binds a driver as soon as a USB device appears, so a fake keyboard can
+type before anything notices. Probolos sets `authorized_default=0` on every
+USB root hub, so a new device arrives **switched off**. It is checked in up to
+four stages, and only your answer switches it on.
 
----
-
-## The idea
-
-Every USB defence has the same problem: the kernel binds a driver the moment a
-device is enumerated. By the time anything notices a keyboard is a BadUSB, it
-has already typed.
-
-Probolos sets `authorized_default=0` on every root hub, so a new device arrives
-*inert*. It is then examined across four stages, and only a human decision
-authorizes it.
-
-| Stage | What it asks | Device state |
+| Stage | Question | The device is |
 |---|---|---|
-| 1 · Identity | What does it claim to be? | blocked |
-| 2 · Consistency | Do its own claims agree with each other? | blocked |
-| 3 · Behaviour | What does it do when switched on and gagged? | live, input grabbed |
-| 4 · Contents | What is on the medium? | live, read-only, never mounted |
+| 1 · Identity | What does it claim to be? | off |
+| 2 · Consistency | Do its claims agree? (a "USB stick" that is also a keyboard?) | off |
+| 3 · Behaviour | Does it type by itself? | on for a few seconds, input captured |
+| 4 · Storage | What partitions does it carry? | on briefly, read-only, never mounted |
 
-Stage 3 grabs evdev input after drivers bind, observes it, then re-blocks the
-device **before releasing the grabs**. Keystrokes may escape before a grab
-succeeds, including with `--close-race-window`: that legacy flag enables
-experimental deferred binding, not race-free isolation. Newly discovered input
-nodes are checked throughout observation; this still requires userspace to react.
+Stages 3 and 4 switch the device on for a moment, and keys it sends before its
+input is captured can still get through. `--observe 0 --no-storage-scan` keeps
+unknown devices fully off until you answer.
 
-Stage 4 also temporarily activates the device. Probolos itself never mounts the
-medium, but another service may do so. It is skipped unless every parsed
-configuration and alternate setting declares mass storage only (no HID, network,
-serial or vendor function), or if descriptors are incomplete.
-
-The research subject is an admission gate combining descriptor, behavioural,
-and storage metadata evidence. Comparative claims about other tools require
-independent measurements of their actual configurations; the previous table
-asserting that other tools invariably decide after driver binding was removed.
-
----
+Devices you allowed with "always" get in without a question, unless something
+CRITICAL turns up.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/capitan0n/probolos
 cd probolos
-sudo pacman -S python-pyudev     # or your distro's package (python3-pyudev)
-sudo python3 -m probolos --observe 3
+sudo pacman -S python-pyudev        # Debian/Ubuntu: sudo apt install python3-pyudev
+sudo python3 -m probolos
 ```
 
-Plug in a device. You will get a report and a prompt.
+Plug in a device: you get a report and a question. `Ctrl-C` stops Probolos and
+reopens the gate.
 
-> **Keep a second way in while testing** — SSH, or your built-in keyboard.
-> A laptop keyboard on the PS/2 (i8042) controller is not USB and is never
-> affected. Devices on internal (`removable=fixed`) USB ports are not gated
-> unless you pass `--gate-fixed-ports`; check before you rely on either.
+> **Keep a way back in while testing**: SSH, or the laptop's built-in
+> keyboard (often PS/2, which Probolos never touches). Internal USB ports
+> (`removable=fixed`) are not gated unless you add `--gate-fixed-ports`, but
+> while the screen is locked even they, and `--allow-port`, are held (see
+> [SECURITY.md][security]).
 
-Stop with `Ctrl-C`; the gate reopens on every exit path.
-
-### Recommended: privilege separation
+### Desktop prompts and privilege separation (recommended)
 
 ```bash
 sudo python3 -m probolos --privsep --agent --agent-user "$USER"
-python3 -m probolos.agent          # in your graphical session
+python3 -m probolos.agent           # in your desktop session
 ```
 
-`--privsep` runs the analyzer as `nobody` and routes privileged operations
-through a separate gate. The trusted code also includes startup preparation,
-protocol handling and cleanup; it is not a 150-line security boundary.
-`nobody` is shared: any other process running as `nobody` can kill the
-analyzer, and the gate then reopens (`SECURITY.md`, "Known weaknesses").
-`--privsep-user` takes a dedicated account instead: the service runs the
-analyzer as `probolos`, a system account `install.sh` creates, and a run by
-hand can pass `--privsep-user probolos` once it exists.
-`--agent` moves the prompt into a desktop dialog: one dialog for a plain
-storage device, a second confirmation for anything that can type or carry
-traffic or showed a warning, and a 10-second countdown before "Allow anyway"
-for a critical finding (a refused device returning, a changed identity).
+- `--privsep` splits Probolos in two: a small root "gate" that flips the USB
+  switches, and an unprivileged analyzer that does everything else. The
+  analyzer runs as `nobody` by default; once `install.sh` has created the
+  `probolos` account, add `--privsep-user probolos` (safer, see
+  [SECURITY.md][security]).
+- `--agent` asks through desktop dialogs, with more friction for riskier
+  devices:
+  - **one dialog** for a plain storage device with no warnings;
+  - **two dialogs** for anything that can type or carry network traffic, or
+    that raised a warning;
+  - **a 10-second countdown** before "Allow anyway" for a CRITICAL finding.
 
-### Run it in the background
+### Install as a service
 
 ```bash
-sudo ./install.sh              # install and start; re-run after pulling to update
-sudo ./install.sh --uninstall  # stop and remove (history is kept)
+sudo ./install.sh              # install and start; re-run after `git pull` to update
+sudo ./install.sh --uninstall  # remove (device history is kept)
 ```
 
-This installs the code to `/opt/probolos` (root-owned), a `probolos` command
-(`sudo probolos --history`), the gate as a system service with `--privsep`, and
-the desktop prompt as a user service for the account that ran `sudo`.
+This copies the code to `/opt/probolos` (owned by root), adds a `probolos`
+command (`sudo probolos --history`), runs the gate as a system service (with
+`--privsep`, analyzer as the `probolos` account) and the desktop prompt as a
+user service for the account that ran `sudo`. Details:
+[systemd/README.md][systemd].
 
-### Stop automount racing the scan
+When there is no desktop to ask (login screen, logout), new devices are
+**held** switched off and asked about once the prompt is back. Remembered
+devices still get in.
 
-Stage 4 must briefly authorize the device for its block node to appear, and
-a desktop automounter may mount the medium (through udisks2) inside that window. Probolos itself only ever
-reads raw sectors and never mounts anything, but a desktop session will.
+## Card readers
 
-The simplest answer is `--no-storage-scan`, which skips stage 4 entirely and
-removes the window. If you want stage 4, tell udisks not to automount USB block
-devices:
+A card reader is the USB device; the card inside it is not. Swapping cards does
+not re-plug anything, so **once a reader is allowed, every card you insert
+later gets in without a question.**
+
+`--watch-media` adds a watcher for that. When a card goes into an allowed
+reader (or one already plugged in when Probolos started), it reads the card's
+layout (raw, read-only, never mounted) and reports:
+
+- an EFI system or hidden partition (CRITICAL);
+- a card inserted while the screen is locked (WARNING);
+- a layout different from the first card seen in that slot;
+- a card the reader cannot read (`UNREADABLE CARD`, after 15 s).
+
+The same card rules apply at the plug-in prompt to a card that is already in
+the reader. The card you approved there is not judged again, and a card the
+reader announces twice is reported once.
+
+It **detects; it does not block**. On a CRITICAL card:
+
+- `--media-policy log` (default): it is reported, nothing more. Your desktop
+  may still mount it.
+- `--media-policy deauthorize`: the **whole reader** is switched off, every
+  slot. Replug the reader to get it back; the card inside is checked again (at
+  the plug-in prompt, or by the watcher for a reader you allowed with
+  "always").
+
+Under `--privsep` this also lets the analyzer read every USB storage device it
+watches (card readers, but also sticks and USB disks) and switch it off, never
+on.
+
+## Stop automount (recommended for stage 4 and `--watch-media`)
+
+Probolos never mounts anything, but your desktop may mount a stick or card
+while it is being checked. Either skip the storage check (`--no-storage-scan`)
+or stop desktop automount for USB storage:
 
 ```bash
 sudo tee /etc/udev/rules.d/60-probolos-inhibit-automount.rules <<'EOF'
-# Probolos stage 4 authorizes a storage device just long enough to read its
-# partition table. A desktop automounter may mount it in that window unless told not to.
-SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{UDISKS_AUTO}="0"
+# Probolos reads USB storage before anything mounts it.
+SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{UDISKS_IGNORE}="1"
 EOF
-sudo udevadm control --reload
-sudo udevadm trigger --subsystem-match=block
+sudo udevadm control --reload      # then replug the device
 ```
 
-**Know what this costs.** The rule is system-wide and permanent: *every* USB
-block device stops automounting, including ones Probolos has approved and ones
-plugged in while it is not running. You mount them by hand afterwards. Remove
-the file and reload to undo it.
-
-It also only constrains **udisks**. Any other automounter on the machine is
-unaffected, so verify the behaviour on your own system rather than assuming the
-window is closed.
-
-### Card readers: the card is not gated
-
-A card reader is the USB device; the card is a medium inside it. Inserting,
-removing or swapping a card causes no USB re-enumeration, so once a reader is
-admitted every later card enters without passing the gate. Stage 4 only sees a
-card that was already in the reader when it was plugged in.
-
-`--watch-media` adds a separate detection layer for that: it listens for the
-block-layer `change` on admitted storage hosts (and ones present at startup),
-reads each new medium the same way stage 4 does — raw, read-only, never
-mounted — and reports its layout, EFI system or hidden partitions, and drift
-from the first medium seen in that slot. It **does not gate the card**: there
-is no per-medium `authorized` switch. The only enforcement is
-`--media-policy deauthorize`, which switches the **whole reader** off on a
-CRITICAL finding.
-
-Two things decide how much a report is worth, and each one says which case
-applied:
-
-- **Automount.** udisks2 never mounts by itself, but a desktop automounter
-  (or a click on the card) mounts through it on the same event. Without the
-  udev rule above, the card may already be mounted when it is read, and the
-  report is post-hoc alerting, not prevention.
-- **Latency.** Media detection rides on the kernel's disk-event polling,
-  typically 1–2 s. Some readers do not report media changes at all; such a
-  slot is flagged as soon as watching begins.
-
-Three more things the watcher does:
-
-- **Unreadable cards are reported.** A card the reader cannot read ("Read
-  Capacity failed" in `dmesg`) sits in the slot at 0 bytes and the kernel says
-  nothing more. If a media change leaves the slot at 0 bytes for 15 s, the
-  watcher prints `UNREADABLE CARD` instead of staying silent.
-- **The prompt and the watcher agree.** With `--watch-media`, the plug-in
-  prompt for a storage device includes the same card rules (EFI system or
-  hidden partition), and the card you approved there is not judged a second
-  time when its disk appears.
-- **A CRITICAL card is never remembered.** The first card recorded in a slot
-  is its baseline for drift; a card that raised a CRITICAL never becomes it.
-
-Under `--privsep` this widens the gate: the analyzer may open the whole disks
-of watched readers read-only and switch those readers off. See `SECURITY.md`.
-
----
+- Works on **KDE Plasma** and **GNOME**. `UDISKS_AUTO="0"` is **not** enough on
+  KDE, which ignores it. On KDE you can instead turn off System Settings →
+  Disks & Cameras → Device Auto-Mount.
+- It applies to **every** USB drive, also when Probolos is not running, and
+  hides them from the file manager. Mount by hand with
+  `udisksctl mount -b /dev/sdX1`. Delete the file and reload to undo.
+- It only stops udisks-based automount. Each card report says whether automount
+  was off.
 
 ## Common options
 
-| Flag | Effect |
+| Option | What it does |
 |---|---|
-| `--observe SEC` | length of the behavioural quarantine (`0` disables stage 3) |
-| `--privsep` | run the analyzer as `nobody` behind a separate root gate |
-| `--privsep-user USER` | the analyzer's account instead of `nobody` (the service: `probolos`) |
-| `--agent` | ask via a desktop dialog instead of the terminal |
-| `--dry-run` | report everything, change nothing |
-| `--list` | read-only inventory of attached devices; never closes the gate |
-| `--trusted` / `--remove-trusted N\|all` | list and revoke remembered devices (history is kept) |
-| `--history [-v]` | every device seen, its type, decisions and descriptor drift |
-| `--remove-all` | clear remembered devices **and** history; asks first, refuses while the daemon runs |
-| `--no-storage-scan` | skip stage 4 entirely |
-| `--watch-media` | inspect and alert on cards inserted into admitted readers (detection only) |
-| `--media-policy log\|deauthorize` | with `--watch-media`: on a CRITICAL media finding, log (default) or drop the whole reader |
-| `--allow-port PORT` | keep a rescue port always open |
-| `--capture-payload` | reconstruct what a quarantined device typed (opt-in) |
-| `--release` | reopen the gate after a crash |
+| `--observe SEC` | length of the behaviour check (default 3; `0` skips stage 3) |
+| `--no-storage-scan` | skip stage 4 |
+| `--privsep`, `--privsep-user USER` | privilege separation, and the analyzer's account (default `nobody`) |
+| `--agent` | ask through desktop dialogs |
+| `--timeout SEC` | deny after SEC seconds without an answer (default 0: the terminal waits; a desktop dialog gives up after 60 s) |
+| `--lock-policy queue\|deny\|ignore` | devices plugged in while the screen is locked (default `queue`: ask on unlock) |
+| `--watch-media`, `--media-policy log\|deauthorize` | watch cards in allowed readers, and what to do with a CRITICAL card |
+| `--allow-port PORT` | never gate this port, except while the screen is locked (keep a rescue keyboard there) |
+| `--dry-run` | report only; never block or allow anything |
+| `--list [-v]` | show attached devices (read-only) |
+| `--history [-v]` | every device seen: its type, decisions and changes |
+| `--trusted`, `--remove-trusted N\|PATTERN\|all` | list or forget remembered devices (history is kept) |
+| `--remove-all` | forget remembered devices **and** all history (asks first) |
+| `--capture-payload` | record what a quarantined device typed (off by default) |
+| `--log FILE` | append every decision to FILE as JSON lines |
+| `--release` | recovery: switch blocked devices on and reopen the gate |
 
----
+`python3 -m probolos --help` lists them all.
 
 ## If something goes wrong
 
-The gate restores on exit, on signals, and via `atexit`. If a device is still
-blocked:
+The gate reopens whenever Probolos exits, crashes or is stopped; only
+`kill -9` or a kernel panic can prevent that. If devices stay blocked:
 
 ```bash
-sudo python3 -m probolos --release      # from the checkout
 sudo probolos --release                 # after install.sh
+sudo python3 -m probolos --release      # from the source folder
 ```
 
-`--release` refuses while a gate is still running. If Probolos itself is
-wedged, the panic file forces the gate open from another TTY or over SSH:
+`--release` refuses while Probolos is still running. If Probolos hangs, force
+the gate open from another terminal or over SSH. The file must be created by
+root, and the watchdog must be on (the default; `--watchdog 0` turns off
+both):
 
 ```bash
 sudo touch /run/probolos.panic
 ```
 
-It must be **root-owned** — a panic file anyone could create would be a way for
-any local account to switch the tool off. Last resort, one line:
+Last resort, without Probolos:
 
 ```bash
 for hub in /sys/bus/usb/devices/usb*/authorized_default; do echo 1 | sudo tee "$hub"; done
 ```
 
-That only affects devices attached from then on: replug anything still
-blocked, or authorize it with `echo 1 | sudo tee /sys/bus/usb/devices/<name>/authorized`.
+Then replug anything still dead, or switch it on with
+`echo 1 | sudo tee /sys/bus/usb/devices/<name>/authorized`.
 
----
+## What it does not protect against
 
-## Running as a service
+- bugs in the kernel's own USB code (reached before Probolos sees the device);
+- a device that behaves for days and attacks later;
+- a perfect copy of a real device (such as an O.MG cable) that stays quiet
+  while it is checked;
+- Thunderbolt/DMA, USB-C power delivery, Bluetooth and other wireless devices;
+- anything after you allow a device (except cards, with `--watch-media`);
+- malware inside files: it reads partition tables, not files.
 
-`sudo ./install.sh` does all of it. See [`systemd/README.md`][systemd]
-for what it sets up by hand: the two units (a system
-service for the gate, a user service for the agent) and what the sandboxing
-does.
+The full list is in [SECURITY.md][security]; the exact feature list is in
+[CAPABILITIES.md][capabilities].
 
----
+## Status
+
+- **Tested on real hardware:** closing and restoring the gate on all five root
+  hubs of a laptop; USB sticks through stages 1 and 4; descriptor-change
+  detection, including the harmless change of a stick moved between USB 2 and
+  USB 3 ports; both prompt types; `--watch-media` with a USB card reader on KDE
+  Plasma. The service runs on the author's own machine.
+- **Not yet tested on real hardware:** stage 3 against a real attack device,
+  `--close-race-window`, and the planned matrix of devices and desktops
+  (ROADMAP 2.2).
+
+The feature set is frozen since 0.11.0: until 1.0 only fixes, tests and
+documentation go in ([ROADMAP.md][roadmap]). Defects found since the freeze are
+logged in [docs/QA-LOG.md][qa-log]; what changed is in
+[CHANGELOG.md][changelog].
 
 ## Requirements
 
-- Linux with sysfs USB authorization (`/sys/bus/usb/devices/*/authorized`)
-- Python 3.10+
-- `pyudev` for the event loop
-- Optional: `PyYAML`, only for `--rules FILE`
-- Optional: `kdialog`, `zenity`, or `tkinter` for the desktop agent
-
-No `python-evdev`: the quarantine talks to the kernel directly through one
-`EVIOCGRAB` ioctl.
-
----
+- Linux with USB authorization in sysfs (`/sys/bus/usb/devices/*/authorized`)
+- Python 3.10+ and `pyudev` (no `python-evdev` needed)
+- Optional: `PyYAML` for `--rules FILE`; `kdialog`, `zenity` or `tkinter` for
+  desktop prompts
 
 ## Development
 
 ```bash
-python3 -m unittest discover -b -s tests -t .   # the whole suite
-python3 -m tests.run_all                        # same, with AF_UNIX skips
+python3 -m unittest discover -b -s tests -t .   # the whole test suite
+python3 -m tests.run_all                        # the same tests; skips the few that need AF_UNIX sockets
+ruff check .                                    # lint
+python3 -m mypy                                 # type check of the root-side code
 ```
 
-Both collect the same tests. `run_all` exists only to skip the handful that
-need a listening AF_UNIX socket, which some restricted containers refuse; use
-it there and the plain command everywhere else. If the two ever report
-different totals, that difference is a bug — it was one before, when the
-defensive-parsing checks were bare module-level functions that unittest
-discovery does not collect and only `run_all` picked up.
+Both test commands collect the same tests: if their totals ever differ, that is
+a bug. The suite needs no root, no USB hardware and no `pyudev`. CI pins the
+tool versions in `.github/requirements-*.txt` and keeps a coverage floor on the
+root-side code.
 
-```bash
-ruff check .                                    # lint (config in pyproject.toml)
-python3 -m mypy                                 # types, root side (config in pyproject.toml)
-```
-
-CI runs these tools at exact versions, pinned in `.github/requirements-*.txt`
-(`pip install -r .github/requirements-ci.txt -r .github/requirements-typecheck.txt`
-gets the same ones locally), and
-holds coverage of the root-side code to a floor (`.github/workflows/coverage.yml`).
-
-The suite needs only the standard library: no root, no USB hardware and no
-`pyudev` (a few tests skip themselves when an optional piece such as PyYAML
-is missing).
-
-`tests/` holds one module per area of the code, and each file's docstring
-names the modules it covers: a bug in `probolos/trust.py` gets its regression
-test in `tests/test_trust.py`, `probolos/storage.py` in `test_storage.py`, and
-so on. The regression tests from the security reviews live there too, as
-classes named after the defect they pin (`AnalyzerHasNoControllingTerminal`,
-`TheDecoyFromTheReport`) rather than after the review that found it.
-Builders and fixtures used by more than one file are in `tests/_support.py`.
-
-| File | Covers |
-|---|---|
-| `test_agent.py` | `agent`, `agentlink`, `dialogs` |
-| `test_boundary.py` | the refusal and error paths of `privsep`, `gate_client`, `gate_server` |
-| `test_cli.py` | `__main__` |
-| `test_daemon.py` | `daemon`, `session` |
-| `test_descriptors.py` | `descriptors`, `descriptors_safe`, `usbclass` |
-| `test_gate.py` | `gate`, `safety` |
-| `test_interrogate.py` | `interrogate`, the study's offline half (probe order, `--gentle`, CSV rows) |
-| `test_ledger.py` | `ledger`, `history` |
-| `test_privsep.py` | `privsep`, `gate_server`, `gate_client`, `protocol` |
-| `test_properties.py` | property-based (Hypothesis), across modules: descriptor, medium and protocol parsing, `textsafe`, the state files, the agent socket |
-| `test_quarantine.py` | `quarantine`, `payload`, `deferred_bind` |
-| `test_rules.py` | `rules`, `analyzers`, `report` |
-| `test_service.py` | the shipped service: `systemd/probolos.service`, `systemd/probolos.sysusers`, `install.sh` |
-| `test_storage.py` | `storage`, `storage_hardening`, `mediawatch` |
-| `test_sysfs.py` | `sysfs` |
-| `test_testbed.py` | `testbed.spawn`, `testbed.emulate`: every preset builds and raises what `testbed/README.md` promises (for the drift pair: same identity, different fingerprint) |
-| `test_textsafe.py` | `textsafe` |
-| `test_trust.py` | `trust`, `atomicio` |
-
-`testbed/` emulates USB devices in software via `dummy_hcd` + `raw_gadget`,
-with presets for BadUSB, descriptor drift and overpowered devices — so the
-CRITICAL paths can be exercised with no hardware.
-
----
-
-## Scope
-
-[`CAPABILITIES.md`][capabilities] is the authoritative list of what Probolos
-does, what it does not do, and what may be built later. Read it first — it
-distinguishes between code that runs and code that merely exists in the tree.
-
-[`SECURITY.md`][security] covers the threat model and is explicit about what
-Probolos does **not** stop: USB stack vulnerabilities, a patient attacker,
-descriptor forgery, Thunderbolt/DMA, and wireless gateways.
-
-Short version:
-
-- **Does** — deny-by-default admission, descriptor consistency rules,
-  pre-authorization quarantine with `EVIOCGRAB` and timing analysis, unmounted
-  storage-metadata inspection, cross-session ledger and trust store, privilege
-  separation with kernel-derived scope, lockout safety.
-- **Does not** — anything before the kernel finishes enumerating, anything after
-  you approve the device, Thunderbolt/DMA, USB-PD, wireless, or file contents.
-  A card inserted into an admitted reader is not gated; `--watch-media` only
-  inspects and alerts on it.
-- **Off by default** — `--close-race-window` experiments with deferred binding
-  using a bus-wide switch. It does not remove the input race. See `SECURITY.md`.
-- **No early activation** — use `--observe 0 --no-storage-scan` when holding
-  unknown devices blocked is more important than behavioural/storage evidence.
-- **Not yet** — no HID report descriptor analysis: the parser for it is written
-  and hardened, but the report descriptor is not in the sysfs blob and has no
-  source wired to it. `CAPABILITIES.md` §2.2 and §3.2.
-
-Status: **beta, 1.0.0b1**, feature-frozen since 0.11.0 on the way to 1.0
-([`ROADMAP.md`][roadmap]). The tree has been through several security
-review passes, the latest on 2026-10-04 ([`docs/QA-LOG.md`][qa-log]);
-each fixed finding has a regression test named after the defect, under
-`tests/`, and the ones still open are listed in `SECURITY.md`.
-
-**Verified on real hardware.** Closing and restoring `authorized_default` on
-all five root hubs of the reference laptop. A Kingston DataTraveler 3.0 through
-stage 1 and stage 4 — identity, MBR parse, filesystem signature — with the
-device re-blocked before the prompt. Descriptor drift across visits, including
-the false positive that the same stick produces when moved between a USB 2 and
-a USB 3 controller, which is why the ledger fingerprint ignores bus-negotiated
-fields. Both prompt paths, both answers, and gate restoration on `SIGINT`.
-
-**Not verified on real hardware.** Stage 3: no BadUSB or HID fixture has been
-run against the quarantine, so the `EVIOCGRAB` path and the exposure-window
-measurement rest on emulation only. Nor has `--privsep`, `--close-race-window`,
-or either systemd unit. A passing test does not prove USB isolation on a real
-kernel, and these are the claims most worth distrusting until somebody plugs an
-ATmega32u4 in and watches what happens.
-
-Treat every real-world result as data rather than a guarantee, and report
-anything that surprises you. What is not done is listed in
-[`CAPABILITIES.md`][capabilities] §2.2 and §3, the plan to 1.0 is
-[`ROADMAP.md`][roadmap], and defects found since the freeze are logged in
-[`docs/QA-LOG.md`][qa-log].
-
----
+`tests/` has one file per area of the code. `testbed/` emulates USB devices in
+software (BadUSB, descriptor drift, ...) so the CRITICAL paths can be tried
+without hardware ([testbed/README.md][testbed]). Internals and the map of the
+tests: [docs/TECHNICAL-REFERENCE.md][techref].
 
 ## License
 
-GPL-3.0-or-later: Probolos is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or (at your
-option) any later version. See [`LICENSE`][license].
-
-Note the warranty disclaimer in particular: this is beta, security-relevant
-software provided as-is. You are responsible for what you run it on.
+GPL-3.0-or-later; see [LICENSE][license]. This is beta, security-relevant
+software, provided as is, without warranty.
 
 <!-- Absolute links: this file is also the project page on PyPI, where a
      relative link points nowhere (tests/test_cli.py checks it). -->
 
 [capabilities]: https://github.com/capitan0n/probolos/blob/main/CAPABILITIES.md
+[changelog]: https://github.com/capitan0n/probolos/blob/main/CHANGELOG.md
 [license]: https://github.com/capitan0n/probolos/blob/main/LICENSE
 [qa-log]: https://github.com/capitan0n/probolos/blob/main/docs/QA-LOG.md
 [roadmap]: https://github.com/capitan0n/probolos/blob/main/ROADMAP.md
 [security]: https://github.com/capitan0n/probolos/blob/main/SECURITY.md
 [systemd]: https://github.com/capitan0n/probolos/blob/main/systemd/README.md
+[techref]: https://github.com/capitan0n/probolos/blob/main/docs/TECHNICAL-REFERENCE.md
+[testbed]: https://github.com/capitan0n/probolos/blob/main/testbed/README.md
