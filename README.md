@@ -48,9 +48,9 @@ reopens the gate.
 
 > **Keep a way back in while testing**: SSH, or the laptop's built-in
 > keyboard (often PS/2, which Probolos never touches). Internal USB ports
-> (`removable=fixed`) are not gated unless you add `--gate-fixed-ports`, but
-> while the screen is locked even they, and `--allow-port`, are held (see
-> [SECURITY.md][security]).
+> (`removable=fixed`) are not gated unless you add `--gate-fixed-ports`, and
+> neither is a port given to `--allow-port`, even while the screen is locked
+> (see [SECURITY.md][security]).
 
 ### Desktop prompts and privilege separation (recommended)
 
@@ -154,7 +154,7 @@ sudo udevadm control --reload      # then replug the device
 | `--timeout SEC` | deny after SEC seconds without an answer (default 0: the terminal waits; a desktop dialog gives up after 60 s) |
 | `--lock-policy queue\|deny\|ignore` | devices plugged in while the screen is locked (default `queue`: ask on unlock) |
 | `--watch-media`, `--media-policy log\|deauthorize` | watch cards in allowed readers, and what to do with a CRITICAL card |
-| `--allow-port PORT` | never gate this port, except while the screen is locked (keep a rescue keyboard there) |
+| `--allow-port PORT` | never gate this port, even while the screen is locked (keep a rescue keyboard there) |
 | `--dry-run` | report only; never block or allow anything |
 | `--list [-v]` | show attached devices (read-only) |
 | `--history [-v]` | every device seen: its type, decisions and changes |

@@ -222,6 +222,16 @@ class _StartCase(unittest.TestCase):
                                     return_value=(65534, 65534))
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Real, they would make the test runner a subreaper and kill its
+        # children: the root side is driven in-process here.
+        patcher = mock.patch.object(privsep, "become_subreaper",
+                                    return_value=True)
+        self.subreaper = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(privsep, "end_descendants",
+                                    return_value=0)
+        self.end_descendants = patcher.start()
+        self.addCleanup(patcher.stop)
         self.logged = []
 
 
@@ -326,6 +336,65 @@ class StartParentSide(_StartCase):
         self.assertEqual(rc, 0)
         kill.assert_not_called()
 
+    def test_it_is_a_subreaper_before_the_analyzer_exists(self):
+        order = []
+        self.subreaper.side_effect = lambda: order.append("subreaper") or True
+        with mock.patch.object(privsep.os, "fork",
+                               side_effect=lambda: order.append("fork") or 4242), \
+                mock.patch.object(privsep.gate_server, "run_gate"), \
+                mock.patch.object(privsep.os, "waitpid",
+                                  return_value=(4242, 0)):
+            privsep.start(lambda _c: 0, log=self.logged.append)
+        self.assertEqual(order, ["subreaper", "fork"])
+
+    def test_what_the_analyzer_left_behind_is_ended_after_it(self):
+        order = []
+        self.end_descendants.side_effect = (
+            lambda **_k: order.append("end_descendants"))
+
+        def wait(pid, _flags):
+            order.append(f"wait {pid}")
+            return pid, 0
+        rc, _ = self.start(waitpid=wait)
+        self.assertEqual(rc, 0)
+        self.assertEqual(order, ["wait 4242", "end_descendants"])
+
+    def test_they_are_ended_after_a_gate_error_too(self):
+        self.start(gate=OSError("x"))
+        self.end_descendants.assert_called_once()
+
+    def test_failing_to_become_a_subreaper_is_said(self):
+        self.subreaper.return_value = False
+        rc, _ = self.start()
+        self.assertEqual(rc, 0)
+        self.assertTrue(any("could not become a subreaper" in line
+                            for line in self.logged))
+
+    def test_an_analyzer_that_outlives_its_socket_is_ended(self):
+        """The gate has stopped and the hubs are open: an analyzer still
+        running would only look like it is protecting something."""
+        calls = []
+
+        def wait(pid, flags):
+            calls.append(flags)
+            return (0, 0) if flags == os.WNOHANG else (pid, 9)
+        with mock.patch.object(privsep.os, "waitpid", side_effect=wait), \
+                mock.patch.object(privsep.os, "kill") as kill:
+            status = privsep._wait_for_analyzer(4242, log=self.logged.append,
+                                                grace=0)
+        kill.assert_called_once_with(4242, signal.SIGKILL)
+        self.assertEqual(status, 9)
+        self.assertEqual(calls, [os.WNOHANG, 0])
+        self.assertTrue(any("did not exit" in line for line in self.logged))
+
+    def test_an_analyzer_that_exits_is_not_killed(self):
+        with mock.patch.object(privsep.os, "waitpid",
+                               return_value=(4242, 3 << 8)), \
+                mock.patch.object(privsep.os, "kill") as kill:
+            status = privsep._wait_for_analyzer(4242, grace=0)
+        kill.assert_not_called()
+        self.assertEqual(status, 3 << 8)
+
     def test_signal_handlers_that_cannot_be_installed_do_not_stop_it(self):
         with mock.patch("signal.signal", side_effect=ValueError("not main")):
             rc, run_gate = self.start()
@@ -339,6 +408,107 @@ def _fd_open(fd):
     except OSError:
         return False
     return True
+
+
+class WhatTheAnalyzerLeavesBehind(unittest.TestCase):
+    """The refusal and error paths of the reaper (ROADMAP 1.12), in-process.
+    The real processes are in test_privsep.WhatTheAnalyzerLeavesIsEnded."""
+
+    def end(self, rounds, waits, budget=5.0, kill=None):
+        """end_descendants() over scripted /proc scans and waitpid results."""
+        logged = []
+        scans = iter(rounds)
+        results = iter(waits)
+
+        def waitpid(_pid, _flags):
+            result = next(results)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        with mock.patch.object(privsep, "_children_of",
+                               side_effect=lambda _me: next(scans, [])), \
+                mock.patch.object(privsep.os, "kill",
+                                  side_effect=kill) as killed, \
+                mock.patch.object(privsep.os, "waitpid", side_effect=waitpid), \
+                mock.patch.object(privsep.time, "sleep"):
+            ended = privsep.end_descendants(log=logged.append, budget=budget)
+        return ended, killed, logged
+
+    def test_nothing_left_is_nothing_killed(self):
+        ended, killed, logged = self.end([[]], [])
+        self.assertEqual(ended, 0)
+        killed.assert_not_called()
+        self.assertEqual(logged, [])
+
+    def test_each_generation_is_killed_as_it_is_handed_over(self):
+        ended, killed, logged = self.end(
+            [[101], [102], []],
+            [(101, 9), ChildProcessError(), (102, 9), (0, 0)])
+        self.assertEqual(ended, 2)
+        self.assertEqual([c.args for c in killed.call_args_list],
+                         [(101, signal.SIGKILL), (102, signal.SIGKILL)])
+        self.assertEqual(logged, ["[privsep] ended 2 process(es) the "
+                                  "analyzer left behind"])
+
+    def test_one_already_gone_is_not_counted(self):
+        ended, _killed, _logged = self.end(
+            [[101], []], [(0, 0)], kill=ProcessLookupError())
+        self.assertEqual(ended, 0)
+
+    def test_one_that_will_not_die_cannot_hold_the_root_side(self):
+        """Stuck in the kernel (a stalled USB read): given up on, said."""
+        ended, _killed, logged = self.end([[101], [101]], [(0, 0)],
+                                          budget=0)
+        self.assertEqual(ended, 1)
+        self.assertIn("did not end within", logged[0])
+
+    def test_children_of_survives_an_unreadable_proc(self):
+        with mock.patch.object(privsep.os, "listdir",
+                               side_effect=PermissionError()):
+            self.assertEqual(privsep._children_of(1), [])
+
+    def test_children_of_skips_what_it_cannot_read_or_parse(self):
+        def opener(path, _mode):
+            if "41" in path:
+                raise FileNotFoundError(path)
+            return mock.mock_open(read_data=b"42 (x)")()
+        with mock.patch.object(privsep.os, "listdir",
+                               return_value=["41", "42"]), \
+                mock.patch("builtins.open", side_effect=opener):
+            self.assertEqual(privsep._children_of(1), [])
+
+    def test_no_prctl_means_no_subreaper(self):
+        with mock.patch("ctypes.CDLL", side_effect=OSError("no libc")):
+            self.assertFalse(privsep.become_subreaper())
+
+    def test_an_analyzer_reaped_elsewhere_has_no_status(self):
+        with mock.patch.object(privsep.os, "waitpid",
+                               side_effect=ChildProcessError()):
+            self.assertIsNone(privsep._wait_for_analyzer(4242, grace=0))
+
+    def test_an_analyzer_that_vanishes_as_it_is_killed_has_no_status(self):
+        def waitpid(_pid, flags):
+            if flags == os.WNOHANG:
+                return 0, 0
+            raise ChildProcessError
+        with mock.patch.object(privsep.os, "waitpid", side_effect=waitpid), \
+                mock.patch.object(privsep.os, "kill",
+                                  side_effect=ProcessLookupError()):
+            self.assertIsNone(privsep._wait_for_analyzer(
+                4242, log=lambda *_a: None, grace=0))
+
+    def test_the_watcher_leaves_a_socket_alone_if_the_wait_fails(self):
+        sock = mock.Mock()
+        with mock.patch.object(privsep.os, "waitid",
+                               side_effect=ChildProcessError()):
+            privsep._stop_serving_when_it_exits(4242, sock).join(5)
+        sock.shutdown.assert_not_called()
+
+    def test_the_watcher_tolerates_a_socket_already_closed(self):
+        sock = mock.Mock(**{"shutdown.side_effect": OSError("closed")})
+        with mock.patch.object(privsep.os, "waitid", return_value=None):
+            privsep._stop_serving_when_it_exits(4242, sock).join(5)
+        sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
 
 
 class StartChildSide(_StartCase):

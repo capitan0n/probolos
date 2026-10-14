@@ -161,6 +161,140 @@ class AnalyzerHasNoControllingTerminal(unittest.TestCase):
             "ready sigint")
 
 
+    def test_what_the_analyzer_forks_does_not_outlive_it(self):
+        """
+        ROADMAP 1.12. A process the analyzer forked and left behind belonged
+        to init once the analyzer exited, and kept the terminal; holding the
+        analyzer's socket, it also kept the gate serving it. It is ended now.
+        """
+        def body(out):
+            first = os.fork()
+            if first == 0:
+                if os.fork() == 0:
+                    time.sleep(5)
+                    os.write(out, b" survived")
+                os._exit(0)
+            os.waitpid(first, 0)
+            os.write(out, b"orphaned")
+
+        started = time.monotonic()
+        self.assertEqual(self._run(body), "orphaned")
+        self.assertLess(time.monotonic() - started, 4,
+                        "the gate waited for the orphan to let go")
+
+
+class WhatTheAnalyzerLeavesIsEnded(unittest.TestCase):
+    """The pieces of ROADMAP 1.12 on real processes; no root needed."""
+
+    def _in_a_child(self, check) -> str:
+        """Run `check(out)` in a forked process; return what it wrote."""
+        read_end, write_end = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_end)
+            try:
+                check(write_end)
+            finally:
+                os._exit(0)
+        os.close(write_end)
+        result = b""
+        deadline = time.monotonic() + 15
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([read_end], [], [], 0.2)
+                if ready:
+                    chunk = os.read(read_end, 4096)
+                    if not chunk:
+                        break
+                    result += chunk
+        finally:
+            os.close(read_end)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+        return result.decode()
+
+    @staticmethod
+    def _orphan() -> int:
+        """Fork a sleeper whose parent exits at once; return its pid."""
+        read_end, write_end = os.pipe()
+        first = os.fork()
+        if first == 0:
+            sleeper = os.fork()
+            if sleeper == 0:
+                os.close(read_end)
+                os.close(write_end)
+                time.sleep(30)
+                os._exit(0)
+            os.write(write_end, str(sleeper).encode())
+            os._exit(0)
+        os.close(write_end)
+        os.waitpid(first, 0)
+        pid = int(os.read(read_end, 64))
+        os.close(read_end)
+        return pid
+
+    def test_an_orphan_is_reparented_to_the_gate_and_ended(self):
+        def check(out):
+            subreaper = privsep.become_subreaper()
+            orphan = self._orphan()
+            mine = orphan in privsep._children_of(os.getpid())
+            ended = privsep.end_descendants(log=lambda *_a: None)
+            try:
+                os.kill(orphan, 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            os.write(out, f"{subreaper} {mine} {ended} {alive}".encode())
+        self.assertEqual(self._in_a_child(check), "True True 1 False")
+
+    def test_with_nothing_left_nothing_is_ended(self):
+        def check(out):
+            privsep.become_subreaper()
+            os.write(out, str(privsep.end_descendants(
+                log=lambda *_a: None)).encode())
+        self.assertEqual(self._in_a_child(check), "0")
+
+    def test_the_gate_stops_when_the_analyzer_exits_not_its_socket(self):
+        parent_sock, child_sock = socket.socketpair(socket.AF_UNIX,
+                                                    socket.SOCK_SEQPACKET)
+        self.addCleanup(parent_sock.close)
+        read_end, write_end = os.pipe()
+        analyzer = os.fork()
+        if analyzer == 0:
+            parent_sock.close()
+            os.close(read_end)
+            holder = os.fork()          # keeps child_sock open after we go
+            if holder == 0:
+                time.sleep(30)
+                os._exit(0)
+            os.write(write_end, str(holder).encode())
+            os._exit(0)
+        child_sock.close()
+        os.close(write_end)
+        holder = int(os.read(read_end, 64))
+        os.close(read_end)
+        self.addCleanup(os.kill, holder, signal.SIGKILL)
+
+        watcher = privsep._stop_serving_when_it_exits(analyzer, parent_sock)
+        parent_sock.settimeout(10)
+        self.assertEqual(parent_sock.recv(64), b"")
+        watcher.join(5)
+        _pid, status = os.waitpid(analyzer, 0)     # WNOWAIT left the status
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+
+    def test_children_of_reads_a_command_name_with_spaces_and_parens(self):
+        stat = b"4242 (a) b (c) S 77 4242 4242 0 -1 4194560 0\n"
+        with mock.patch.object(privsep.os, "listdir",
+                               return_value=["4242", "self", "x"]), \
+                mock.patch("builtins.open",
+                           mock.mock_open(read_data=stat)):
+            self.assertEqual(privsep._children_of(77), [4242])
+            self.assertEqual(privsep._children_of(4242), [])
+
+
 class GateScope(unittest.TestCase):
 
     def setUp(self):
@@ -1960,6 +2094,9 @@ class TrustPathComesFromTheRootSide(unittest.TestCase):
                 mock.patch.object(privsep.os, "fork", return_value=4242), \
                 mock.patch.object(privsep.os, "waitpid",
                                   return_value=(4242, 0)), \
+                mock.patch.object(privsep, "become_subreaper",
+                                  return_value=True), \
+                mock.patch.object(privsep, "end_descendants"), \
                 mock.patch("signal.signal"), \
                 mock.patch.object(privsep.gate_server, "run_gate",
                                   fake_run_gate):

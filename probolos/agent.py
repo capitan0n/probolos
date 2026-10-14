@@ -55,9 +55,10 @@ from typing import Optional
 
 from . import dialogs
 from .agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_UNAVAILABLE,
-                        ANSWER_YES, DEFAULT_SOCKET,
-                        MAX_MESSAGE, MSG_ANSWER, MSG_CRITICAL, MSG_DECIDE,
-                        MSG_NOTICE, STEPS_COUNTDOWN, STEPS_ONE, STEPS_TWO)
+                        ANSWER_YES, DEFAULT_DIALOG_TIMEOUT, DEFAULT_SOCKET,
+                        MAX_DIALOG_TIMEOUT, MAX_MESSAGE, MIN_DIALOG_TIMEOUT,
+                        MSG_ANSWER, MSG_CRITICAL, MSG_DECIDE, MSG_NOTICE,
+                        STEPS_COUNTDOWN, STEPS_ONE, STEPS_TWO)
 
 APP_NAME = "Probolos"
 ICON = "drive-removable-media-usb"
@@ -246,12 +247,10 @@ class Notifier:
             pass
 
 
-# Bounds on the dialog timeout a message may ask for. The floor keeps a
-# question from flashing past unanswerably; the ceiling keeps one from pinning
-# a dialog on the user's screen indefinitely.
-MIN_DIALOG_TIMEOUT = 10.0
-MAX_DIALOG_TIMEOUT = 600.0
-DEFAULT_DIALOG_TIMEOUT = 60.0
+# Bounds on the dialog timeout a message may ask for (agentlink, shared with
+# the analyzer). The floor keeps a question from flashing past unanswerably;
+# the ceiling keeps one from pinning a dialog on the user's screen
+# indefinitely.
 
 # How long a notice window stays up when there is no notification server to
 # carry it. It approves nothing, so this only bounds how long it is in the way.
@@ -555,7 +554,9 @@ class Agent:
 
             first_text = (f"{title}\n\n{body}\n\n"
                           f"It is BLOCKED and cannot do anything.")
-            first_timeout = max(timeout - 5, 10)
+            # Never past the deadline: at the 10 s floor the first dialog
+            # outlived the analyzer's patience by a second.
+            first_timeout = min(max(timeout - 5, 10), timeout - 1)
 
             if steps == STEPS_ONE:
                 text = f"{first_text}\n{can_do}\n\nAllow it?"

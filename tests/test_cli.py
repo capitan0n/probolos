@@ -25,9 +25,23 @@ class AgentUserMustNotBeTheAnalyzerAccount(unittest.TestCase):
     from every process running as the shared `nobody` account.
     """
 
-    def _run_main(self, agent_user):
+    def _run_main(self, agent_user, listens=True):
         served = {}
         prepared = []
+        self.binders = []
+        test = self
+
+        class FakeBinder:
+            def __init__(self, path, log=print):
+                self.path, self.listener, self.stopped = path, None, False
+                test.binders.append(self)
+
+            def listen(self):
+                self.listener = object() if listens else None
+                return listens
+
+            def stop(self):
+                self.stopped = True
 
         def fake_start(analyzer_main, **_kw):
             analyzer_main(object())
@@ -41,6 +55,7 @@ class AgentUserMustNotBeTheAnalyzerAccount(unittest.TestCase):
                                   side_effect=lambda **kw: served.update(kw)), \
                 mock.patch.object(cli.agentlink, "prepare_socket_dir",
                                   side_effect=lambda *a: prepared.append(a)), \
+                mock.patch.object(cli.agentlink, "AgentLink", FakeBinder), \
                 mock.patch.object(privsep, "start", side_effect=fake_start), \
                 mock.patch("builtins.print"):
             with self.assertRaises(SystemExit):
@@ -69,6 +84,33 @@ class AgentUserMustNotBeTheAnalyzerAccount(unittest.TestCase):
         self.assertIsNotNone(served["agent_socket"])
         self.assertEqual(served["agent_uid"], pwd.getpwnam(other).pw_uid)
         self.assertEqual(len(prepared), 1)
+
+    def _desktop_account(self):
+        return next((e.pw_name for e in pwd.getpwall()
+                     if e.pw_uid != pwd.getpwnam("nobody").pw_uid), None)
+
+    def test_root_binds_the_socket_and_the_analyzer_inherits_it(self):
+        """
+        ROADMAP 1.13. The analyzer bound the socket in a directory its own
+        account owned, so any process running as that account (`nobody`, by
+        hand) could unlink it and listen in its place. Root binds it now, in
+        a directory root owns, and removes it after the analyzer has gone.
+        """
+        served, prepared = self._run_main(self._desktop_account())
+        (path, owner, _gid), = prepared
+        self.assertEqual(owner, 0, "the socket directory is not root's")
+        binder, = self.binders
+        self.assertEqual(binder.path, path)
+        self.assertIs(served["agent_listener"], binder.listener)
+        self.assertIsNotNone(binder.listener)
+        self.assertTrue(binder.stopped, "root left the socket behind")
+
+    def test_a_socket_root_cannot_bind_leaves_the_agent_configured(self):
+        """Configured, so the analyzer holds what nobody can be asked about
+        rather than falling back to a terminal the service does not have."""
+        served, _ = self._run_main(self._desktop_account(), listens=False)
+        self.assertIsNotNone(served["agent_socket"])
+        self.assertIsNone(served["agent_listener"])
 
 
 class DurationsMustBeFiniteAndNonNegative(unittest.TestCase):

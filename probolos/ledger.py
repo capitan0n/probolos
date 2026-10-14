@@ -504,6 +504,28 @@ def _bounded(items: List[str], limit: int) -> List[str]:
     return items[:1] + items[-(limit - 1):]
 
 
+# The decision the previously-rejected rule looks for (analyzers.py).
+REJECTED = "user rejected"
+
+
+def _bounded_decisions(decisions: List[str]) -> List[str]:
+    """
+    The newest MAX_DECISIONS, keeping a refusal that would fall out.
+
+    A refusal is the evidence previously-rejected reads, and the tail alone
+    let it be washed out: twenty sightings of anything else -- a device
+    plugged in again and again while nobody answers -- and the device you
+    turned away came back without its countdown. Kept at the front, as the
+    first known hash is, for the same reason.
+    """
+    if len(decisions) <= MAX_DECISIONS:
+        return list(decisions)
+    tail = decisions[-MAX_DECISIONS:]
+    if REJECTED in decisions and REJECTED not in tail:
+        tail = [REJECTED] + tail[1:]
+    return tail
+
+
 def identity_of(dev) -> str:
     """
     The identity a device CLAIMS. Not proof of anything; just what it said.
@@ -776,7 +798,8 @@ class Ledger:
         # Keep the tail only. An audit trail belongs in the JSONL log; this
         # file exists to answer "has this changed?", and unbounded growth in a
         # file read at every device attachment is a real operational problem.
-        entry.decisions = entry.decisions[-MAX_DECISIONS:]
+        # A refusal is kept regardless: see _bounded_decisions.
+        entry.decisions = _bounded_decisions(entry.decisions)
         # The same bound, for the same reason, on the two lists that had none.
         #
         # `decisions` was capped and these were not, which left the cap doing

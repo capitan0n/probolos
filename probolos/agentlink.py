@@ -144,6 +144,15 @@ STEPS_ONE = "one"               # one dialog: allow / keep blocked
 STEPS_TWO = "two"               # plus a second "switch it on?" confirmation
 STEPS_COUNTDOWN = "countdown"   # CRITICAL: Allow unlocks after a countdown
 
+# How long a question may stay open on the desktop, whatever --timeout says.
+# Shared because both ends must agree: the agent clamps the timeout it is sent
+# to these bounds, and the analyzer stops listening after the timeout it sent.
+# When they differed (--timeout 5: a dialog up for 10 s, the analyzer gone
+# after 5), an answer in between was lost while the person believed it given.
+MIN_DIALOG_TIMEOUT = 10.0
+MAX_DIALOG_TIMEOUT = 600.0
+DEFAULT_DIALOG_TIMEOUT = 60.0
+
 MAX_MESSAGE = 16384
 
 # struct ucred { pid_t pid; uid_t uid; gid_t gid; } -- a signed int followed by
@@ -203,14 +212,19 @@ def _still_connected(conn) -> bool:
 
 def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
     """
-    Create the socket directory so that the analyzer and the agent can both
-    reach it, and nobody else can.
+    Create the socket directory so that the agent can reach the socket, and
+    nobody else can.
 
-    Called by the launcher while still root. The directory is owned by the
-    analyzer's user, group-owned by the desktop user's group, mode 2750 -- the
-    setgid bit matters: it makes the socket the analyzer creates inherit the
-    group, which is how a process running as `nobody` ends up with a socket the
-    desktop user can open without anyone having to be given broad permissions.
+    Called by the launcher while still root, with `owner_uid` 0: the launcher
+    then binds the socket itself (AgentLink.listen) and the analyzer inherits
+    the listener. Group-owned by the desktop user's group, mode 2750 -- the
+    setgid bit makes the socket bound in it inherit that group, so the desktop
+    user can open it without anyone having to be given broad permissions.
+
+    The owner used to be the analyzer's account, so that the analyzer could
+    bind the socket. Owning the directory is the right to replace anything in
+    it, and every process running as that account had it: on a run by hand,
+    the shared `nobody`.
 
     The alternative -- a world-writable socket -- would let any local account
     answer questions about hardware, which is not a trade worth making for a
@@ -230,8 +244,8 @@ def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
     authority in the project that a writable parent directory hands away, and
     it was the one still handing it.
 
-    Dropping group write costs nothing: the analyzer owns the directory and
-    still creates, chmods and unlinks its own socket there.
+    Dropping group write costs nothing: root creates, chmods and unlinks the
+    socket there.
     """
     from .securefs import open_directory
     directory = os.path.abspath(path.parent)
@@ -272,7 +286,8 @@ class AgentLink:
     """
 
     def __init__(self, path: Path = DEFAULT_SOCKET, log=print,
-                 allowed_uids=None, owner_uid=None, owner_gid=None):
+                 allowed_uids=None, owner_uid=None, owner_gid=None,
+                 listener: Optional[socket.socket] = None):
         self.path = Path(path)
         self.log = log
         self.allowed_uids = None if allowed_uids is None else set(allowed_uids)
@@ -284,7 +299,11 @@ class AgentLink:
         # instead and these stay None.
         self.owner_uid = owner_uid
         self.owner_gid = owner_gid
-        self._listener: Optional[socket.socket] = None
+        # A listening socket the launcher bound as root before the privilege
+        # drop (--privsep). Adopted as is: the analyzer neither binds nor
+        # unlinks it, and could not, because the directory is root's.
+        self._listener: Optional[socket.socket] = listener
+        self._adopted = listener is not None
         self._conn: Optional[socket.socket] = None
         self._peer: Optional[tuple] = None
         self._lock = threading.Lock()
@@ -296,7 +315,43 @@ class AgentLink:
 
     # ---- lifecycle ----
 
+    @property
+    def listener(self) -> Optional[socket.socket]:
+        """The listening socket, once listen() has bound it."""
+        return self._listener
+
     def start(self) -> bool:
+        """Listen (unless a listener was handed in) and start accepting."""
+        if self._listener is None and not self.listen():
+            return False
+        listener = self._listener
+        if listener is None:
+            return False
+        listener.settimeout(0.5)
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        if self.allowed_uids is None:
+            # Visible rather than silent. Without a uid the only thing keeping
+            # other accounts off this socket is the 0660/2750 permission pair,
+            # and on a distribution whose useradd puts everyone in a shared
+            # primary group (`users`, gid 100) that is every interactive
+            # account on the machine. The caller is expected to pass a uid;
+            # saying so is cheaper than someone discovering it later.
+            self.log("[agent] WARNING: no permitted uid configured; any "
+                     "process that can open the socket may answer")
+        return True
+
+    def listen(self) -> bool:
+        """
+        Bind the socket at `path` and listen on it; False if that failed.
+
+        Under --privsep the launcher calls this as root, before the analyzer
+        exists, in a directory only root can write (prepare_socket_dir), and
+        the analyzer inherits the listener. Bound by the analyzer instead, in
+        a directory the analyzer's account owned, the socket could be unlinked
+        and replaced by any other process running as that account: the shared
+        `nobody`, on a run by hand. The desktop agent would then have
+        connected to that process's listener and shown it its questions.
+        """
         # The directory descriptor is HELD for the rest of this block, not
         # opened and dropped.
         #
@@ -340,10 +395,11 @@ class AgentLink:
             # window rather than closing it quickly.
             #
             # umask is process-global, which is why it is touched here and
-            # nowhere else: start() runs before this process has spawned any
-            # thread of its own -- the accept thread below is the first -- and
-            # before listen(), so nothing else is creating files meanwhile and
-            # nothing can connect to the socket yet either.
+            # nowhere else: listen() runs before this process has spawned any
+            # thread of its own -- start()'s accept thread is the first, and
+            # the launcher calls it before the fork -- and before the socket
+            # listens, so nothing else is creating files meanwhile and nothing
+            # can connect to the socket yet either.
             previous_umask = os.umask(0o117)
             try:
                 self._listener.bind(str(self.path))
@@ -366,25 +422,15 @@ class AgentLink:
             self._chmod_socket(directory_fd, 0o660)
             self._chown_for_owner(directory_fd)
             self._listener.listen(1)
-            self._listener.settimeout(0.5)
         except OSError as exc:
             self.log(f"[agent] could not listen on {self.path}: {exc}")
+            if self._listener is not None:
+                self._listener.close()
             self._listener = None
             return False
         finally:
             if directory_fd is not None:
                 os.close(directory_fd)
-
-        threading.Thread(target=self._accept_loop, daemon=True).start()
-        if self.allowed_uids is None:
-            # Visible rather than silent. Without a uid the only thing keeping
-            # other accounts off this socket is the 0660/2750 permission pair,
-            # and on a distribution whose useradd puts everyone in a shared
-            # primary group (`users`, gid 100) that is every interactive
-            # account on the machine. The caller is expected to pass a uid;
-            # saying so is cheaper than someone discovering it later.
-            self.log("[agent] WARNING: no permitted uid configured; any "
-                     "process that can open the socket may answer")
         return True
 
     def _chmod_socket(self, directory_fd, mode: int) -> None:
@@ -469,6 +515,8 @@ class AgentLink:
                         pass
             self._conn = self._listener = None
             self._peer = None
+        if self._adopted:
+            return                  # root's to remove, in root's directory
         # Only ever unlink a socket. Shutdown runs as root in the no-privsep
         # case, and `self.path` is operator-supplied via --agent-socket, so an
         # unconditional unlink is a privileged delete of whatever now sits at

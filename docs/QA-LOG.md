@@ -72,9 +72,9 @@ yet.
 | 2026-10-04 | Docs: an emoji and `pip install pyudev` before `sudo python3`; "internal ports are never gated" without `--gate-fixed-ports`; recovery only for a checkout; "denied" for held devices; `--forget` in SECURITY.md; the testbed's CRITICAL line | review (security audit) | P3 | |
 | 2026-10-04 | Tests left 33 temporary directories per run, and `unittest.main()` mid-file skipped later classes when a file was run directly | review (security audit) | P3 | |
 | 2026-10-04 | Any process running as `nobody` can kill the `--privsep` analyzer, which reopens every hub; devices attached meanwhile become baseline. Fixed in 0.13.0 for the service; a run by hand still defaults to `nobody` | review (security audit) | P1 | |
-| 2026-10-04 | A compromised analyzer's descendants outlive the gate on a terminal run | review (security audit) | P1, open | |
-| 2026-10-04 | Any `nobody` process can replace the agent socket and show the agent its own questions (it cannot approve anything). Fixed in 0.13.0 for the service | review (security audit) | P2 | |
-| 2026-10-04 | `--timeout` under about 12 s disagrees with the agent's 10 s floor; the capped decision history can lose an old refusal; `--lock-policy deny` never asks about devices stranded at a locked start; `--agent` with a failed socket denies instead of holding | review (security audit) | P2, open | |
+| 2026-10-04 | A compromised analyzer's descendants outlive the gate on a terminal run | review (security audit) | P1 | |
+| 2026-10-04 | Any `nobody` process can replace the agent socket and show the agent its own questions (it cannot approve anything). Fixed in 0.13.0 for the service; for a run by hand once root bound the socket | review (security audit) | P2 | |
+| 2026-10-04 | `--timeout` under about 12 s disagrees with the agent's 10 s floor; the capped decision history can lose an old refusal; `--lock-policy deny` never asks about devices stranded at a locked start; `--agent` with a failed socket denies instead of holding | review (security audit) | P2 | |
 | 2026-10-11 | `--watch-media` dropped a card the reader could not read (0 bytes after a media change) with no report and no audit entry | dogfooding | P2 | |
 | 2026-10-11 | `--watch-media` reported `UDISKS_AUTO=0` as "automount inhibited"; KDE Plasma's automounter ignores it, and the README's udev rule relied on it | dogfooding | P2 | |
 | 2026-10-11 | With `--watch-media` the plug-in prompt did not apply the card rules, and the approved card was judged again when its disk appeared; under `--media-policy deauthorize` the reader was switched off seconds after approval | dogfooding | P2 | |
@@ -85,9 +85,13 @@ yet.
 | 2026-10-12 | `--watch-media` reported one card up to three times (the reader announcing it again, and stage 4's own disk events) | dogfooding | P3 | |
 | 2026-10-12 | Stage 4 showed an isohybrid installer image only as "a large unused area" | dogfooding | P3 | |
 | 2026-10-12 | `--history` cut serials to their first characters (`00000000`), hiding the part that tells devices apart | dogfooding | P3 | |
-| 2026-10-12 | While the screen is locked, the internal-port and `--allow-port` exemptions do not apply (the lock check runs first), so a rescue keyboard plugged in at the lock screen stays blocked | review | P1, open | |
+| 2026-10-12 | While the screen is locked, the internal-port and `--allow-port` exemptions do not apply (the lock check runs first), so a rescue keyboard plugged in at the lock screen stays blocked | review | P1 | |
 | 2026-10-12 | Docs: `--timeout 0` was said to make a question wait (a dialog closes after 60 s); the unit's placeholder agent user was said to hold devices (they are refused after stages 3 and 4); closing a dialog was said to be no decision (it is "Keep blocked"); the panic file was not said to need the watchdog; `--lock-policy deny` stranding was not limited to runs without a desktop prompt | review | P2 | |
 | 2026-10-12 | In the fixes above: the approval window started at registration, so a busy event loop lost the approval (under `deauthorize`, a switch-off); every unplug printed the "replaced reader" alarm; the re-announce line could hide new findings; a tiny ISO 9660 explained away a large gap; a planted ISO signature behind an MBR raised nothing | review (fix verification) | P2 | |
+| 2026-10-14 | A process the analyzer forked kept the gate serving after the analyzer exited, for as long as it held the analyzer's end of the socket | review (fix verification) | P1 | |
+| 2026-10-14 | A rescue keyboard left blocked by a run that died was queued at a locked start, and waited for the unlock it was needed for | review (fix verification) | P1 | |
+| 2026-10-14 | zenity's exit 1 when GTK cannot open or loses the display was recorded as "Keep blocked", a refusal nobody made | review | P2 | |
+| 2026-10-14 | At the 10 s floor the agent's first dialog stayed up a second after the analyzer stopped listening | review (fix verification) | P2 | |
 
 ## Coverage (privilege boundary)
 

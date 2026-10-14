@@ -646,6 +646,8 @@ def main(argv=None) -> None:
         args.agent = False
     agent_uid = agent_identity[0] if agent_identity else None
     agent_gid = agent_identity[1] if agent_identity else None
+    # Under --privsep, the agent socket bound by root for the analyzer.
+    agent_binder = None
 
     def _serve():
         daemon.serve(dry_run=args.dry_run, timeout=args.timeout,
@@ -662,6 +664,8 @@ def main(argv=None) -> None:
                      agent_socket=args.agent_socket if args.agent else None,
                      agent_uid=agent_uid,
                      agent_gid=agent_gid,
+                     agent_listener=(agent_binder.listener
+                                     if agent_binder else None),
                      close_race_window=args.close_race_window,
                      watch_media=args.watch_media,
                      media_policy=args.media_policy)
@@ -693,20 +697,28 @@ def main(argv=None) -> None:
 
         if args.agent:
             # The analyzer will run as `nobody` and the agent as the desktop
-            # user; neither can grant the other access afterwards, so the
-            # directory is set up here, while still root. The identity was
-            # already resolved above -- reused here so the socket's group and
-            # the uid AgentLink enforces cannot disagree.
+            # user, so the socket is set up here, while still root. The
+            # identity was already resolved above -- reused here so the
+            # socket's group and the uid AgentLink enforces cannot disagree.
+            #
+            # Root binds it, in a directory only root can write, and the
+            # analyzer inherits the listener. The analyzer used to bind it in
+            # a directory its own account owned, so any process running as
+            # that account -- the shared `nobody`, by hand -- could unlink it
+            # and bind its own listener in its place (ROADMAP 1.13).
+            uid, gid, agent_user = agent_identity
             try:
-                import pwd as _pwd
-                uid, gid, agent_user = agent_identity
-                analyzer_uid = _pwd.getpwnam(args.privsep_user).pw_uid
-                agentlink.prepare_socket_dir(args.agent_socket,
-                                             analyzer_uid, gid)
-                print(f"[agent] {args.agent_socket.parent} prepared for "
-                      f"{agent_user} (uid {uid})")
-            except (KeyError, OSError) as exc:
+                agentlink.prepare_socket_dir(args.agent_socket, 0, gid)
+            except OSError as exc:
                 sys.exit(f"could not prepare the agent socket directory: {exc}")
+            agent_binder = agentlink.AgentLink(args.agent_socket)
+            if agent_binder.listen():
+                print(f"[agent] {args.agent_socket} bound for {agent_user} "
+                      f"(uid {uid})")
+            else:
+                # Still configured: the analyzer then has an agent nobody can
+                # reach, and holds what it cannot ask in a terminal.
+                agent_binder = None
 
         try:
             # ONLY the ledger directory is handed to the analyzer. The trust
@@ -739,6 +751,11 @@ def main(argv=None) -> None:
                                                else (gate_lock,)))
         except privsep.PrivsepError as exc:
             sys.exit(f"privsep: {exc}")
+        finally:
+            # Root's copy of the listener, and the socket file, which only
+            # root can remove from that directory.
+            if agent_binder is not None:
+                agent_binder.stop()
         sys.exit(rc)
     else:
         _serve()

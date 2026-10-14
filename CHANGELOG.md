@@ -21,9 +21,39 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
   `SIGTERM` after a stall, it set `authorized_default=1` on every root hub
   while the daemon believed the gate closed. Only the process that closed the
   gate may reopen it now, and the reader drops the inherited handlers.
+- **Nothing the analyzer starts outlives it** (ROADMAP 1.12). The root side is
+  a child subreaper: on a run from a terminal, a process a compromised
+  analyzer forked kept that terminal after the gate stopped, and one holding
+  the analyzer's socket kept the gate serving it after the analyzer had
+  exited. The analyzer's exit now ends the gate, and everything it left
+  behind is killed and reaped; an analyzer still running after it closed its
+  socket is killed after 10 s.
+- **The agent socket cannot be replaced by the analyzer's account**
+  (ROADMAP 1.13). Under `--privsep` root binds it before the privilege drop, in
+  a directory root owns, and the analyzer inherits the listener. A hand run as
+  `nobody` let any other `nobody` process listen in its place.
+- **A refusal can no longer be washed out of a device's history.** The last 20
+  decisions were kept, so twenty unanswered plug-ins removed the refusal and
+  the `previously-rejected` countdown with it. A refusal is kept at the front.
 
 ### Fixed
 
+- **Lockout: the rescue port works at the lock screen.** Internal ports and
+  `--allow-port` were held while the screen was locked, so a USB keyboard on
+  the rescue port could not type the password. They are admitted before the
+  lock is checked, and one found blocked at a locked start is admitted at once.
+- **Desktop prompt timeouts:** the analyzer stopped listening after
+  `--timeout` as given while the dialog stayed up at least 10 s, so under
+  `--timeout 5` an answer could be lost, and a CRITICAL device under about
+  12 s could not be approved at all. The question now lasts as long as the
+  dialog, and a CRITICAL one at least 10 s past its countdown.
+- **`--lock-policy deny`** asks about devices found blocked at a locked start
+  when the screen unlocks; with no desktop prompt they were never asked about.
+- **`--agent` with a socket that could not be opened** holds devices that no
+  terminal can answer; under the service they were denied as unanswered.
+- **zenity without a display:** GTK's exit when it cannot open or loses the
+  display was read as "Keep blocked" and recorded as a refusal; it is "no
+  answer" now.
 - **Card readers (`--watch-media`):**
   - a card the reader cannot read (0 bytes after a media change) is re-checked
     for 15 s and reported as `UNREADABLE CARD`; it used to be dropped silently;

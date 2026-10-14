@@ -40,8 +40,11 @@ from __future__ import annotations
 
 import os
 import pwd
+import signal
 import socket
 import sys
+import threading
+import time
 
 from . import gate_server
 
@@ -214,6 +217,163 @@ def _run_analyzer(analyzer_main, client) -> int:
     return rc or 0
 
 
+# prctl(2) option from <linux/prctl.h>.
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def become_subreaper() -> bool:
+    """
+    Have orphans below this process reparented to it instead of to init.
+
+    Without it, whatever the analyzer forked and left behind belonged to init
+    the moment the analyzer exited, and nothing ended it: on a run from a
+    terminal, a compromised analyzer's children kept the terminal it was
+    started from, and kept reading it, after the gate had stopped. The
+    service is covered by systemd ending the unit's cgroup; a terminal run
+    has no cgroup of its own to end.
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def _children_of(parent: int) -> list[int]:
+    """Pids whose parent is `parent`, zombies included, read from /proc."""
+    children: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return children
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as stat:
+                line = stat.read()
+        except OSError:
+            continue                # exited and reaped since the listing
+        # The command name is in parentheses and may itself hold spaces and
+        # ')': the state and the parent pid follow the LAST ')'.
+        fields = line[line.rfind(b")") + 2:].split()
+        try:
+            if int(fields[1]) == parent:
+                children.append(int(entry))
+        except (IndexError, ValueError):
+            continue
+    return children
+
+
+def end_descendants(log=print, budget: float = 5.0) -> int:
+    """
+    Kill and reap everything still below this process; return how many.
+
+    Only reaches past the direct children because this process is a
+    subreaper: each one killed hands its own children to us, and the next
+    round kills those. Polled, not a blocking wait, so a process stuck in
+    the kernel (a read from a stalled USB device) cannot hold the root side
+    past `budget`.
+    """
+    me = os.getpid()
+    killed: set[int] = set()
+    deadline = time.monotonic() + budget
+    while True:
+        children = _children_of(me)
+        if not children:
+            break
+        for pid in children:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                continue
+            killed.add(pid)
+        reaped = False
+        while True:
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if pid == 0:
+                break
+            reaped = True
+        if time.monotonic() >= deadline:
+            log(f"[privsep] {len(_children_of(me))} process(es) the analyzer "
+                f"left behind did not end within {budget:.0f}s")
+            break
+        if not reaped:
+            time.sleep(0.02)
+    if killed:
+        log(f"[privsep] ended {len(killed)} process(es) the analyzer left "
+            f"behind")
+    return len(killed)
+
+
+def _stop_serving_when_it_exits(pid: int, sock: socket.socket):
+    """
+    End the gate when the analyzer exits, whoever else holds its socket.
+
+    The gate served until the socket's other end was closed, and a fork
+    inherits that end: a process the analyzer left behind kept the gate
+    serving it after the analyzer was gone, and was not ended until it let
+    go. The analyzer's exit is what ends the gate. WNOWAIT leaves the exit
+    status for the reap in start().
+    """
+    def watch():
+        try:
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        except OSError:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass                    # closed already: the gate has stopped
+    watcher = threading.Thread(target=watch, name="analyzer-exit",
+                               daemon=True)
+    watcher.start()
+    return watcher
+
+
+# How long the analyzer may take to exit once its end of the socket is
+# closed. Closing it is the last thing an analyzer does before _exit(), or
+# the first thing after a round trip failed; either way it is on its way out.
+ANALYZER_EXIT_GRACE = 10.0
+
+
+def _wait_for_analyzer(pid: int, log=print,
+                       grace: float = ANALYZER_EXIT_GRACE):
+    """
+    Wait for the analyzer's exit status; None if it was reaped elsewhere.
+
+    Bounded: the gate has stopped and the hubs are open again, and an
+    analyzer still running then would only look like it is protecting
+    something. Past `grace` it is killed.
+    """
+    deadline = time.monotonic() + grace
+    while True:
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return None
+        if done == pid:
+            return status
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    log(f"[privsep] the analyzer (pid {pid}) did not exit after the gate "
+        f"stopped; ending it")
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        _pid, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        return None
+    return status
+
+
 def start(analyzer_main, drop_to: str = "nobody", log=print,
           state_paths=(), watch_media: bool = False, trust_path=None,
           close_in_child=()) -> int:
@@ -284,7 +444,6 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     # Until fork() returns the analyzer's pid there is nobody to forward to, so
     # a signal in that instant is dropped rather than fatal; the child puts back
     # the dispositions it inherited before it does anything else.
-    import signal
     analyzer: list = []
 
     def _forward(signum, _frame):
@@ -305,6 +464,12 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
             inherited[_sig] = signal.signal(_sig, _handler)
         except (ValueError, OSError):
             pass
+
+    # Before fork(), so nothing the analyzer starts can be orphaned to init
+    # first. Not inherited: the analyzer itself is no subreaper.
+    if not become_subreaper():
+        log("[privsep] could not become a subreaper: processes the analyzer "
+            "starts may outlive it")
 
     pid = os.fork()
     if pid == 0:
@@ -352,6 +517,7 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     # ---- parent: stays root, runs the gate ----
     analyzer.append(pid)
     child_sock.close()
+    _stop_serving_when_it_exits(pid, parent_sock)
 
     log(f"[privsep] gate running as root (pid {os.getpid()}), "
         f"analyzer as {drop_to} (pid {pid})")
@@ -374,9 +540,11 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     if gate_error is not None:
         log(f"[privsep] the gate stopped with an error: {gate_error!r}")
 
-    try:
-        _pid, status = os.waitpid(pid, 0)
-    except ChildProcessError:
+    status = _wait_for_analyzer(pid, log=log)
+    # Whatever the analyzer started goes with it: on a terminal run nothing
+    # else would end it, and it holds the terminal.
+    end_descendants(log=log)
+    if status is None:
         # Already reaped (a SIGCHLD handler installed elsewhere, or the child
         # was inherited away). Nothing left to wait for.
         return 1 if gate_error is not None else 0

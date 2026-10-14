@@ -250,6 +250,30 @@ class KDialogBackend(DialogBackend):
         return True
 
 
+# What GTK prints on its way to exit(1) when it cannot open the display, or
+# loses it: X11's IO error handler, the Wayland event source of GTK 3 and 4.
+# Exit 1 is also zenity's Cancel, so without these a dialog that was never on
+# screen, or vanished with the session, was recorded as a refusal: the next
+# plug-in of that device met "You have refused this device before".
+_GTK_DISPLAY_LOST = (
+    b"cannot open display",
+    b"Fatal IO error",
+    b"Error reading events from display",
+    b"Error flushing display",
+    b"Lost connection to Wayland compositor",
+    b"dispatching to Wayland display",
+)
+
+
+def _lost_display(stderr) -> bool:
+    """Whether a GTK tool's stderr says the display, not a person, ended it."""
+    if isinstance(stderr, str):
+        stderr = stderr.encode("utf-8", "replace")
+    if not isinstance(stderr, bytes):
+        return False
+    return any(marker in stderr for marker in _GTK_DISPLAY_LOST)
+
+
 class ZenityBackend(DialogBackend):
     """GTK dialog tool, standard on GNOME and XFCE."""
 
@@ -281,8 +305,10 @@ class ZenityBackend(DialogBackend):
         # 0 is OK and 1 is Cancel or the window closed. Anything else -- a
         # signal (negative), zenity's own error exit (255) -- is not a button
         # and so no decision, for the reason given in KDialogBackend.confirm.
-        # GTK exits 1 when it loses the display, which stays
-        # indistinguishable from Cancel; that much cannot be told apart here.
+        # GTK exits 1 too when it has no display; what it printed tells the
+        # two apart.
+        if result.returncode == 1 and _lost_display(result.stderr):
+            return None
         return {0: True, 1: False}.get(result.returncode)
 
     def choose(self, title: str, text: str, once_label: str,
@@ -304,7 +330,7 @@ class ZenityBackend(DialogBackend):
             return None
         if result.returncode == 0:
             return CHOICE_ONCE
-        if result.returncode != 1:
+        if result.returncode != 1 or _lost_display(result.stderr):
             return None         # not a button: see confirm()
         if (result.stdout or "").strip() == always_label:
             return CHOICE_ALWAYS
@@ -323,6 +349,8 @@ class ZenityBackend(DialogBackend):
         # OK is 0 and closing the window 1; anything else (255, a signal) is
         # zenity failing, not the person closing it -- as in kdialog's.
         if result.returncode not in (0, 1):
+            return None
+        if result.returncode == 1 and _lost_display(result.stderr):
             return None
         return True
 

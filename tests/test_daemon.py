@@ -240,6 +240,55 @@ class TestLockedBehaviour(unittest.TestCase):
             engine._on_add(str(dev.syspath))
         self.assertEqual(engine.pending, {})
 
+    def _add_protected(self, engine, dev):
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized",
+                               side_effect=lambda p, v: self.writes.append(v)), \
+             mock.patch.object(daemon_mod.sysfs, "admit_device") as admit, \
+             mock.patch.object(engine, "_load_with_retry", return_value=dev), \
+             mock.patch.object(engine, "_ask") as ask, \
+             mock.patch.object(daemon_mod.report, "one_liner", return_value="x"):
+            engine._on_add(str(dev.syspath))
+        ask.assert_not_called()
+        return admit
+
+    def test_the_rescue_port_is_admitted_behind_a_locked_screen(self):
+        """
+        The lock check ran before the exemptions, so a rescue keyboard plugged
+        in at the lock screen was held until an unlock it was needed for.
+        """
+        for lock_policy in (session.POLICY_QUEUE, session.POLICY_DENY):
+            with self.subTest(lock_policy=lock_policy):
+                engine = daemon_mod.Probolos(
+                    monitor=session.FixedState(True), lock_policy=lock_policy,
+                    observe=0,
+                    policy=safety.SafetyPolicy(allowed_ports=["3-9"]))
+                dev = make_device(kinds=[usbclass.KIND_INPUT])
+                admit = self._add_protected(engine, dev)
+                admit.assert_called_once_with(dev)
+                self.assertEqual(engine.pending, {})
+                self.assertIn("3-9", engine.known)
+
+    def test_an_internal_port_is_admitted_behind_a_locked_screen(self):
+        """An internal webcam re-enumerating on resume meets the lock screen
+        the suspend raised; it was held there."""
+        dev = make_device(kinds=[usbclass.KIND_OTHER])
+        dev.removable = "fixed"
+        with mock.patch.object(safety, "_fixed_all_the_way_to_a_root_hub",
+                               return_value=True):
+            admit = self._add_protected(self.engine, dev)
+        admit.assert_called_once_with(dev)
+        self.assertEqual(self.engine.pending, {})
+
+    def test_other_ports_are_still_held_behind_a_locked_screen(self):
+        engine = daemon_mod.Probolos(
+            monitor=session.FixedState(True), lock_policy=session.POLICY_QUEUE,
+            observe=0, policy=safety.SafetyPolicy(allowed_ports=["3-1"]))
+        dev = make_device(kinds=[usbclass.KIND_INPUT])
+        admit = self._add_protected(engine, dev)
+        admit.assert_not_called()
+        self.assertIn("3-9", engine.pending)
+        self.assertNotIn(1, self.writes)
+
     def test_ignore_policy_asks_normally(self):
         engine = daemon_mod.Probolos(monitor=session.FixedState(True),
                                      lock_policy=session.POLICY_IGNORE,
@@ -253,6 +302,45 @@ class TestLockedBehaviour(unittest.TestCase):
              mock.patch.object(engine, "_inspect_medium", return_value=None):
             engine._on_add(str(dev.syspath))
             ask.assert_called_once()
+
+
+class TheDesktopQuestionLastsAsLongAsTheDialog(unittest.TestCase):
+    """
+    The agent holds every dialog to 10-600 s; the analyzer stopped listening
+    after --timeout as given. Under --timeout 5 a dialog stayed up after the
+    analyzer had gone, and a CRITICAL device under about 12 s could not be
+    approved at all: "Allow anyway" unlocked as the question ended.
+    """
+
+    def timeout(self, configured, critical=False):
+        engine = daemon_mod.Probolos(observe=0, timeout=configured)
+        return engine._agent_timeout(critical)
+
+    def test_it_is_held_to_the_dialogs_bounds(self):
+        self.assertEqual(self.timeout(5), agentlink.MIN_DIALOG_TIMEOUT)
+        self.assertEqual(self.timeout(45), 45)
+        self.assertEqual(self.timeout(5000), agentlink.MAX_DIALOG_TIMEOUT)
+
+    def test_no_timeout_is_the_dialogs_default(self):
+        self.assertEqual(self.timeout(0), agentlink.DEFAULT_DIALOG_TIMEOUT)
+
+    def test_a_critical_question_outlasts_its_countdown(self):
+        self.assertEqual(self.timeout(12, critical=True),
+                         daemon_mod.CRITICAL_COUNTDOWN
+                         + agentlink.MIN_DIALOG_TIMEOUT)
+        self.assertEqual(self.timeout(0, critical=True),
+                         agentlink.DEFAULT_DIALOG_TIMEOUT)
+
+    def test_the_agent_is_asked_with_it(self):
+        engine = daemon_mod.Probolos(observe=0, timeout=5)
+        engine.agent = mock.Mock(**{"is_live.return_value": True,
+                                    "ask.return_value": agentlink.ANSWER_NO})
+        dev = make_device()
+        with mock.patch.object(daemon_mod.report, "one_liner",
+                               return_value="x"):
+            engine._ask(dev, [])
+        self.assertEqual(engine.agent.ask.call_args.kwargs["timeout"],
+                         agentlink.MIN_DIALOG_TIMEOUT)
 
 
 class TestUnlockDrainsTheQueue(unittest.TestCase):
@@ -364,6 +452,52 @@ class TestStrandedDevicesAtStartup(unittest.TestCase):
             engine.snapshot()
         self.assertIn("3-4", engine.known)
         self.assertEqual(engine.pending, {})
+
+    def _admit_protected_held(self, engine, devices, same=True):
+        """Run the startup admission over `engine.pending`; return admit()."""
+        by_path = {d.syspath: d for d in devices}
+        with mock.patch.object(daemon_mod.sysfs, "load_device",
+                               side_effect=by_path.get), \
+             mock.patch.object(engine, "_load_with_retry",
+                               side_effect=lambda p: by_path[Path(p)]), \
+             mock.patch.object(engine, "_still_same_device",
+                               return_value=same), \
+             mock.patch.object(daemon_mod.sysfs, "admit_device") as admit, \
+             mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(engine, "_ask") as ask, \
+             mock.patch.object(daemon_mod.report, "one_liner", return_value="x"):
+            engine._admit_protected_held()
+        ask.assert_not_called()
+        return admit
+
+    def test_a_blocked_rescue_keyboard_is_admitted_at_a_locked_start(self):
+        """
+        Left at authorized=0 by a run that died, the rescue keyboard waited in
+        the queue for an unlock or an agent, and the unlock needed it.
+        """
+        engine = daemon_mod.Probolos(
+            observe=0, monitor=session.FixedState(True),
+            lock_policy=session.POLICY_QUEUE,
+            policy=safety.SafetyPolicy(allowed_ports=["3-1"]))
+        rescue = make_device("3-1", kinds=[usbclass.KIND_INPUT])
+        other = make_device("3-9", kinds=[usbclass.KIND_INPUT])
+        for dev in (rescue, other):
+            engine.pending[dev.name] = (dev.syspath, dev.instance_id)
+        admit = self._admit_protected_held(engine, [rescue, other])
+        admit.assert_called_once_with(rescue)
+        self.assertIn("3-1", engine.known)
+        self.assertEqual(list(engine.pending), ["3-9"],
+                         "the device on an ordinary port still waits")
+
+    def test_a_recycled_rescue_port_is_not_admitted_under_the_old_entry(self):
+        engine = daemon_mod.Probolos(
+            observe=0, monitor=session.FixedState(True),
+            policy=safety.SafetyPolicy(allowed_ports=["3-1"]))
+        rescue = make_device("3-1", kinds=[usbclass.KIND_INPUT])
+        engine.pending["3-1"] = (rescue.syspath, rescue.instance_id)
+        admit = self._admit_protected_held(engine, [rescue], same=False)
+        admit.assert_not_called()
+        self.assertIn("3-1", engine.pending)
 
     def test_exit_reports_devices_left_switched_off(self):
         """A refused device, or a reader the media policy switched off, stays
@@ -1755,6 +1889,35 @@ class NobodyToAskHoldsTheDevice(_NobodyToAskCase):
         self.admit.assert_not_called()
 
 
+class StrandedDevicesAreAskedOnUnlockUnderDeny(_NobodyToAskCase):
+    """
+    --lock-policy deny with no desktop agent: a device found blocked at a
+    locked start was queued, and nothing ever drained the queue, because
+    only "queue" watched for the unlock.
+    """
+
+    terminal = True
+
+    def test_asked_on_the_terminal_once_the_screen_unlocks(self):
+        monitor = session.FixedState(True)
+        engine = self.engine(monitor=monitor, agent=None,
+                             lock_policy=session.POLICY_DENY)
+        engine.pending["3-9"] = (self.dev.syspath, self.dev.instance_id)
+        self.stdin = io.StringIO("y\n")
+
+        def still_locked():
+            self.admit.assert_not_called()
+
+        def unlock():
+            still_locked()
+            monitor._locked = False
+
+        self.run_loop(engine, still_locked, unlock)
+        self.admit.assert_called_once_with(self.dev)
+        self.assertEqual(engine.pending, {})
+        self.assertIn("[▶] Screen unlocked", self.out.getvalue())
+
+
 class HeldDevicesAreAskedWhenTheAgentConnects(_NobodyToAskCase):
 
     def test_the_next_pass_after_the_agent_connects_asks(self):
@@ -2325,6 +2488,48 @@ class ShortcutsNeverOutrankACriticalFinding(unittest.TestCase):
         written.assert_not_called()
         ledger.save.assert_not_called()
         ledger.record.assert_not_called()
+
+class AnAgentSocketThatFailsStillHolds(unittest.TestCase):
+    """
+    `--agent` with a socket that could not be opened ran with no agent at
+    all: the terminal fallback read the service's /dev/null and denied every
+    device as unanswered. The link is kept, never live, so they are held.
+    """
+
+    def test_the_engine_keeps_the_link(self):
+        link = mock.Mock(**{"start.return_value": False,
+                            "is_live.return_value": False})
+        engines = []
+        stop = RuntimeError("stop here")
+
+        def capture(**kwargs):
+            engines.append(kwargs)
+            raise stop
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        policy = safety.SafetyPolicy(panic_file=Path(tmp.name) / "panic")
+        out = io.StringIO()
+        with mock.patch.object(daemon_mod.agentlink, "AgentLink",
+                               return_value=link), \
+             mock.patch.object(daemon_mod, "pyudev", object()), \
+             mock.patch.object(daemon_mod.gate, "AuthorizationGate",
+                               return_value=mock.MagicMock()), \
+             mock.patch.object(daemon_mod, "Probolos", side_effect=capture), \
+             redirect_stdout(out):
+            with self.assertRaises(RuntimeError):
+                daemon_mod.serve(policy=policy, watchdog_timeout=0,
+                                 lock_policy=session.POLICY_IGNORE,
+                                 agent_socket=Path(tmp.name) / "s.sock",
+                                 agent_uid=1000)
+        self.assertIs(engines[0]["agent"], link)
+        self.assertIn("held, not denied", out.getvalue())
+
+    def test_with_no_terminal_a_device_is_held(self):
+        link = mock.Mock(**{"is_live.return_value": False})
+        engine = daemon_mod.Probolos(observe=0, agent=link)
+        with mock.patch.object(engine, "_has_terminal", return_value=False):
+            self.assertTrue(engine._nobody_can_be_asked())
+
 
 class AStallTheWatchdogEndedIsAFailure(unittest.TestCase):
     """

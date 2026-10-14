@@ -111,11 +111,13 @@ behaviour is a **feature** and waits for after 1.0.
   any analyzer exit). P1. Done in 0.13.0: the service runs the analyzer as
   `probolos`. Keeping the hubs closed instead was not taken
   (`docs/TECHNICAL-REFERENCE.md` says why).
-- [ ] **1.12 S** Reap the analyzer's whole process tree: a subreaper in the
+- [x] **1.12 S** Reap the analyzer's whole process tree: a subreaper in the
   gate, so nothing the analyzer forked outlives it on a terminal run. P1.
-- [ ] **1.13 S** The agent socket: another process with the analyzer's uid can
-  take its place. P2. Done for the service with 1.11; open for a run by hand
-  as `nobody`.
+  The analyzer's exit also ends the gate when a process it left behind holds
+  its socket.
+- [x] **1.13 S** The agent socket: another process with the analyzer's uid can
+  take its place. P2. Root binds the socket before the privilege drop, in a
+  directory root owns; the analyzer inherits the listener.
 - [ ] **1.14 S** Publish to PyPI by trusted publishing: TestPyPI at once, PyPI
   when the maintainer approves. The workflow is done; the publishers and
   environments are set up by hand (`docs/GITHUB-SETUP.md`). Done when

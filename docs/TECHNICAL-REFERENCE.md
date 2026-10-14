@@ -57,6 +57,15 @@ re-blocks devices it switched on for inspection, and reopens the root hubs.
 Nothing is restored on a path whose kernel instance has changed (a recycled
 port). Devices you allowed stay on.
 
+**Nothing the analyzer starts outlives it.** The root process is a child
+subreaper (`PR_SET_CHILD_SUBREAPER`), so anything the analyzer forks and
+leaves behind is handed to it rather than to init. The analyzer's exit ends
+the gate even when such a process still holds its end of the socket; the gate
+then kills and reaps every process below it (a 5 s budget, so one stuck in
+the kernel cannot hold the root side). An analyzer that closes its socket and
+keeps running is killed after 10 s. Under the service, systemd also ends the
+unit's cgroup.
+
 **Why a killed analyzer reopens the gate.** Keeping the hubs closed when the
 analyzer is killed was considered and not done. The analyzer's own `SIGTERM`
 handler reopens the hubs and exits 0, so a `SIGTERM` from another process with
@@ -147,17 +156,19 @@ USB 3 port no longer matches and is asked about again.
 
 ## The agent socket
 
-`/run/probolos/` is mode `2750`: owned by the analyzer's account, group-owned
-by the desktop user's group. The socket is `0660`, and the analyzer checks the
-connecting uid with `SO_PEERCRED`. `connect()` needs write permission on the
-socket, not on the directory, so the group has no write permission there:
-otherwise any member could unlink the socket and listen in its place.
+`/run/probolos/` is mode `2750`: owned by root, group-owned by the desktop
+user's group. The socket is `0660`, and the analyzer checks the connecting uid
+with `SO_PEERCRED`. `connect()` needs write permission on the socket, not on
+the directory, so the group has no write permission there: otherwise any
+member could unlink the socket and listen in its place.
 
-The directory's *owner* can still do that. While the owner was the shared
-`nobody`, any `nobody` process could put its own listener there and show the
-agent its own questions (answers to them admit nothing, but the real analyzer
-loses its prompt and holds devices meanwhile). The service's `probolos`
-account closes this; a hand run as `nobody` does not (ROADMAP 1.13).
+The directory's *owner* can still do that, so under `--privsep` the owner is
+root: the launcher binds the socket before the privilege drop, the analyzer
+inherits the listening socket, and root removes the socket after the analyzer
+exits. The directory used to belong to the analyzer's account, and while that
+was the shared `nobody` any `nobody` process could put its own listener there
+and show the agent its own questions (answers to them admitted nothing, but
+the real analyzer lost its prompt).
 
 The socket's mode is set relative to the held directory descriptor after
 `lstat` confirms it is still the socket, and shutdown removes only a socket. A
@@ -175,9 +186,11 @@ refusal either: a recorded refusal makes the next plug CRITICAL
   device is held blocked before stages 3 and 4, and asked about when an agent
   connects. With no agent configured at all (the unit's placeholder agent
   user), nothing is held: the stages run and the terminal prompt reads
-  end-of-file, so the device is refused as "no answer". Holding
-  again records nothing new, so it cannot push a real refusal out of the
-  bounded history.
+  end-of-file, so the device is refused as "no answer". An agent whose socket
+  could not be opened counts as configured and not connected: devices are
+  held, and asked about at the next start. Holding again records nothing new,
+  and the bounded history keeps a refusal at its front however many other
+  decisions follow, so neither can wash a real refusal out.
 - **Re-ask cap.** An agent that leaves mid-question holds the device again;
   each round may switch it on for inspection, so on the third lost question
   (`MAX_UNSEEN_ASKS`) it is refused as unanswered.
@@ -192,11 +205,13 @@ refusal either: a recorded refusal makes the next plug CRITICAL
   window and a timeout are "no answer". A question shown and not answered is
   recorded as such, not re-queued, and the agent shows a display-only "still
   blocked, replug it" notice (critical urgency for a CRITICAL device).
-  Remaining gap: GTK exits 1 when it loses the display, which zenity reports
-  like Cancel.
+  GTK also exits 1, zenity's Cancel, when it cannot open the display or
+  loses it; that exit counts as "no answer" when GTK's stderr says so.
 - **Dialog timeout.** A dialog closes after `--timeout` seconds, clamped to
   10–600 s, or after 60 s when `--timeout` is 0 (only the terminal can wait
-  without limit). The device then stays blocked as "no answer".
+  without limit). A CRITICAL question stays open at least 10 s past its
+  countdown. The analyzer listens for exactly as long as the dialog is up. The
+  device then stays blocked as "no answer".
 - **The countdown is enforced by the daemon:** an approval that arrives within
   10 s of the question is refused, whatever sent it.
 - **tkinter asks twice.** A Tk message box labels its buttons Yes/No/Cancel
@@ -332,10 +347,11 @@ reach the terminal, the dialogs, the JSON log, the trust store and the ledger.
 - **Panic file:** must be root-owned, in a root-owned directory, and is
   checked with `lstat`, so a planted symlink or hardlink is refused. The
   watchdog thread is what checks for it, so `--watchdog 0` disables it too.
-- **The screen lock comes first.** The lock check runs before the exemptions
-  for internal ports and `--allow-port`, so while the screen is locked a
-  device on those ports is held (or denied) like any other: an open lockout
-  risk for a machine whose only keyboard is USB.
+- **The exemptions come before the screen lock.** A device on an internal
+  port or an `--allow-port` port is admitted while the screen is locked too,
+  so a rescue keyboard can type the password; one found blocked at startup is
+  admitted at once rather than queued. The price: anyone at the locked machine
+  can use that port as well.
 - **Root hubs** that appear after start (a new controller) are not closed.
 
 ## The test suite

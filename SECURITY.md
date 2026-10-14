@@ -40,11 +40,10 @@ It assumes that:
 
 Open, and listed on purpose. ROADMAP item numbers are in brackets.
 
-1. **The rescue port is held while the screen is locked.** The screen-lock
-   rule runs before the exemptions for internal ports and `--allow-port`, so a
-   keyboard plugged in at the lock screen stays blocked, even on the rescue
-   port. If your keyboard is USB, keep SSH access, or use
-   `--lock-policy ignore`.
+1. **The rescue port is open while the screen is locked.** Internal ports
+   and `--allow-port` are not gated behind a locked screen either, so a rescue
+   keyboard can type the password. Anyone else at the machine can use an
+   `--allow-port` port just as well: give one only if your keyboard is USB.
 2. **Keystrokes can slip through during stage 3.** The device is switched on
    before its input can be captured (`EVIOCGRAB`), and keys sent in that gap
    reach your session. `--close-race-window` does not fix this. Stages 3 and 4
@@ -58,34 +57,22 @@ Open, and listed on purpose. ROADMAP item numbers are in brackets.
    off.
 5. **A `--privsep` run started by hand uses the shared `nobody` account** by
    default. Any other process running as `nobody` can kill the analyzer, which
-   reopens the gate, or take over the desktop prompt's socket (it cannot
-   approve anything through it). The service runs the analyzer as its own
-   `probolos` account and is not affected; by hand, pass
-   `--privsep-user probolos` once that account exists [1.11, 1.13].
-6. **Processes started by a compromised analyzer can outlive it** on a run
-   from a terminal, and keep reading that terminal. Under the service, systemd
-   ends them with the unit [1.12].
-7. **The analyzer makes the decisions.** Privilege separation limits what a
+   reopens the gate. The service runs the analyzer as its own `probolos`
+   account and is not affected; by hand, pass `--privsep-user probolos` once
+   that account exists [1.11].
+6. **The analyzer makes the decisions.** Privilege separation limits what a
    compromised analyzer can make root do, but it can still allow or block
    devices, or exit, which reopens the gate.
-8. **Typing rhythm can be faked.** A device can imitate human timing
+7. **Typing rhythm can be faked.** A device can imitate human timing
    (Malboard, 2019), so `machine-generated-keystrokes` should be assumed
    beatable. The rule that matters is `unprompted-typing`: nobody should be
    typing on a device in quarantine at all, however human it looks.
-9. **Stage 4 is a hint, not a gate.** It knows a fixed set of filesystems, and
+8. **Stage 4 is a hint, not a gate.** It knows a fixed set of filesystems, and
    a device can delay its storage until the check gives up. Decisions rest on
    stages 1 and 2.
-10. **Root hubs added after start are not gated** (a new USB controller, for
-    example in a dock).
-11. **Smaller open items:**
-    - `--timeout` below about 12 s conflicts with the desktop prompt's 10 s minimum;
-    - after many replugs, an old refusal can drop out of a device's history;
-    - with `--lock-policy deny` and no desktop prompt, devices left blocked at
-      a start behind a locked screen are never asked about;
-    - with `--agent` and a socket that fails to open, devices are denied
-      instead of held;
-    - a zenity dialog that loses its display counts as "Keep blocked".
-12. **`--close-race-window` is experimental.** It turns off automatic driver
+9. **Root hubs added after start are not gated** (a new USB controller, for
+   example in a dock).
+10. **`--close-race-window` is experimental.** It turns off automatic driver
     binding for the whole system and may leave it off after a `SIGKILL`; it
     cannot be combined with `--privsep`.
 
@@ -130,8 +117,8 @@ obligations, so turn `--capture-payload` on deliberately.
 
 | Safety layer | What it covers |
 |---|---|
-| Internal ports | `removable=fixed` ports are not gated (unless `--gate-fixed-ports`), except while the screen is locked |
-| `--allow-port` | a rescue port that is never gated, except while the screen is locked |
+| Internal ports | `removable=fixed` ports are not gated (unless `--gate-fixed-ports`), even while the screen is locked |
+| `--allow-port` | a rescue port that is never gated, even while the screen is locked: anyone at the machine can use it too |
 | Watchdog | reopens the gate if Probolos stops making progress (`--watchdog`, default 60 s) |
 | Panic file | `sudo touch /run/probolos.panic` from another terminal or SSH; the watchdog checks for it |
 | Exit handling | the gate reopens on exit, crash and signals; `--release` afterwards |

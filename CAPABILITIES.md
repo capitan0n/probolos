@@ -144,8 +144,9 @@ their other functions on too. Its result is context: decisions rest on stages
 
 - **Screen locked:** a new device is held and asked about on unlock
   (`--lock-policy queue`, the default) or denied (`deny`). Either way nothing
-  gets in while the screen is locked, not even a remembered device. (`ignore`
-  takes no notice of the lock.)
+  gets in while the screen is locked, not even a remembered device, except on
+  an internal port or an `--allow-port` port (§1.9). (`ignore` takes no
+  notice of the lock.)
 - **Desktop prompt set up but not there** (the service at the login screen,
   during a logout, or while the agent restarts): a new device is **held**
   switched off, before stages 3 and 4, and asked about when the prompt is
@@ -169,8 +170,8 @@ measured. Limits: [SECURITY.md](SECURITY.md).
 A watchdog (`--watchdog`), the panic file (`/run/probolos.panic`, checked by
 the watchdog), `--release`, `--allow-port`, `--dry-run`, internal ports left
 ungated, and the bus state restored on every exit path, including a failed
-start and a lost analyzer. While the screen is locked, internal ports and
-`--allow-port` are held like any other (SECURITY.md, "Known weaknesses").
+start and a lost analyzer. Internal ports and `--allow-port` stay ungated
+while the screen is locked, so a rescue keyboard can type the password.
 
 ### 1.10 Hostile device text
 

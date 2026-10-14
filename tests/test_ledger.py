@@ -178,6 +178,27 @@ class TestDriftDetection(unittest.TestCase):
         self.assertEqual(found["previously-rejected"].severity,
                          rules.Severity.CRITICAL)
 
+    def test_a_refusal_is_not_washed_out_by_later_sightings(self):
+        """The decision list keeps the newest MAX_DECISIONS; twenty
+        unanswered plug-ins pushed the refusal out, and the countdown
+        with it."""
+        self.store.record(Dev(), "user rejected")
+        for _ in range(ledger_mod.MAX_DECISIONS + 5):
+            self.store.record(Dev(), "no answer")
+        entry = self.store.lookup(Dev())
+        self.assertEqual(len(entry.decisions), ledger_mod.MAX_DECISIONS)
+        self.assertEqual(entry.decisions[0], "user rejected")
+        self.assertEqual(entry.decisions[-1], "no answer")
+        self.assertIn("previously-rejected",
+                      [f.rule_id for f in self.analyze(Dev())])
+
+    def test_without_a_refusal_only_the_newest_are_kept(self):
+        for n in range(ledger_mod.MAX_DECISIONS + 5):
+            self.store.record(Dev(), f"no answer {n}")
+        entry = self.store.lookup(Dev())
+        self.assertEqual(entry.decisions[0], "no answer 5")
+        self.assertEqual(len(entry.decisions), ledger_mod.MAX_DECISIONS)
+
     def test_an_unanswered_prompt_is_not_a_previous_refusal(self):
         self.store.record(Dev(), "no answer")
         ids = [f.rule_id for f in self.analyze(Dev())]

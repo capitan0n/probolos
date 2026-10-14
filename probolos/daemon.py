@@ -220,8 +220,9 @@ class Probolos:
         # then stay queued until one connects, instead of being "asked" on a
         # stdin that reads EOF and denied.
         if self.pending and not self.dry_run:
-            if (self.lock_policy == session_mod.POLICY_IGNORE
-                    or not self.monitor.is_locked()):
+            self._admit_protected_held()
+            if self.pending and (self.lock_policy == session_mod.POLICY_IGNORE
+                                 or not self.monitor.is_locked()):
                 self._drain_pending()
 
         while True:
@@ -242,8 +243,16 @@ class Probolos:
             # about. Polling once a second is plenty: this is a human-timescale
             # event, and polling avoids depending on a session bus the
             # unprivileged analyzer cannot reach.
+            #
+            # Under "deny" too, while anything is held. That policy queues
+            # nothing itself, but devices found blocked at a locked start are
+            # queued all the same, and with no desktop agent to drain them
+            # nothing else ever did: they were never asked about.
             drained = False
-            if self.lock_policy == session_mod.POLICY_QUEUE and not self.dry_run:
+            watch_lock = (self.lock_policy == session_mod.POLICY_QUEUE
+                          or (self.lock_policy == session_mod.POLICY_DENY
+                              and self.pending))
+            if watch_lock and not self.dry_run:
                 locked = self.monitor.is_locked()
                 if locked is not None:
                     if self._was_locked and not locked:
@@ -452,21 +461,19 @@ class Probolos:
         if dev.is_root_hub:
             return
 
-        # ---- nobody is at the machine ------------------------------------
-        # Neither quarantine nor the storage scan runs while the screen is
-        # locked: both require switching the device on, and powering up unknown
-        # hardware while its owner is absent is the exact situation being
-        # defended against. Only the identity is recorded; the device stays
-        # dead until a human is back.
-        if self.lock_policy != session_mod.POLICY_IGNORE and not self.dry_run:
-            if self.monitor.is_locked():
-                self._hold_until_unlocked(dev)
-                return
-
         # SAFETY BEFORE SECURITY. A device on an internal port or on the
         # operator's allowlist is admitted without a question, because the cost
         # of being wrong here is somebody with no keyboard and no way to answer
         # the prompt that would give them one.
+        #
+        # Before the screen lock, not after it. The lock screen is where that
+        # cost is highest: it is the one prompt that cannot be answered
+        # without a keyboard. With the lock checked first, a rescue keyboard
+        # plugged in to type the password was held until an unlock it was
+        # needed for, and an internal device that re-enumerates on resume (a
+        # webcam, a Bluetooth adapter) was held behind the lock screen a
+        # suspend had just raised. Neither exemption was ever a question, so
+        # the lock has nothing to defer.
         protection = self.policy.is_protected(dev)
         if protection and not self.dry_run:
             try:
@@ -483,6 +490,17 @@ class Probolos:
                                   time.time()))
             self._watch_if_storage(dev, "admitted without prompt")
             return
+
+        # ---- nobody is at the machine ------------------------------------
+        # Neither quarantine nor the storage scan runs while the screen is
+        # locked: both require switching the device on, and powering up unknown
+        # hardware while its owner is absent is the exact situation being
+        # defended against. Only the identity is recorded; the device stays
+        # dead until a human is back.
+        if self.lock_policy != session_mod.POLICY_IGNORE and not self.dry_run:
+            if self.monitor.is_locked():
+                self._hold_until_unlocked(dev)
+                return
 
         findings = analyzers.run(analyzers.Context(
             device=dev, ledger=self.ledger, config=self.rule_config))
@@ -1068,6 +1086,35 @@ class Probolos:
                       f"device: {exc!r}. It stays BLOCKED.")
                 traceback.print_exc()
 
+    def _admit_protected_held(self) -> None:
+        """
+        Admit the held devices no question was ever needed for: those on an
+        internal port or on the operator's allowlist.
+
+        Only devices found blocked at startup can be here; one attached later
+        is admitted by _on_add before anything could hold it. They used to
+        wait for the drain with everything else, and the drain waits for an
+        unlock or an agent: a rescue keyboard left blocked by a run that died
+        could not type the password the unlock needed.
+        """
+        for name, (syspath, instance) in list(self.pending.items()):
+            dev = sysfs.load_device(syspath)
+            if dev is None or not self.policy.is_protected(dev):
+                continue
+            # Same identity check as the drain: the exemption belongs to the
+            # port, but the queue entry belongs to the device that was there.
+            if instance is not None and not self._still_same_device(
+                    syspath, instance):
+                continue
+            del self.pending[name]
+            try:
+                self._on_add(str(syspath), was_held=True)
+            except Exception as exc:   # noqa: BLE001 -- see _drain_pending
+                import traceback
+                print(f"[!] {name}: unhandled error while admitting this "
+                      f"protected device: {exc!r}. It stays BLOCKED.")
+                traceback.print_exc()
+
     @staticmethod
     def _still_same_device(syspath: Path, instance: tuple) -> bool:
         """
@@ -1397,6 +1444,26 @@ class Probolos:
             print(f"  trust was saved by the gate but cannot be read back "
                   f"here ({why}); this device will be asked about again")
 
+    def _agent_timeout(self, critical: bool) -> float:
+        """
+        How long the desktop question stays open: --timeout, within the
+        bounds the agent holds every dialog to, and for a CRITICAL device at
+        least that floor again after the countdown.
+
+        It used to be --timeout as given. The agent clamps it to at least
+        10 s, so under --timeout 5 the dialog stayed up after the analyzer had
+        stopped listening, and an answer given then was lost. A CRITICAL
+        device under anything below about 12 s could not be approved at all:
+        "Allow anyway" unlocked as the question ended.
+        """
+        seconds = self.timeout or agentlink.DEFAULT_DIALOG_TIMEOUT
+        seconds = max(agentlink.MIN_DIALOG_TIMEOUT,
+                      min(agentlink.MAX_DIALOG_TIMEOUT, seconds))
+        if critical:
+            seconds = max(seconds,
+                          CRITICAL_COUNTDOWN + agentlink.MIN_DIALOG_TIMEOUT)
+        return seconds
+
     def _ask(self, dev: sysfs.UsbDevice,
              findings=()) -> bool:
         """
@@ -1440,7 +1507,7 @@ class Probolos:
                 body=self._agent_body(dev, findings),
                 severity=rules.worst(findings).label if findings else "none",
                 allow_always=self._can_remember() and not critical,
-                timeout=self.timeout if self.timeout else 60.0,
+                timeout=self._agent_timeout(critical),
                 steps=steps,
                 capabilities=self._agent_capabilities(dev),
                 countdown=CRITICAL_COUNTDOWN if critical else 0,
@@ -1671,6 +1738,7 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
           agent_socket: Optional[Path] = None,
           agent_uid: Optional[int] = None,
           agent_gid: Optional[int] = None,
+          agent_listener=None,
           close_race_window: bool = False,
           watch_media: bool = False,
           media_policy: str = "log") -> None:
@@ -1684,8 +1752,11 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
         # fail confusingly while debugging. The uid that matters is the desktop
         # one -- everything else is refused and logged.
         permitted = None if agent_uid is None else {agent_uid, 0}
+        # Under --privsep the socket was bound by root before the privilege
+        # drop, and is only adopted here.
         link = agentlink.AgentLink(agent_socket, allowed_uids=permitted,
-                                   owner_uid=agent_uid, owner_gid=agent_gid)
+                                   owner_uid=agent_uid, owner_gid=agent_gid,
+                                   listener=agent_listener)
         if link.start():
             who = "any local process" if permitted is None else f"uid {agent_uid}"
             print(f"  - desktop agent socket: {agent_socket} "
@@ -1693,7 +1764,14 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
             print("    start the agent in your session with: "
                   "python -m probolos.agent")
         else:
-            link = None
+            # Kept, not dropped. With no link the run fell back to the
+            # terminal, and the service has none: every device was denied
+            # there as unanswered, as though it had been asked. A link that
+            # never connects keeps "nobody can be asked" true instead, so
+            # devices are held, as they are before anyone has logged in, and
+            # asked about at the next start.
+            print("[!] desktop agent socket unavailable: devices that cannot "
+                  "be asked in a terminal are held, not denied")
 
     monitor = session_mod.detect(force_locked)
     if lock_policy != session_mod.POLICY_IGNORE:

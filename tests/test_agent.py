@@ -1191,6 +1191,39 @@ class ADialogThatDiesIsNotAnAnswer(unittest.TestCase):
                     zenity.choose("t", "x", "once", "always", "no", 1.0),
                     expected)
 
+    def test_zenity_without_its_display_is_no_decision_not_cancel(self):
+        """
+        GTK exits 1 when it cannot open the display or loses it, which is
+        also zenity's Cancel: a dialog that never showed was recorded as a
+        refusal.
+        """
+        from probolos import dialogs
+        zenity = self._backend(dialogs.ZenityBackend)
+        lost = (b"(zenity:4242): Gtk-WARNING **: cannot open display: :0\n",
+                b"Gdk-Message: zenity: Fatal IO error 11 (Resource temporarily "
+                b"unavailable) on X server :0.\n",
+                b"Gdk-Message: Lost connection to Wayland compositor.\n",
+                b"Gdk-Message: Error 71 (Protocol error) dispatching to "
+                b"Wayland display.\n")
+        for stderr in lost:
+            done = mock.Mock(returncode=1, stdout="", stderr=stderr)
+            with self.subTest(stderr=stderr), mock.patch.object(
+                    dialogs.subprocess, "run", return_value=done):
+                self.assertIsNone(zenity.confirm("t", "x", "y", "n", 1.0))
+                self.assertIsNone(
+                    zenity.choose("t", "x", "once", "always", "no", 1.0))
+                self.assertIsNone(zenity.notice("t", "x", 1.0))
+        # GTK's everyday chatter on a real Cancel is still a Cancel.
+        chatter = mock.Mock(returncode=1, stdout="", stderr=(
+            b"Gtk-Message: GtkDialog mapped without a transient parent. "
+            b"This is discouraged.\n"))
+        with mock.patch.object(dialogs.subprocess, "run",
+                               return_value=chatter):
+            self.assertIs(zenity.confirm("t", "x", "y", "n", 1.0), False)
+            self.assertEqual(
+                zenity.choose("t", "x", "once", "always", "no", 1.0),
+                dialogs.CHOICE_NO)
+
     def test_a_dead_dialog_reaches_the_analyzer_as_no_decision(self):
         from probolos import agent as agent_mod
         from probolos import dialogs
@@ -1241,9 +1274,11 @@ class TestServePassesAgentUid(unittest.TestCase):
         captured = {}
         sentinel = RuntimeError("stop here")
 
-        def fake_link(path, allowed_uids=None, owner_uid=None, owner_gid=None):
+        def fake_link(path, allowed_uids=None, owner_uid=None, owner_gid=None,
+                      listener=None):
             captured["allowed_uids"] = allowed_uids
             captured["owner_uid"] = owner_uid
+            captured["listener"] = listener
             link = mock.Mock()
             # Stop serve() the instant the link is built, before it tries to
             # open the real USB gate (which needs /sys/bus/usb we do not have).
@@ -1266,6 +1301,14 @@ class TestServePassesAgentUid(unittest.TestCase):
         # root is always allowed alongside the desktop uid; see the comment in
         # serve() for why refusing uid 0 would buy nothing.
         self.assertEqual(captured["allowed_uids"], {1000, 0})
+
+    def test_a_listener_bound_by_root_is_adopted(self):
+        listener = object()
+        with tempfile.TemporaryDirectory() as d:
+            captured = self._run_serve(agent_socket=Path(d) / "sock",
+                                       agent_uid=1000,
+                                       agent_listener=listener)
+        self.assertIs(captured["listener"], listener)
 
     def test_no_agent_uid_means_no_restriction_recorded(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1569,6 +1612,81 @@ class SocketOwnership(unittest.TestCase):
             self.assertTrue(link.start())
         link.stop()
         chown.assert_not_called()
+
+
+class TheAnalyzerAdoptsASocketItCannotReplace(unittest.TestCase):
+    """
+    ROADMAP 1.13: the analyzer bound the agent socket in a directory its own
+    account owned, so any other process running as that account could unlink
+    it and listen in its place. Root binds it now and the analyzer adopts it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "agent.sock"
+
+    def test_an_adopted_listener_accepts_and_is_left_for_root_to_remove(self):
+        binder = agentlink.AgentLink(self.path, log=lambda *_a: None)
+        self.assertTrue(binder.listen())
+        self.addCleanup(binder.stop)
+        link = agentlink.AgentLink(self.path, log=lambda *_a: None,
+                                   allowed_uids={os.getuid()},
+                                   listener=binder.listener)
+        with mock.patch.object(link, "listen") as listen:
+            self.assertTrue(link.start())
+        listen.assert_not_called()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.connect(str(self.path))
+        deadline = time.monotonic() + 5
+        while not link.connected and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(link.connected)
+        link.stop()
+        self.assertTrue(stat.S_ISSOCK(os.lstat(self.path).st_mode),
+                        "the analyzer tried to remove root's socket")
+        binder.stop()
+        self.assertFalse(os.path.lexists(self.path))
+
+    @unittest.skipUnless(os.geteuid() == 0, "needs root to drop to nobody")
+    def test_the_analyzers_account_cannot_replace_the_socket(self):
+        import pwd
+        try:
+            nobody = pwd.getpwnam("nobody")
+        except KeyError:                                  # pragma: no cover
+            self.skipTest("no `nobody` account")
+        os.chmod(self.tmp.name, 0o755)
+        root = Path(self.tmp.name) / "probolos"
+        path = root / "agent.sock"
+        with mock.patch.object(agentlink, "DEFAULT_SOCKET", path):
+            agentlink.prepare_socket_dir(path, 0, nobody.pw_gid)
+        binder = agentlink.AgentLink(path, log=lambda *_a: None)
+        self.assertTrue(binder.listen())
+        self.addCleanup(binder.stop)
+
+        read_end, write_end = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_end)
+            try:
+                os.setgroups([])
+                os.setgid(nobody.pw_gid)
+                os.setuid(nobody.pw_uid)
+                try:
+                    os.unlink(path)
+                    result = b"replaced"
+                except PermissionError:
+                    result = b"refused"
+                os.write(write_end, result)
+            finally:
+                os._exit(0)
+        os.close(write_end)
+        result = os.read(read_end, 64)
+        os.close(read_end)
+        os.waitpid(pid, 0)
+        self.assertEqual(result, b"refused")
+        self.assertTrue(stat.S_ISSOCK(os.lstat(path).st_mode))
 
 
 class SocketDirectoryIsNotGroupWritable(unittest.TestCase):
@@ -2062,6 +2180,15 @@ class ConfirmationEndsBeforeTheAnalyzerStopsListening(unittest.TestCase):
             agent._ask_user({"title": "t", "body": "b"}, 60)
         second_timeout = agent.dialog.confirm.call_args_list[1].kwargs["timeout"]
         self.assertLessEqual(second_timeout, 60 - 50)
+
+    def test_the_first_dialog_ends_before_the_analyzer_stops_listening(self):
+        """At the 10 s floor the first dialog got 10 s and the analyzer's
+        budget was 9: an answer in the last second was lost."""
+        agent, _agent_mod = self.build()
+        agent.dialog.confirm.return_value = None
+        agent._ask_user({"title": "t", "body": "b"}, 10)
+        first = agent.dialog.confirm.call_args.kwargs["timeout"]
+        self.assertLessEqual(first, 10 - 1)
 
     def test_no_budget_left_is_no_decision_not_a_late_yes(self):
         """Out of time before the second dialog: never a yes, and not a
