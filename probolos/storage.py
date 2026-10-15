@@ -167,6 +167,9 @@ class MediumReport:
     error: Optional[str] = None
     detail: Optional[str] = None
     timed_out: bool = False
+    # How far a whole-device ISO 9660 volume at sector 0 reaches, when there
+    # is one behind a partition table (an isohybrid image). None otherwise.
+    whole_device_sectors: Optional[int] = None
 
     @property
     def inspected(self) -> bool:
@@ -432,6 +435,23 @@ def _both_endian(vd: bytes, offset: int, width: int) -> Optional[int]:
     return le if le == be else None
 
 
+def _iso9660_extent(data: bytes) -> Optional[int]:
+    """Bytes the ISO 9660 volume at sector 16 says it covers (validated
+    first by _iso9660_problem), or None."""
+    for index in range(OPTICAL_MAX_DESCRIPTORS):
+        start = OPTICAL_VD_START + index * OPTICAL_VD_STRIDE
+        vd = data[start:start + OPTICAL_VD_STRIDE]
+        if len(vd) < OPTICAL_VD_STRIDE or vd[1:6] != ISO9660_ID:
+            return None
+        if vd[0] == ISO_VD_TERMINATOR:
+            return None
+        if vd[0] == ISO_VD_PRIMARY:
+            blocks = _both_endian(vd, 80, 4)
+            block_size = _both_endian(vd, 128, 2)
+            return blocks * block_size if blocks and block_size else None
+    return None
+
+
 def _iso9660_problem(data: bytes, limit_bytes: Optional[int]) -> Optional[str]:
     """
     Why this is not an ISO 9660 volume, or None if it is one (ECMA-119).
@@ -546,6 +566,15 @@ def _udf_vrs_problem(data: bytes) -> Optional[str]:
 
 def _inspect_worker(device: str, conn, fd=None) -> None:
     """Runs inspect() in a child so a stalled read can be killed."""
+    # The fork carries the parent's signal handlers -- the gate's among them,
+    # which reopen it. SIGTERM is how a stalled read is ended, and it must
+    # end THIS process, not run the parent's shutdown in it.
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
     try:
         open_fn = (lambda _dev: fd) if fd is not None else None
         conn.send(("ok", inspect(device, open_fn=open_fn)))
@@ -715,6 +744,23 @@ def inspect(device: str, open_fn=None) -> MediumReport:
         elif partitions:
             report.scheme = "mbr"
             report.partitions = partitions
+            # An isohybrid image -- every dd-written Linux installer -- is an
+            # ISO 9660 filesystem at LBA 0 that ALSO carries an MBR. Only the
+            # table was reported, so the volume a desktop actually mounts
+            # (MANJARO_KDE_2601, say) read as "a large unused area". Same
+            # structural check as for an unpartitioned medium.
+            chunk = _read_at(fd, 0, PARTITION_SNIFF_READ)
+            if len(chunk) > len(data):
+                limit = (report.size_sectors * SECTOR
+                         if report.size_sectors else None)
+                optical, note = _identify_optical(chunk, limit)
+                if optical:
+                    report.signatures[-1] = optical
+                    extent = _iso9660_extent(chunk)
+                    if extent:
+                        report.whole_device_sectors = extent // SECTOR
+                if note:
+                    report.hollow_signatures.append(f"whole device: {note}")
         else:
             # No partition table. Common and legitimate: many USB sticks are
             # formatted as a "superfloppy", with a filesystem written directly

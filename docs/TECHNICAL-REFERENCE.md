@@ -63,8 +63,9 @@ leaves behind is handed to it rather than to init. The analyzer's exit ends
 the gate even when such a process still holds its end of the socket; the gate
 then kills and reaps every process below it (a 5 s budget, so one stuck in
 the kernel cannot hold the root side). An analyzer that closes its socket and
-keeps running is killed after 10 s. Under the service, systemd also ends the
-unit's cgroup.
+keeps running is killed after 10 s. Under the service the root side may not
+kill it (the unit's bounding set has no `CAP_KILL`), so it exits with a
+failure instead, and systemd ends the unit's cgroup and restarts it.
 
 **Why a killed analyzer reopens the gate.** Keeping the hubs closed when the
 analyzer is killed was considered and not done. The analyzer's own `SIGTERM`

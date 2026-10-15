@@ -16,6 +16,17 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ### Security
 
+- **The 2026-10-13 batch was never in the code.** Its fixes (the storage
+  reader below, the card-reader watch fixes, isohybrid images, `--history`
+  serials) were committed as `probolos-fixes.patch` and deleted again
+  unapplied, while this changelog listed them. They are applied now, with
+  their tests.
+- **The service could not end an analyzer that outlived its socket.** The
+  unit's bounding set has no `CAP_KILL`, and root without it may not signal
+  another uid: the 10 s `SIGKILL` failed unnoticed and root waited for as long
+  as the analyzer lived, the gate stopped and the unit still "active". When it
+  did exit, its status 0 was passed on, so `Restart=on-failure` never ran. The
+  gate now exits with a failure, and systemd ends what is left.
 - **A storage reader could reopen the gate.** The forked process that reads a
   medium inherited the armed gate and its signal handlers; killed with
   `SIGTERM` after a stall, it set `authorized_default=1` on every root hub

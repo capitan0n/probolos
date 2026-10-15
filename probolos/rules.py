@@ -921,12 +921,28 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
         first = min(partitions, key=lambda p: p.start_lba)
         if first.start_lba > _ALIGNMENT_TOLERANCE_SECTORS:
             mib = first.start_lba * storage_mod.SECTOR / (1024 * 1024)
+            whole = report.signatures.get(-1)
+            reach = getattr(report, "whole_device_sectors", None) or 0
+            hidden = ("space no filesystem describes, which is where data "
+                      "would go if it were meant not to be found by ordinary "
+                      "tools.")
+            if whole and reach >= first.start_lba - _ALIGNMENT_TOLERANCE_SECTORS:
+                why = (f"Here it holds a whole-device {whole} filesystem "
+                       "starting at sector 0: an isohybrid image, as written "
+                       "by every Linux installer, which is what a desktop "
+                       "mounts.")
+            elif whole:
+                # The volume's own size, not its presence, is what explains
+                # the gap: a tiny valid ISO must not vouch for gigabytes.
+                covers = reach * storage_mod.SECTOR / (1024 * 1024)
+                why = (f"A whole-device {whole} volume at sector 0 covers only "
+                       f"the first {covers:.1f} MiB; the rest is " + hidden)
+            else:
+                why = "A much larger gap is " + hidden
             add("large-unallocated-gap", Severity.NOTICE,
                 "A large unused area sits before the first partition",
                 f"The first partition begins {mib:.1f} MiB into the device. "
-                "Alignment normally accounts for 1 to 8 MiB. A much larger "
-                "gap is space no filesystem describes, which is where data "
-                "would go if it were meant not to be found by ordinary tools.")
+                f"Alignment normally accounts for 1 to 8 MiB. {why}")
 
     # -- 5. A GPT that contradicts its own protective MBR --------------------
     if report.scheme == "gpt":

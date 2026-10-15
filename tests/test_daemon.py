@@ -959,7 +959,15 @@ class DaemonWiring(unittest.TestCase):
             shown.extend(f.rule_id for f in findings)
             return True
 
-        with mock.patch.object(daemon_mod.sysfs, "admit_device"), \
+        order = []
+
+        def fence():
+            order.append("fence")
+            return 4242
+
+        with mock.patch.object(daemon_mod.sysfs, "admit_device",
+                               side_effect=lambda d: order.append("admit")), \
+             mock.patch.object(mediawatch, "uevent_seqnum", side_effect=fence), \
              mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
              mock.patch.object(engine, "_load_with_retry", return_value=dev), \
              mock.patch.object(engine, "_inspect_medium", return_value=esp), \
@@ -972,9 +980,54 @@ class DaemonWiring(unittest.TestCase):
             engine._on_add(str(dev.syspath))
         # The prompt shows what the watcher would say about the same card ...
         self.assertIn("media-efi-system-partition", shown)
-        # ... and the watcher is told this card was approved.
-        self.watch.register.assert_called_once_with(dev, "approved",
-                                                    medium=esp)
+        # ... and the watcher is told this card was approved, with the fence
+        # that keeps stage 4's own queued disk events out.
+        self.watch.register.assert_called_once()
+        args, kwargs = self.watch.register.call_args
+        self.assertEqual(args, (dev, "approved"))
+        self.assertIs(kwargs["medium"], esp)
+        # Read BEFORE the admission write, or the admitted disk's own events
+        # could fall at or below it and be dropped as stale.
+        self.assertEqual(order, ["fence", "admit"])
+        self.assertEqual(kwargs["seqnum_fence"], 4242)
+
+    def test_the_event_is_handled_before_the_slots_are_rechecked(self):
+        """tick() ahead of the event that brought a capacity reported the
+        card itself; the event then reported it a second time."""
+        stop = threading.Event()
+        order = []
+        event = mock.Mock(subsystem="block", action="change",
+                          sys_path="/sys/x/block/sdb", properties={})
+
+        class OneEvent:
+            def __init__(self):
+                self.given = False
+
+            def filter_by(self, **_kw):
+                pass
+
+            def start(self):
+                pass
+
+            def poll(self, timeout=None):
+                if self.given:
+                    stop.set()
+                    return None
+                self.given = True
+                return event
+
+        fake_pyudev = mock.Mock()
+        fake_pyudev.Monitor.from_netlink.return_value = OneEvent()
+        engine = daemon_mod.Probolos(monitor=session.AlwaysUnlocked(),
+                                     stop_event=stop, media_watch=self.watch)
+        with mock.patch.object(daemon_mod, "pyudev", fake_pyudev), \
+             mock.patch.object(engine, "_dispatch_safely",
+                               side_effect=lambda d: order.append("event")), \
+             mock.patch.object(engine, "_media_tick",
+                               side_effect=lambda: order.append("tick")), \
+             mock.patch("builtins.print"):
+            engine.run()
+        self.assertEqual(order[:2], ["event", "tick"])
 
     def test_a_policy_deauthorization_puts_the_reader_back_behind_the_gate(self):
         dev = make_device("1-2")

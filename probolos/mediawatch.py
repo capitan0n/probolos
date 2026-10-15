@@ -31,7 +31,8 @@ Two limits are stated wherever the result is shown rather than hidden here:
     own, but a desktop automounter (KDE's, GNOME's) asks it to on this very
     `change` when it is enabled, and a person can click the card open. Unless
     automount is inhibited for the disk (the udev rule in the README sets
-    UDISKS_AUTO=0), the medium may be mounted -- and the kernel fs driver may
+    UDISKS_IGNORE=1; UDISKS_AUTO=0 is only a hint, which KDE Plasma ignores),
+    the medium may be mounted -- and the kernel fs driver may
     have parsed it -- before or while it is read, and the result is post-hoc
     alerting, not prevention. Each report says which case it was.
   * LATENCY. Medium detection rides on the kernel's disk-event polling
@@ -79,6 +80,24 @@ SETTLE_SECONDS = 5.0
 # it is reported as a card the reader could not read. Field data (Genesys
 # 05e3:0749): a card that "Read Capacity" failed on came good ~10 s later.
 UNREADABLE_GRACE = 15.0
+# How long the layout an operator approved at admission is accepted. Long
+# enough for a card whose capacity arrives late (~10 s seen in the field),
+# short enough that a card put back much later is judged.
+APPROVAL_SECONDS = 30.0
+# tick() reports a late capacity only once it has seen it for this long: udev
+# opens the disk (making the size visible) BEFORE it runs its rules and
+# broadcasts, and the event it then delivers is the better report -- it
+# carries the udisks hints.
+CAPACITY_CONFIRM = 1.5
+UEVENT_SEQNUM = "/sys/kernel/uevent_seqnum"
+
+
+def uevent_seqnum() -> Optional[int]:
+    """The kernel's latest uevent number, or None if it cannot be read."""
+    try:
+        return int(Path(UEVENT_SEQNUM).read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 
 @dataclass
@@ -93,15 +112,31 @@ class Host:
     # disk name -> when it was first seen, or when watching began for a disk
     # that already existed (clock seconds)
     first_seen: Dict[str, float] = field(default_factory=dict)
-    # disk name -> [deadline, sys_path, count]: media changes that left the
-    # slot at 0 bytes, re-checked by tick() before anything is said
+    # disk name -> [deadline, sys_path, count, udisks hints, capacity first
+    # seen]: media changes that left the slot at 0 bytes, re-checked by tick()
+    # before anything is said
     zero: Dict[str, list] = field(default_factory=dict)
+    # disk name -> (layout, findings, accepted) of the last card judged in the
+    # slot, cleared when the slot is seen empty. `accepted` marks the card the
+    # operator approved at admission: it stays accepted until it is removed.
+    verdicts: Dict[str, tuple] = field(default_factory=dict)
     # Layouts the operator saw at admission and approved. The disk's own
     # `add` right after admission is that same card, and judging it again
     # would overrule a decision a person just made with the contents on screen.
     approved: Set[str] = field(default_factory=set)
+    # Starts with the host's first event after admission, not at
+    # registration: the loop may be busy with another device's prompt for
+    # longer than the window before it reads the reader's own disk events.
+    approved_until: Optional[float] = None
     # Disks a card has been reported for this run (for the wording only).
     reported: Set[str] = field(default_factory=set)
+    # Block events numbered at or below this predate the reader's admission:
+    # stage 4 switched the reader on and off before the prompt, and the disk
+    # add/remove that caused are still queued when watching begins. SCSI host
+    # numbers and sd names are reused, so they carry the SAME sys_path as the
+    # admitted disk -- a stale `remove` erased the slot, a stale `add` read
+    # the new card. Only the sequence number tells them apart.
+    fence: Optional[int] = None
 
 
 def layout_fingerprint(medium: storage.MediumReport) -> Optional[str]:
@@ -193,12 +228,14 @@ class MediaWatch:
     # ---- which hosts ----------------------------------------------------
 
     def register(self, dev: sysfs.UsbDevice, why: str,
-                 medium: Optional[storage.MediumReport] = None) -> bool:
+                 medium: Optional[storage.MediumReport] = None,
+                 seqnum_fence: Optional[int] = None) -> bool:
         """
         Start watching `dev` if it is a pure storage host. True if so.
 
         `medium` is what stage 4 showed the operator before they approved the
         device. Its layout is accepted once, for the disk's own arrival.
+        `seqnum_fence` is uevent_seqnum() read just before admission.
         """
         if not _is_storage_host(dev):
             return False
@@ -206,7 +243,8 @@ class MediaWatch:
             resolved = os.path.realpath(dev.syspath)
         except (OSError, ValueError):
             return False
-        host = Host(dev=dev, resolved=resolved, instance=dev.instance_id)
+        host = Host(dev=dev, resolved=resolved, instance=dev.instance_id,
+                    fence=seqnum_fence)
         approved = layout_fingerprint(medium) if medium is not None else None
         if approved:
             host.approved.add(approved)
@@ -257,11 +295,16 @@ class MediaWatch:
             # A sysfs name is a port. The instance is the device.
             try:
                 st = os.stat(host.resolved)
-                same = (st.st_dev, st.st_ino) == host.instance
             except OSError:
-                same = False
-            if not same:
+                # Gone: an ordinary unplug. Its disk `remove` arrives after
+                # the reader's directory has vanished, and the daemon reports
+                # the unplug itself; the alarm below is for a substitution.
                 self.unregister(name)
+                return None
+            if (st.st_dev, st.st_ino) != host.instance:
+                self.unregister(name)
+                self.log(f"[!] media watch: {name} is no longer the reader "
+                         f"that was admitted; it is no longer watched")
                 return None
             return host
         return None
@@ -276,18 +319,28 @@ class MediaWatch:
             return
         if properties.get("DEVTYPE", "disk") != "disk":
             return
-        if action == "remove":
-            for host in self.hosts.values():
-                host.slots.pop(disk, None)
-            return
-        if action not in ("add", "change"):
+        if action not in ("add", "change", "remove"):
             return
         host = self._host_of(sys_path)
         if host is None:
             return
+        seqnum = properties.get("SEQNUM")
+        if host.fence is not None and seqnum is not None:
+            try:
+                if int(seqnum) <= host.fence:
+                    return                  # queued before admission
+            except ValueError:
+                pass
+        now = self.clock()
+        if host.approved and host.approved_until is None:
+            host.approved_until = now + APPROVAL_SECONDS
+        if action == "remove":
+            host.slots.pop(disk, None)
+            host.zero.pop(disk, None)
+            host.verdicts.pop(disk, None)
+            return
 
         lun = self._lun(sys_path)
-        now = self.clock()
         if disk not in host.slots:
             host.first_seen[disk] = now
             problem = event_reporting_problem(sys_path)
@@ -303,6 +356,7 @@ class MediaWatch:
                          f"LUN {lun} ({disk})")
                 self._audit(host, disk, lun, "removed")
                 host.zero.pop(disk, None)
+                host.verdicts.pop(disk, None)
             elif media_change and not settling:
                 # The kernel says the medium changed, yet the slot reads
                 # 0 bytes. That used to be dropped here without a word -- and
@@ -312,24 +366,43 @@ class MediaWatch:
                 # so it is re-checked (tick) before anything is said.
                 pending = host.zero.get(disk)
                 if pending is None:
-                    host.zero[disk] = [now + UNREADABLE_GRACE, sys_path, 1]
+                    hints = {k: properties[k] for k in
+                             ("UDISKS_IGNORE", "UDISKS_AUTO") if k in properties}
+                    host.zero[disk] = [now + UNREADABLE_GRACE, sys_path, 1,
+                                       hints, None]
+                    self.log(f"[…] {host.dev.label()} LUN {lun} ({disk}): "
+                             f"media change, but no capacity yet; re-checking "
+                             f"for {UNREADABLE_GRACE:.0f} s")
                 else:
                     pending[2] += 1
             host.slots[disk] = EMPTY
             return
         host.zero.pop(disk, None)
-        inhibited = (properties.get("UDISKS_IGNORE") == "1"
-                     or properties.get("UDISKS_AUTO") == "0")
+        # UDISKS_AUTO=0 is only udisks' HintAuto: GNOME honours it, KDE
+        # Plasma's automounter (Solid) never reads it. Only UDISKS_IGNORE=1
+        # (HintIgnore) stops both, so only that may be called inhibited.
+        ignored = properties.get("UDISKS_IGNORE") == "1"
+        hinted = properties.get("UDISKS_AUTO") == "0"
         mounted_before = _mounted(disk)
         medium = self._inspect(disk)
         fingerprint = layout_fingerprint(medium)
         state = fingerprint or UNREADABLE
         # Partition rescans and repeated polls produce more than one `change`
-        # for one medium. Only the kernel's own media-change flag, or a
-        # different layout, is a new medium.
-        if not media_change and host.slots.get(disk) == state:
+        # for one medium: without the kernel's media-change flag, the layout
+        # the slot already holds is not news. WITH the flag it is judged
+        # below, and only then may it be folded into one line.
+        previous = host.slots.get(disk)
+        if previous == state and not media_change:
             return
         host.slots[disk] = state
+        locked = self.is_locked() is True
+        last = host.verdicts.get(disk)
+        # The card approved at admission keeps its acceptance until the slot
+        # is seen empty -- a unit attention after the window must not switch
+        # off a reader a person said yes to. Not while the screen is locked:
+        # nobody is there to have kept it in place.
+        still_accepted = (last is not None and last[2] and previous == state
+                          and last[0] == fingerprint and not locked)
 
         # Judge first, record after. The ledger used to be written before
         # the findings existed, so the first card ever seen in a slot became
@@ -345,31 +418,58 @@ class MediaWatch:
             if baseline is not None and baseline != fingerprint:
                 drift, drift_known = baseline, seen
 
+        # Any event may bring the approved card -- its own `add`, a unit
+        # attention, or tick() once a late capacity arrives -- but only for a
+        # while after approval.
         approved = (fingerprint is not None and fingerprint in host.approved
-                    and (not media_change or settling))
+                    and host.approved_until is not None
+                    and now <= host.approved_until)
+        exempt = approved or still_accepted
         findings = sorted(
             rules.storage_findings(medium, self.rule_config)
             + rules.media_findings(medium,
-                                   drift=None if approved else drift,
+                                   drift=None if exempt else drift,
                                    drift_known=drift_known,
-                                   locked=(not approved
-                                           and self.is_locked() is True),
+                                   locked=not exempt and locked,
                                    config=self.rule_config),
             key=lambda f: f.severity, reverse=True)
+        verdict = frozenset((f.rule_id, f.severity) for f in findings)
+
+        # A media change with the layout AND findings the slot already holds,
+        # and no removal seen in between: the reader announcing the same card
+        # again (a unit attention after re-configuration, or an open). Field
+        # case: one card reported three times in full. Folded into one line
+        # only when nothing would differ: not while locked, not when the
+        # findings changed (the layout does not cover everything a report
+        # shows), and not when a switch-off is still to be done.
+        if (media_change and previous == state and fingerprint is not None
+                and last is not None and last[0] == fingerprint
+                and last[1] == verdict and not locked
+                and (rules.worst(findings) < rules.Severity.CRITICAL
+                     or last[2] or self.policy != POLICY_DEAUTHORIZE)):
+            self.log(f"[◌] {report.one_liner(host.dev)} LUN {lun} ({disk}): "
+                     f"media change with the same layout and findings as the "
+                     f"card already here, no removal seen; not reported again")
+            self._audit(host, disk, lun, "re-announced",
+                        fingerprint=fingerprint, findings=findings)
+            return
 
         # A layout that earned a CRITICAL is never learned as "seen in this
         # slot": it must not become the baseline, nor make a returning copy
         # of itself read as familiar. Its structural findings fire anyway.
+        recorded = False
         if (self.ledger is not None and fingerprint is not None
                 and rules.worst(findings) < rules.Severity.CRITICAL):
             self.ledger.record_media(host.dev, lun, fingerprint)
+            recorded = True
             error = self.ledger.save()
             if error:
                 self.log(f"[!] could not write ledger: {error}")
 
-        if approved:
+        if exempt:
             # One use only: the same card taken out and put back is judged.
             host.approved.discard(fingerprint)
+            host.verdicts[disk] = (fingerprint, verdict, True)
             host.reported.add(disk)
             self.log(f"[◉] {report.one_liner(host.dev)} LUN {lun} ({disk}): "
                      f"the card shown when this reader was approved; not "
@@ -379,14 +479,15 @@ class MediaWatch:
             return
 
         if self.ledger is not None:
-            first = fingerprint is not None and not slot_known
+            # Only when it WAS recorded: a CRITICAL card never is.
+            first = recorded and not slot_known
             note = " — first card recorded for this slot" if first else ""
         else:
             first = disk not in host.reported
             note = " — first card seen in this slot this run" if first else ""
         host.reported.add(disk)
 
-        timing = self._timing(mounted_before, inhibited)
+        timing = self._timing(mounted_before, ignored, hinted)
         self.log("")
         self.log(f"[▣] CARD CHANGE — {report.one_liner(host.dev)} "
                  f"LUN {lun} ({disk})" + note)
@@ -396,6 +497,7 @@ class MediaWatch:
             self.log("  GPT entries are not where the header read reaches; "
                      "EFI and hidden-partition checks did not run.")
 
+        host.verdicts[disk] = (fingerprint, verdict, False)
         enforcement = self._enforce(host, findings)
         self._audit(host, disk, lun, "inserted", medium=medium,
                     fingerprint=fingerprint, drift=drift, findings=findings,
@@ -416,11 +518,21 @@ class MediaWatch:
         """
         now = self.clock()
         for host in list(self.hosts.values()):
-            for disk, (deadline, sys_path, count) in list(host.zero.items()):
+            for disk, entry in list(host.zero.items()):
+                deadline, sys_path, count, hints, seen_at = entry
                 if storage.read_size_sectors(f"/dev/{disk}"):
+                    # Seen first here, the capacity is usually udev still
+                    # processing the event that brought it; that event wins
+                    # (handle() clears this entry) unless it never comes.
+                    if seen_at is None:
+                        entry[4] = now
+                        continue
+                    if now - seen_at < CAPACITY_CONFIRM:
+                        continue
                     host.zero.pop(disk, None)
                     self.handle("change", sys_path,
-                                {"DEVTYPE": "disk", "DISK_MEDIA_CHANGE": "1"})
+                                dict({"DEVTYPE": "disk",
+                                      "DISK_MEDIA_CHANGE": "1"}, **hints))
                     continue
                 if now < deadline:
                     continue
@@ -474,15 +586,21 @@ class MediaWatch:
         return medium
 
     @staticmethod
-    def _timing(mounted_before: bool, inhibited: bool) -> str:
+    def _timing(mounted_before: bool, ignored: bool, hinted: bool) -> str:
         if mounted_before:
             return ("automount: the card was ALREADY MOUNTED when it was "
                     "read -- this is post-hoc alerting, not prevention")
-        if inhibited:
-            return ("automount: inhibited for udisks on this disk, so this "
-                    "read came first (other automounters are not covered)")
-        return ("automount: NOT inhibited on this disk -- udisks may mount it "
-                "during or after this read; treat this as post-hoc alerting")
+        if ignored:
+            return ("automount: inhibited for udisks on this disk "
+                    "(UDISKS_IGNORE=1), so this read came first (automounters "
+                    "that bypass udisks are not covered)")
+        if hinted:
+            return ("automount: only hinted off (UDISKS_AUTO=0) -- GNOME "
+                    "honours that, KDE Plasma does not; the desktop may mount "
+                    "it during or after this read")
+        return ("automount: NOT inhibited on this disk -- the desktop may "
+                "mount it during or after this read; treat this as post-hoc "
+                "alerting")
 
     def _enforce(self, host: Host, findings) -> str:
         if rules.worst(findings) < rules.Severity.CRITICAL:
@@ -490,6 +608,9 @@ class MediaWatch:
         if self.policy != POLICY_DEAUTHORIZE:
             self.log("  CRITICAL finding; --media-policy is 'log', so the "
                      "reader stays authorized.")
+            self.log("  The card is NOT blocked: your desktop may mount it. "
+                     "--media-policy deauthorize switches the whole reader "
+                     "off instead.")
             return "logged (policy: log)"
         # The last look at the instance before the write: the direct backend
         # has no gate to make this check for it.
@@ -497,6 +618,9 @@ class MediaWatch:
             st = os.stat(host.resolved)
             if (st.st_dev, st.st_ino) != host.instance:
                 self.unregister(host.dev.name)
+                self.log(f"[!] media watch: {host.dev.name} was replaced "
+                         f"before it could be switched off; nothing was "
+                         f"enforced and it is no longer watched")
                 return "not enforced: the reader was replaced"
             sysfs.set_authorized(host.dev.syspath, 0)
         except OSError as exc:
@@ -530,8 +654,11 @@ class MediaWatch:
             "disk": disk,
             "lun": lun,
         }
-        if what == "approved-at-admission":
+        if what in ("approved-at-admission", "re-announced"):
             entry["layout"] = fingerprint
+        if what == "re-announced":
+            entry["verdict"] = rules.worst(findings).label
+            entry["findings"] = [f.rule_id for f in findings]
         if what == "inserted":
             entry.update({
                 "layout": fingerprint,

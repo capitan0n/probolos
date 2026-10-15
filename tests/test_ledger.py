@@ -1127,5 +1127,26 @@ class RemovalWaitsForTheDaemon(unittest.TestCase):
         self.assertEqual(order, ["claim", "load"])
 
 
+class SerialsShowTheirDistinguishingEnd(unittest.TestCase):
+    """'000000001532' was shown as '(00000000)' -- the digits that tell
+    units of one model apart were the ones cut off."""
+
+    def row(self, identity, verbose=False):
+        from probolos import history
+        entry = Entry.from_raw(dict(GOOD, identity=identity))
+        return history.format_table([entry], verbose=verbose)
+
+    def test_the_tail_is_kept(self):
+        out = self.row("05e3:0749:000000001532")
+        self.assertIn("05e3:0749 (\u2026000001532)", out)
+
+    def test_a_short_serial_is_whole(self):
+        self.assertIn("1234:5678 (ABC123)", self.row("1234:5678:ABC123"))
+
+    def test_verbose_shows_the_whole_serial(self):
+        out = self.row("05e3:0749:000000001532", verbose=True)
+        self.assertRegex(out, r"serial +: 000000001532")
+
+
 if __name__ == "__main__":
     unittest.main()

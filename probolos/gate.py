@@ -23,6 +23,7 @@ documents the one-line manual recovery.
 from __future__ import annotations
 
 import atexit
+import os
 import signal
 import threading
 import sys
@@ -40,6 +41,15 @@ class AuthorizationGate:
         self.log = log
         self._original: Dict[Path, int] = {}
         self._armed = False
+        # Only the process that closed the gate may reopen it. A forked child
+        # -- the storage reader in inspect_safely -- inherits this object
+        # armed, the signal handlers that call restore(), and under --privsep
+        # the socket to the root gate. When the parent ended a stalled read
+        # with SIGTERM, the child ran the handler and wrote
+        # authorized_default=1 to every hub, while the parent went on
+        # believing the gate was closed: a fail-open a hostile medium could
+        # time.
+        self._owner_pid = os.getpid()
         self._previous_handlers: Dict[int, object] = {}
         # restore() has three callers that do not coordinate: the watchdog
         # thread (on_stall -> opened.restore()), the main thread on the way out
@@ -59,6 +69,7 @@ class AuthorizationGate:
             raise RuntimeError("no USB root hubs found under /sys/bus/usb/devices")
 
         self._armed = True
+        self._owner_pid = os.getpid()
         self._install_handlers()
         atexit.register(self.restore)
         try:
@@ -106,7 +117,7 @@ class AuthorizationGate:
             self._restore_locked()
 
     def _restore_locked(self) -> None:
-        if not self._armed:
+        if not self._armed or os.getpid() != self._owner_pid:
             return
         remaining = {}
         for hub, value in list(self._original.items()):
@@ -146,6 +157,9 @@ class AuthorizationGate:
         self._previous_handlers.clear()
 
     def _on_signal(self, signum, _frame):
+        if os.getpid() != self._owner_pid:
+            # A forked child that kept the handler: end it, reopen nothing.
+            os._exit(128 + signum)
         self.log(f"\n[signal {signal.Signals(signum).name}] shutting down")
         self.restore()
         # Re-raise as a normal exit so `finally` blocks upstream still run.

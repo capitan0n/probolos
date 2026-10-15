@@ -677,8 +677,17 @@ class WatcherBehaviour(WatcherTestBase):
 
     def test_the_report_says_when_automount_was_inhibited(self):
         w = self.watcher()
-        self.change(w, {"UDISKS_AUTO": "0"})
+        self.change(w, {"UDISKS_IGNORE": "1"})
         self.assertIn("inhibited for udisks", self.output())
+
+    def test_udisks_auto_alone_is_not_called_inhibited(self):
+        """UDISKS_AUTO=0 is udisks' HintAuto: GNOME honours it, KDE Plasma's
+        automounter never reads it. Calling it inhibited told KDE users their
+        read came first when the card was being mounted."""
+        w = self.watcher()
+        self.change(w, {"UDISKS_AUTO": "0"})
+        self.assertNotIn("inhibited for udisks", self.output())
+        self.assertIn("KDE Plasma does not", self.output())
 
     def test_the_report_says_when_automount_was_not_inhibited(self):
         w = self.watcher()
@@ -807,6 +816,9 @@ class UnreadableCards(WatcherTestBase):
         self.change(w)
         self.size = 62333952
         w.tick()
+        self.assertNotIn("CARD CHANGE", self.output(), "udev gets its turn")
+        self.clock.now += mediawatch.CAPACITY_CONFIRM
+        w.tick()
         self.assertIn("CARD CHANGE", self.output())
         self.assertNotIn("UNREADABLE", self.output())
         self.assertFalse(w.waiting())
@@ -850,6 +862,223 @@ class UnreadableCards(WatcherTestBase):
         self.assertIn("does not report media changes", self.output())
 
 
+class ReannouncedCardsAndStaleEvents(UnreadableCards):
+    """Field case: one card, never moved, reported three times in full."""
+
+    def test_the_same_card_announcing_itself_again_is_one_line(self):
+        w = self.watcher()
+        self.change(w)
+        self.change(w)
+        self.change(w)
+        self.assertEqual(self.output().count("CARD CHANGE"), 1)
+        self.assertEqual(self.output().count("not reported again"), 2)
+        entry = json.loads(self.logfile.read_text().splitlines()[-1])
+        self.assertEqual(entry["action"], "re-announced")
+        self.assertIn("verdict", entry)
+
+    def test_different_findings_are_reported_in_full(self):
+        """The layout does not cover everything a report shows: a swap the
+        reader never showed empty, to a card with the same table but a planted
+        signature, must not be folded into "the same card"."""
+        w = self.watcher()
+        self.change(w)
+        self.card = medium(**FAT_CARD)
+        self.card.hollow_signatures = [
+            "partition 1: ISO 9660 signature at sector 16, but planted"]
+        self.change(w)
+        self.assertEqual(self.output().count("CARD CHANGE"), 2)
+
+    def test_a_critical_card_under_log_is_reported_once(self):
+        """The field case: a Ventoy card, reported three times in full."""
+        self.card = medium(**ESP_CARD)
+        w = self.watcher()
+        self.change(w)
+        self.change(w)
+        self.change(w)
+        self.assertEqual(self.output().count("CARD CHANGE"), 1)
+
+    def test_a_failed_switch_off_is_retried(self):
+        self.card = medium(**ESP_CARD)
+        w = self.watcher(policy=mediawatch.POLICY_DEAUTHORIZE)
+        with mock.patch.object(sysfs, "set_authorized",
+                               side_effect=OSError("busy")):
+            self.change(w)
+            self.change(w)
+        self.assertEqual(self.output().count("COULD NOT DEAUTHORIZE"), 2)
+
+    def test_tick_waits_for_the_event_udev_is_still_processing(self):
+        self.size = 0
+        w = self.watcher()
+        self.settled()
+        self.change(w)
+        self.size = 62333952
+        w.tick()                             # capacity seen, event pending
+        self.change(w)                       # udev delivers it
+        self.clock.now += 5
+        w.tick()
+        self.assertEqual(self.output().count("CARD CHANGE"), 1)
+        self.assertNotIn("not reported again", self.output())
+
+    def test_tick_keeps_the_udisks_hints(self):
+        self.size = 0
+        w = self.watcher()
+        self.settled()
+        self.change(w, {"UDISKS_IGNORE": "1"})
+        self.size = 62333952
+        w.tick()
+        self.clock.now += mediawatch.CAPACITY_CONFIRM
+        w.tick()
+        self.assertIn("inhibited for udisks", self.output())
+
+    def test_a_removal_after_admission_is_honoured(self):
+        w = mediawatch.MediaWatch(ledger=self.ledger, json_log=self.logfile,
+                                  log=self.lines.append, clock=FakeClock())
+        self.assertTrue(w.register(self.reader, "approved", seqnum_fence=500))
+        w.handle("add", str(self.disk), {"DEVTYPE": "disk", "SEQNUM": "501"})
+        w.handle("remove", str(self.disk), {"DEVTYPE": "disk", "SEQNUM": "502"})
+        w.handle("add", str(self.disk), {"DEVTYPE": "disk", "SEQNUM": "503"})
+        self.assertEqual(self.output().count("CARD CHANGE"), 2)
+
+    def test_a_remove_touches_only_its_own_reader(self):
+        other_host = Path(self.tmp.name) / "sys/devices/pci0/usb1/1-3"
+        other_lun = other_host / "1-3:1.0/host7/target7:0:0/7:0:0:0"
+        (other_lun / "block/sdz").mkdir(parents=True)
+        w = self.watcher()
+        self.assertTrue(w.register(FakeReader(other_host), "test"))
+        w.handle("remove", str(self.disk), {"DEVTYPE": "disk"})
+        self.assertNotIn("sdz", w.hosts["1-2"].slots)
+        self.assertIn("sdz", w.hosts["1-3"].slots)
+
+    def test_an_unplug_is_not_called_a_substitution(self):
+        """The disk's remove arrives after the reader's directory is gone;
+        that printed the 'no longer the reader that was admitted' alarm on
+        every unplug."""
+        w = self.watcher()
+        shutil.rmtree(self.host)
+        w.handle("remove", str(self.disk), {"DEVTYPE": "disk"})
+        self.assertNotIn("[!]", self.output())
+        self.assertNotIn("1-2", w.hosts)
+
+    def test_a_reader_replaced_before_switch_off_is_said(self):
+        self.card = medium(**ESP_CARD)
+        w = self.watcher(policy=mediawatch.POLICY_DEAUTHORIZE)
+        host = w.hosts["1-2"]
+        host.instance = (0, 0)
+        result = w._enforce(host, rules.media_findings(self.card))
+        self.assertEqual(result, "not enforced: the reader was replaced")
+        self.assertIn("was replaced", self.output())
+        self.assertEqual(self.writes, [])
+
+    def test_a_removal_in_between_makes_it_a_new_card(self):
+        w = self.watcher()
+        self.change(w)
+        self.size = 0
+        self.change(w)
+        self.size = 62333952
+        self.change(w)
+        self.assertEqual(self.output().count("CARD CHANGE"), 2)
+
+    def test_while_locked_it_is_reported_in_full(self):
+        w = self.watcher(locked=True)
+        self.change(w)
+        self.change(w)
+        self.assertEqual(self.output().count("CARD CHANGE"), 2)
+
+    def test_events_queued_before_admission_are_ignored(self):
+        """Stage 4's own disk add/remove carry the SAME sys_path as the
+        admitted disk (host numbers and sd names are reused)."""
+        w = mediawatch.MediaWatch(ledger=self.ledger, json_log=self.logfile,
+                                  log=self.lines.append, clock=FakeClock())
+        self.assertTrue(w.register(self.reader, "approved", seqnum_fence=500))
+        props = {"DEVTYPE": "disk", "SEQNUM": "499"}
+        w.handle("remove", str(self.disk), props)
+        w.handle("add", str(self.disk), props)
+        self.assertEqual(self.inspected, [])
+        self.assertIn("sdz", w.hosts["1-2"].slots, "stale remove ignored")
+        w.handle("add", str(self.disk), {"DEVTYPE": "disk", "SEQNUM": "501"})
+        self.assertIn("CARD CHANGE", self.output())
+
+    def test_a_recheck_says_it_is_waiting(self):
+        self.size = 0
+        w = self.watcher()
+        self.settled()
+        self.change(w)
+        self.assertIn("no capacity yet; re-checking", self.output())
+
+    def test_a_replaced_reader_is_said_to_be_dropped(self):
+        w = self.watcher()
+        w.hosts["1-2"].instance = (0, 0)
+        self.change(w)
+        self.assertIn("no longer watched", self.output())
+
+
+class ApprovalWindow(WatcherTestBase):
+    """The approval was used up by the first matching event and needed that
+    event to carry no media-change flag; a card whose capacity arrived late
+    (tick, after the settle window) was judged again and, under deauthorize,
+    switched off after the operator said yes."""
+
+    def register(self, clock):
+        self.card = medium(**ESP_CARD)
+        w = mediawatch.MediaWatch(
+            policy=mediawatch.POLICY_DEAUTHORIZE, ledger=self.ledger,
+            json_log=self.logfile, log=self.lines.append, clock=clock,
+            on_deauthorized=lambda dev, f: self.deauthorized.append(dev))
+        self.size = 0
+        self.assertTrue(w.register(self.reader, "approved", medium=self.card))
+        return w
+
+    def test_a_late_capacity_within_the_window_is_the_approved_card(self):
+        clock = FakeClock()
+        w = self.register(clock)
+        clock.now += mediawatch.SETTLE_SECONDS + 1
+        self.change(w)                       # media change at 0 bytes
+        self.size = 62333952
+        w.tick()                             # capacity seen ...
+        clock.now += mediawatch.CAPACITY_CONFIRM
+        w.tick()                             # ... and synthesized
+        self.assertIn("not judged again", self.output())
+        self.assertEqual(self.writes, [])
+        self.change(w)                       # and a unit attention after it
+        self.assertEqual(self.writes, [])
+        self.assertIn("not reported again", self.output())
+
+    def test_the_window_starts_with_the_readers_own_disk(self):
+        """The loop can be busy with another device's prompt for longer than
+        the window before it reads the approved reader's disk events."""
+        clock = FakeClock()
+        w = self.register(clock)
+        clock.now += 120                     # another prompt, answered slowly
+        self.size = 62333952
+        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})
+        self.assertIn("not judged again", self.output())
+        self.assertEqual(self.writes, [])
+
+    def test_the_approved_card_stays_accepted_until_removed(self):
+        clock = FakeClock()
+        w = self.register(clock)
+        self.size = 62333952
+        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})
+        clock.now += mediawatch.APPROVAL_SECONDS * 4
+        self.change(w)                       # a unit attention much later
+        self.assertEqual(self.writes, [])
+        self.size = 0
+        self.change(w)                       # taken out ...
+        self.size = 62333952
+        self.change(w)                       # ... and put back: judged
+        self.assertEqual(self.writes, [(str(self.host), 0)])
+
+    def test_after_the_window_it_is_judged(self):
+        clock = FakeClock()
+        w = self.register(clock)
+        w.handle("add", str(self.disk), {"DEVTYPE": "disk"})  # empty: window on
+        clock.now += mediawatch.APPROVAL_SECONDS + 1
+        self.size = 62333952
+        self.change(w)
+        self.assertIn("CARD CHANGE", self.output())
+        self.assertEqual(self.writes, [(str(self.host), 0)])
+
+
 class MediaBaselineIsJudgedBeforeItIsKept(WatcherTestBase):
     """The first card ever seen in a slot became its permanent baseline,
     recorded before it was judged -- a card that got the reader switched off
@@ -879,6 +1108,13 @@ class MediaBaselineIsJudgedBeforeItIsKept(WatcherTestBase):
         self.change(w)
         self.assertEqual(self.output().count("A card this slot has never seen"),
                          2)
+
+    def test_a_critical_card_is_not_called_recorded(self):
+        self.card = medium(**ESP_CARD)
+        w = self.watcher()
+        self.change(w)
+        self.assertNotIn("first card recorded", self.output())
+        self.assertIn("The card is NOT blocked", self.output())
 
     def test_first_card_wording_follows_the_ledger(self):
         w = self.watcher()
@@ -925,6 +1161,159 @@ class TheApprovedCardIsNotJudgedAgain(WatcherTestBase):
         self.card = medium(**ESP_CARD)
         w.handle("add", str(self.disk), {"DEVTYPE": "disk"})
         self.assertIn("CARD CHANGE", self.output())
+
+
+class IsohybridImages(_Inspect):
+    """Every dd-written Linux installer is ISO 9660 at sector 0 WITH an MBR.
+    Only the table was reported; the volume a desktop mounts read as "a large
+    unused area" (field case: MANJARO_KDE_2601)."""
+
+    def image(self):
+        data = _media.iso9660_image(DEVICE_BYTES)
+        data[:512] = mbr((0xEF, 200, 8, False))
+        return data
+
+    def test_the_whole_device_filesystem_is_reported(self):
+        medium_report = self.inspect(self.image())
+        self.assertEqual(medium_report.scheme, "mbr")
+        self.assertEqual(medium_report.signatures.get(-1), "ISO 9660")
+        text = report.render_medium(medium_report, [])
+        self.assertIn("isohybrid", text)
+
+    def gap(self, volume_blocks):
+        data = _media.iso9660_image(DEVICE_BYTES, volume_blocks=volume_blocks)
+        data[:512] = mbr((0xEF, 200, 8, False))
+        medium_report = self.inspect(data, sectors=200 * 1024)
+        medium_report.partitions[0].start_lba = 100000
+        found = [f for f in rules.storage_findings(medium_report)
+                 if f.rule_id == "large-unallocated-gap"]
+        self.assertTrue(found)
+        return found[0].explanation
+
+    def test_a_volume_reaching_the_partition_explains_the_gap(self):
+        self.assertIn("isohybrid", self.gap(volume_blocks=25000))
+
+    def test_a_tiny_volume_does_not_vouch_for_the_gap(self):
+        """A 128 KiB ISO must not make a 49 MiB gap read as an installer."""
+        why = self.gap(volume_blocks=64)
+        self.assertNotIn("isohybrid", why)
+        self.assertIn("covers only the first", why)
+        self.assertIn("no filesystem describes", why)
+
+    def test_bare_magic_is_still_not_a_filesystem(self):
+        data = bytearray(DEVICE_BYTES)
+        data[:512] = mbr((0x0C, 2048, 100, False))
+        data[0x8001:0x8006] = b"CD001"
+        medium_report = self.inspect(data)
+        self.assertNotIn(-1, medium_report.signatures)
+        # ... and the check that ran says so, as it does without a table.
+        self.assertTrue(any(h.startswith("whole device:")
+                            for h in medium_report.hollow_signatures))
+        self.assertIn("filesystem-signature-without-structure",
+                      [f.rule_id for f in
+                       rules.storage_findings(medium_report)])
+
+
+class TheReaderChildCannotReopenTheGate(unittest.TestCase):
+    """The forked reader inherited the gate's signal handlers and the armed
+    gate. Ended with SIGTERM after a stall, it ran the handler and wrote
+    authorized_default=1 to every hub while the parent believed the gate was
+    closed."""
+
+    def test_the_worker_drops_inherited_handlers(self):
+        import signal as signal_mod
+        previous = {s: signal_mod.getsignal(s)
+                    for s in (signal_mod.SIGTERM, signal_mod.SIGHUP)}
+        try:
+            for sig in previous:
+                signal_mod.signal(sig, lambda *_: None)
+            conn = mock.Mock()
+            with mock.patch.object(storage, "inspect",
+                                   return_value=storage.MediumReport("x")):
+                storage._inspect_worker("/dev/sdz", conn)
+            for sig in previous:
+                self.assertEqual(signal_mod.getsignal(sig), signal_mod.SIG_DFL)
+        finally:
+            for sig, handler in previous.items():
+                signal_mod.signal(sig, handler)
+            signal_mod.signal(signal_mod.SIGINT, signal_mod.default_int_handler)
+
+    def test_a_forked_child_that_gets_the_signal_exits_quietly(self):
+        import multiprocessing
+        import signal as signal_mod
+        from probolos import gate as gate_mod
+        g = gate_mod.AuthorizationGate(log=lambda *_: None)
+        g._original = {Path("/sys/bus/usb/devices/usb1"): 1}
+        g._armed = True
+        ctx = multiprocessing.get_context("fork")
+        proc = ctx.Process(target=g._on_signal,
+                           args=(signal_mod.SIGTERM, None))
+        proc.start()
+        proc.join(10)
+        self.assertEqual(proc.exitcode, 128 + signal_mod.SIGTERM)
+        self.assertTrue(g._armed, "the parent's gate is untouched")
+
+    def test_a_forked_child_cannot_restore_the_gate(self):
+        import multiprocessing
+        from probolos import gate as gate_mod
+        g = gate_mod.AuthorizationGate(log=lambda *_: None)
+        g._original = {Path("/sys/bus/usb/devices/usb1"): 1}
+        g._armed = True
+        writes = []
+        ctx = multiprocessing.get_context("fork")
+        parent, child = ctx.Pipe()
+
+        def in_child():
+            g.restore()
+            child.send(list(writes))
+
+        with mock.patch.object(gate_mod.sysfs, "set_authorized_default",
+                               side_effect=lambda hub, v: writes.append(v)):
+            proc = ctx.Process(target=in_child)
+            proc.start()
+            proc.join(10)
+            self.assertEqual(parent.recv(), [], "the child wrote the hubs")
+            g.restore()                      # the owner still can
+        self.assertEqual(writes, [1])
+
+    def test_a_stall_ended_by_sigterm_leaves_the_gate_closed(self):
+        """End to end: the gate armed in this process, a read that outlasts
+        the timeout and is still running when SIGTERM arrives. Nothing but
+        this process may write the hubs."""
+        import time
+        from probolos import gate as gate_mod
+        record = Path(self._tmp()) / "writes"
+
+        def write(hub, value):
+            with open(record, "a") as fh:
+                fh.write(f"{os.getpid()} {value}\n")
+
+        def stall(device, open_fn=None):
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+            return storage.MediumReport(device)
+
+        hub = Path("/sys/bus/usb/devices/usb1")
+        with mock.patch.object(gate_mod.sysfs, "list_root_hubs",
+                               return_value=[hub]), \
+                mock.patch.object(gate_mod.sysfs, "get_authorized_default",
+                                  return_value=1), \
+                mock.patch.object(gate_mod.sysfs, "set_authorized_default",
+                                  side_effect=write):
+            with gate_mod.AuthorizationGate(log=lambda *_: None):
+                with mock.patch.object(storage, "inspect", side_effect=stall):
+                    medium = storage.inspect_safely("/dev/sdz", timeout=0.3)
+                self.assertTrue(medium.timed_out)
+                self.assertEqual(record.read_text().split("\n")[:-1],
+                                 [f"{os.getpid()} 0"],
+                                 "a process other than the gate's owner "
+                                 "wrote authorized_default")
+
+    def _tmp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return directory.name
 
 
 # ---------------------------------------------------------------------------

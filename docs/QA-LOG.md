@@ -92,6 +92,8 @@ yet.
 | 2026-10-14 | A rescue keyboard left blocked by a run that died was queued at a locked start, and waited for the unlock it was needed for | review (fix verification) | P1 | |
 | 2026-10-14 | zenity's exit 1 when GTK cannot open or loses the display was recorded as "Keep blocked", a refusal nobody made | review | P2 | |
 | 2026-10-14 | At the 10 s floor the agent's first dialog stayed up a second after the analyzer stopped listening | review (fix verification) | P2 | |
+| 2026-10-14 | The fixes of `a911831` (the storage reader reopening the gate, the card-reader watch fixes, isohybrid images, `--history` serials) were committed as `probolos-fixes.patch` and deleted in `3d659e7` unapplied; CHANGELOG.md and this log listed them as fixed | review | P0 | |
+| 2026-10-14 | Under the shipped unit (no `CAP_KILL`) the gate's `SIGKILL` of an analyzer that outlived its socket failed with EPERM: root blocked in `waitpid` with the gate stopped and the unit active, then exited 0, so `Restart=on-failure` never ran | review | P1 | |
 
 ## Coverage (privilege boundary)
 

@@ -283,35 +283,42 @@ class Probolos:
                     raise
                 continue
             self._stream_failing = False
+            if device is not None:
+                self._dispatch_safely(device)
             # Slots whose media change left 0 bytes are re-checked on the loop's
             # own one-second beat: a card that never becomes readable produces
-            # no further event to wait for.
+            # no further event to wait for. AFTER the event, never before it:
+            # tick() ahead of the event that brought a capacity reported the
+            # card itself, and the event then reported it a second time.
             try:
                 self._media_tick()
-            except Exception as exc:   # noqa: BLE001 -- see _dispatch below
+            except Exception as exc:   # noqa: BLE001 -- see _dispatch_safely
                 print(f"[!] media watch: unhandled error while re-checking a "
                       f"slot: {exc!r}")
-            if device is None:
-                continue
-            # One device must never be able to end the gate. Everything below
-            # this line touches hardware that can vanish mid-call: sysfs writes
-            # return ENODEV, a dialog backend dies, a descriptor read races the
-            # unplug. Those raise OSError and worse, and until now they left
-            # the loop entirely -- the daemon exited, every subsequent device
-            # was admitted by the kernel with no question asked, and the user
-            # saw a traceback rather than a closed gate. Handling it here keeps
-            # the failure to the one device it belongs to.
-            #
-            # KeyboardInterrupt and SystemExit are deliberately NOT caught:
-            # shutdown must stay immediate.
-            try:
-                self._dispatch(device)
-            except Exception as exc:   # noqa: BLE001 -- see above
-                import traceback
-                print(f"[!] {Path(device.sys_path).name}: unhandled error "
-                      f"while gating this device: {exc!r}")
-                print("[!] It stays BLOCKED. The gate is still running.")
-                traceback.print_exc()
+
+    def _dispatch_safely(self, device) -> None:
+        """
+        One device must never be able to end the gate.
+
+        Everything _dispatch does touches hardware that can vanish mid-call:
+        sysfs writes return ENODEV, a dialog backend dies, a descriptor read
+        races the unplug. Those raise OSError and worse, and until now they
+        left the loop entirely -- the daemon exited, every subsequent device
+        was admitted by the kernel with no question asked, and the user saw a
+        traceback rather than a closed gate. Handling it here keeps the
+        failure to the one device it belongs to.
+
+        KeyboardInterrupt and SystemExit are deliberately NOT caught: shutdown
+        must stay immediate.
+        """
+        try:
+            self._dispatch(device)
+        except Exception as exc:   # noqa: BLE001 -- see above
+            import traceback
+            print(f"[!] {Path(device.sys_path).name}: unhandled error "
+                  f"while gating this device: {exc!r}")
+            print("[!] It stays BLOCKED. The gate is still running.")
+            traceback.print_exc()
 
     def _dispatch(self, device) -> None:
         """Route one uevent: USB devices to the gate, disks to the watcher."""
@@ -335,8 +342,8 @@ class Probolos:
             self._on_remove(device.sys_path)
 
     def _watch_if_storage(self, dev: sysfs.UsbDevice, why: str,
-                          medium: Optional["storage.MediumReport"] = None
-                          ) -> None:
+                          medium: Optional["storage.MediumReport"] = None,
+                          fence: Optional[int] = None) -> None:
         """
         An admitted pure storage host: keep watching what is put in it.
 
@@ -347,10 +354,12 @@ class Probolos:
         """
         if self.media_watch is None or self.dry_run:
             return
-        if medium is None:
-            self.media_watch.register(dev, why)
-        else:
-            self.media_watch.register(dev, why, medium=medium)
+        extra = {}
+        if medium is not None:
+            extra["medium"] = medium
+        if fence is not None:
+            extra["seqnum_fence"] = fence
+        self.media_watch.register(dev, why, **extra)
 
     def _media_tick(self) -> None:
         """Let the watcher re-check slots that are waiting on a capacity."""
@@ -686,6 +695,13 @@ class Probolos:
                     and self.monitor.is_locked()):
                 self._hold_until_unlocked(dev)
                 return
+            # Stage 4 switched this reader on and off before the prompt; the
+            # disk events that caused are still queued. Numbered before the
+            # admission write, they can be told from the admitted disk's own.
+            fence = None
+            if self.media_watch is not None and medium is not None:
+                from .mediawatch import uevent_seqnum
+                fence = uevent_seqnum()
             try:
                 sysfs.admit_device(dev)
             except OSError as exc:
@@ -699,7 +715,7 @@ class Probolos:
             if getattr(self, "_remember", False) and self.trust is not None:
                 self._remember_admitted(dev)
             print(f"[+] AUTHORIZED — {report.one_liner(dev, findings)}\n")
-            self._watch_if_storage(dev, "approved", medium)
+            self._watch_if_storage(dev, "approved", medium, fence)
         else:
             # "user rejected" only when someone actually said no. A timeout,
             # an EOF (the service's stdin is /dev/null) or an unanswered

@@ -340,15 +340,30 @@ def _stop_serving_when_it_exits(pid: int, sock: socket.socket):
 # the first thing after a round trip failed; either way it is on its way out.
 ANALYZER_EXIT_GRACE = 10.0
 
+# What _wait_for_analyzer answers when the analyzer is still running and this
+# process could not end it. No wait status is negative, so it cannot be
+# mistaken for one.
+ANALYZER_NOT_ENDED = -1
+
 
 def _wait_for_analyzer(pid: int, log=print,
                        grace: float = ANALYZER_EXIT_GRACE):
     """
-    Wait for the analyzer's exit status; None if it was reaped elsewhere.
+    Wait for the analyzer's exit status; None if it was reaped elsewhere,
+    ANALYZER_NOT_ENDED if it is still running and could not be killed.
 
     Bounded: the gate has stopped and the hubs are open again, and an
     analyzer still running then would only look like it is protecting
     something. Past `grace` it is killed.
+
+    The kill can be refused. The shipped unit leaves CAP_KILL out of the
+    root side's bounding set, and root without it may not signal another
+    uid: the SIGKILL failed with EPERM, unnoticed, and the wait after it
+    blocked for as long as the analyzer chose to live -- the gate stopped,
+    the hubs open, the unit still "active (running)". When the analyzer did
+    end, its own exit status (0) was returned, so Restart=on-failure never
+    started the gate again. The caller now exits with a failure instead, and
+    the supervisor, which can, ends what is left.
     """
     deadline = time.monotonic() + grace
     while True:
@@ -365,8 +380,12 @@ def _wait_for_analyzer(pid: int, log=print,
         f"stopped; ending it")
     try:
         os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
+    except ProcessLookupError:
+        pass                        # exited meanwhile: reaped below
+    except OSError as exc:
+        log(f"[privsep] could not end the analyzer (pid {pid}): {exc}; "
+            f"exiting with a failure so that the supervisor ends it")
+        return ANALYZER_NOT_ENDED
     try:
         _pid, status = os.waitpid(pid, 0)
     except ChildProcessError:
@@ -544,6 +563,10 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
     # Whatever the analyzer started goes with it: on a terminal run nothing
     # else would end it, and it holds the terminal.
     end_descendants(log=log)
+    if status == ANALYZER_NOT_ENDED:
+        # The gate has stopped and the analyzer is still running: a failure,
+        # whatever the analyzer would have exited with.
+        return 1
     if status is None:
         # Already reaped (a SIGCHLD handler installed elsewhere, or the child
         # was inherited away). Nothing left to wait for.

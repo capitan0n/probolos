@@ -80,6 +80,17 @@ def _blank(lines: List[str]) -> None:
         lines.append("")
 
 
+def _tail(serial: str, room: int) -> str:
+    """The end of a serial, where units of one model usually differ.
+
+    The head is often a run of zeros ("000000001532"), so cutting from the
+    front showed every such reader as "(00000000)".
+    """
+    if room < 4 or len(serial) <= room:
+        return serial
+    return "\u2026" + serial[-(room - 1):]
+
+
 def _type_changed(entry) -> bool:
     """True if the device has claimed more than one type under this identity."""
     return len(getattr(entry, "known_types", None) or []) > 1
@@ -169,11 +180,14 @@ def format_table(entries: List, verbose: bool = False) -> str:
         # show a cleaned serial only when present.
         raw_id = _clean(e.identity)
         parts = raw_id.split(":")
+        serial = ""
         if len(parts) >= 3:
             vidpid = ":".join(parts[:2])
             serial = ":".join(parts[2:]).strip()
-            if serial and serial != "-":
-                identity = f"{vidpid} ({serial[:8]})"
+            if serial == "-":
+                serial = ""
+            if serial:
+                identity = f"{vidpid} ({_tail(serial, 22 - len(vidpid) - 3)})"
             else:
                 identity = vidpid
         else:
@@ -192,6 +206,8 @@ def format_table(entries: List, verbose: bool = False) -> str:
                      f"{last:<9} {verdict:<11} {drift}")
 
         if verbose:
+            if serial:
+                lines.extend(_detail("serial", serial))
             lines.extend(_detail("type", kind))
             types = getattr(e, "known_types", None) or []
             if len(types) > 1:

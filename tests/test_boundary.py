@@ -387,6 +387,37 @@ class StartParentSide(_StartCase):
         self.assertEqual(calls, [os.WNOHANG, 0])
         self.assertTrue(any("did not exit" in line for line in self.logged))
 
+    def test_a_kill_that_is_refused_does_not_block_the_root_side(self):
+        """The shipped unit keeps CAP_KILL out of the bounding set, so the
+        SIGKILL fails with EPERM. The wait after it blocked for as long as
+        the analyzer lived, the gate already stopped."""
+        calls = []
+
+        def wait(_pid, flags):
+            calls.append(flags)
+            if flags != os.WNOHANG:
+                raise AssertionError("a blocking wait for an analyzer that "
+                                     "could not be ended")
+            return 0, 0
+        with mock.patch.object(privsep.os, "waitpid", side_effect=wait), \
+                mock.patch.object(privsep.os, "kill",
+                                  side_effect=PermissionError(1, "EPERM")):
+            status = privsep._wait_for_analyzer(4242, log=self.logged.append,
+                                                grace=0)
+        self.assertEqual(status, privsep.ANALYZER_NOT_ENDED)
+        self.assertEqual(calls, [os.WNOHANG])
+        self.assertTrue(any("could not end the analyzer" in line
+                            for line in self.logged))
+
+    def test_an_analyzer_that_could_not_be_ended_is_a_failure(self):
+        """Its eventual exit status (0) was passed on, so the supervisor saw
+        a clean stop and Restart=on-failure never started the gate again."""
+        with mock.patch.object(privsep, "_wait_for_analyzer",
+                               return_value=privsep.ANALYZER_NOT_ENDED):
+            rc, _ = self.start()
+        self.assertEqual(rc, 1)
+        self.end_descendants.assert_called_once()
+
     def test_an_analyzer_that_exits_is_not_killed(self):
         with mock.patch.object(privsep.os, "waitpid",
                                return_value=(4242, 3 << 8)), \

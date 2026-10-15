@@ -243,6 +243,10 @@ def render_medium(medium, findings: Sequence[rules.Finding]) -> str:
             else:
                 out.append(INDENT + _dim("no partition table; "
                                          "contains no known filesystem"))
+        if medium.scheme != "none" and medium.signatures.get(-1):
+            out.append(INDENT + _dim(
+                f"whole-device {medium.signatures[-1]} filesystem at sector 0 "
+                f"(isohybrid image: this is what a desktop mounts)"))
         for part in real:
             seen = medium.signatures.get(part.index)
             boot = " · bootable" if part.bootable else ""
