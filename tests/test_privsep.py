@@ -134,9 +134,16 @@ class AnalyzerHasNoControllingTerminal(unittest.TestCase):
 
     @staticmethod
     def _wait_for_ctrl_c(out):
-        os.write(out, b"ready ")
+        # "ready " inside the try: the key is pressed as soon as it is read,
+        # and a KeyboardInterrupt raised as the write returns, outside the
+        # try, ended the analyzer quietly with the report cut to "ready ".
+        # Short sleeps, so a signal that lands just before one of them is
+        # seen within 0.1 s, not after the whole 10.
         try:
-            time.sleep(10)
+            os.write(out, b"ready ")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                time.sleep(0.1)
             os.write(out, b"no-sigint")
         except KeyboardInterrupt:
             os.write(out, b"sigint")

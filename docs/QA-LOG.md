@@ -94,6 +94,9 @@ yet.
 | 2026-10-14 | At the 10 s floor the agent's first dialog stayed up a second after the analyzer stopped listening | review (fix verification) | P2 | |
 | 2026-10-14 | The fixes of `a911831` (the storage reader reopening the gate, the card-reader watch fixes, isohybrid images, `--history` serials) were committed as `probolos-fixes.patch` and deleted in `3d659e7` unapplied; CHANGELOG.md and this log listed them as fixed | review | P0 | |
 | 2026-10-14 | Under the shipped unit (no `CAP_KILL`) the gate's `SIGKILL` of an analyzer that outlived its socket failed with EPERM: root blocked in `waitpid` with the gate stopped and the unit active, then exited 0, so `Restart=on-failure` never ran | review | P1 | |
+| 2026-10-15 | Under `--privsep` a Ctrl-C or hangup that landed just before the gate's blocking `recv()` was handled at C level without interrupting it, so the gate forwarded it only at the analyzer's next request (CI: `test_ctrl_c_at_the_terminal_still_reaches_the_analyzer`, about 1 in 30 under load) | CI failure, reproduced and root-caused | P2 | |
+| 2026-10-15 | The same test raced on its own: its analyzer wrote "ready" outside its `try`, so a Ctrl-C forwarded at once ended it with the report cut to `ready ` (about 2 in 100 under load once the gate was fixed) | review (fix verification) | P3 | |
+| 2026-10-15 | After the analyzer was reaped the gate still passed Ctrl-C, Ctrl-\\ and hangup on to its pid, which another process may have been given meanwhile | review (fix verification) | P3 | |
 
 ## Coverage (privilege boundary)
 

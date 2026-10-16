@@ -308,19 +308,21 @@ class StartParentSide(_StartCase):
         self.assertNotEqual(second, self.logged.append)
 
     def test_terminal_signals_are_forwarded_to_the_analyzer(self):
+        """While the gate serves, which is while the analyzer lives."""
         seen = {}
 
         def gate(*_a, **_k):
-            seen["handler"] = signal.getsignal(signal.SIGINT)
             seen["term"] = signal.getsignal(signal.SIGTERM)
+            handler = signal.getsignal(signal.SIGINT)
+            with mock.patch.object(privsep.os, "kill") as kill:
+                handler(signal.SIGINT, None)
+            seen["kills"] = kill.call_args_list
+            with mock.patch.object(privsep.os, "kill",
+                                   side_effect=ProcessLookupError):
+                handler(signal.SIGHUP, None)    # analyzer gone: ignored
         self.start(gate=gate)
         self.assertEqual(seen["term"], signal.SIG_IGN)
-        with mock.patch.object(privsep.os, "kill") as kill:
-            seen["handler"](signal.SIGINT, None)
-        kill.assert_called_once_with(4242, signal.SIGINT)
-        with mock.patch.object(privsep.os, "kill",
-                               side_effect=ProcessLookupError):
-            seen["handler"](signal.SIGHUP, None)    # analyzer gone: ignored
+        self.assertEqual(seen["kills"], [mock.call(4242, signal.SIGINT)])
 
     def test_a_signal_before_fork_returns_is_dropped(self):
         """Nobody to forward to yet: dropped, not fatal to the root side."""
@@ -418,6 +420,15 @@ class StartParentSide(_StartCase):
         self.assertEqual(rc, 1)
         self.end_descendants.assert_called_once()
 
+    def test_a_ctrl_c_after_the_reap_is_not_passed_on(self):
+        """Once reaped, the analyzer's pid is free. A Ctrl-C during the
+        cleanup after it went to whatever process had that pid next."""
+        self.start()
+        forward = signal.getsignal(signal.SIGINT)
+        with mock.patch.object(privsep.os, "kill") as kill:
+            forward(signal.SIGINT, None)
+        kill.assert_not_called()
+
     def test_an_analyzer_that_exits_is_not_killed(self):
         with mock.patch.object(privsep.os, "waitpid",
                                return_value=(4242, 3 << 8)), \
@@ -431,6 +442,13 @@ class StartParentSide(_StartCase):
             rc, run_gate = self.start()
         self.assertEqual(rc, 0)
         run_gate.assert_called_once()
+
+
+def _close_quietly(fd):
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def _fd_open(fd):
@@ -1149,6 +1167,167 @@ class GateFingerprintFailsClosed(_FakeSysfs):
         with mock.patch.object(gate_server.os, "fdopen",
                                side_effect=OSError("EIO")):
             self.assertIsNone(self.gate._read_text_at(fd, "authorized"))
+
+
+class GateWaitRunsSignalHandlers(unittest.TestCase):
+    """
+    A Ctrl-C at the terminal under --privsep reaches the gate, whose handler
+    passes it on to the analyzer. A signal that landed after the interpreter
+    last checked and before recv() went to sleep was taken by the C handler
+    without interrupting recv(), so the Python handler ran only at the
+    analyzer's next request: test_privsep's Ctrl-C test failed about one run
+    in thirty under load ("ready no-sigint"), and on an idle machine the
+    Ctrl-C did nothing at all.
+    """
+
+    def setUp(self):
+        self.peer, self.gate_end = socket.socketpair(socket.AF_UNIX,
+                                                     socket.SOCK_SEQPACKET)
+        self.addCleanup(self.peer.close)
+        self.addCleanup(self.gate_end.close)
+        self.gate = gate_server.GateServer(self.gate_end,
+                                           log=lambda *_a: None)
+
+    def test_a_signal_the_wait_did_not_see_still_runs_its_handler(self):
+        """The C handler runs on another thread here, deterministically:
+        exactly the case of a signal that did not interrupt the wait. Two of
+        them, because each wait must be one: a gate that went back to recv()
+        after the first would sit on the second. And no spinning: a pipe
+        left undrained keeps poll() returning."""
+        import faulthandler
+        import sys
+        import threading
+        import time
+        # Never hang CI. The real stderr: the suite runs buffered, and
+        # faulthandler needs a descriptor, not the runner's StringIO.
+        faulthandler.dump_traceback_later(60, exit=True, file=sys.__stderr__)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
+        handled = []
+        previous = signal.signal(signal.SIGUSR1,
+                                 lambda *_a: handled.append(time.monotonic()))
+        self.addCleanup(signal.signal, signal.SIGUSR1, previous)
+        polls = []
+        real_poll = gate_server.select.poll
+
+        class CountingPoller:
+            def __init__(self):
+                self.poller = real_poll()
+
+            def register(self, *args):
+                self.poller.register(*args)
+
+            def poll(self, *args):
+                polls.append(1)
+                return self.poller.poll(*args)
+
+        def poke():
+            for _ in range(2):
+                time.sleep(0.25)
+                signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)
+            time.sleep(1.2)
+            self.peer.close()               # the analyzer leaves at last
+        helper = threading.Thread(target=poke)
+        started = time.monotonic()
+        with mock.patch.object(gate_server.select, "poll", CountingPoller):
+            helper.start()
+            self.gate.serve_forever()       # main thread, as under start()
+        helper.join(10)
+        self.assertEqual(len(handled), 2, "a handler never ran")
+        self.assertLess(handled[-1] - started, 1.2,
+                        "a handler waited for the analyzer to speak")
+        self.assertLess(len(polls), 10, f"poll() ran {len(polls)} times")
+
+    def test_a_broken_wakeup_pipe_is_given_up_not_spun_on(self):
+        """At end-of-file the pipe is always readable: draining it again and
+        again would hold a CPU in the root process until the analyzer spoke."""
+        import threading
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.addCleanup(_close_quietly, read_fd)
+        os.close(write_fd)
+        self.gate.wakeup = read_fd
+        done = threading.Event()
+
+        def wait():
+            self.gate._wait_for_request()
+            done.set()
+        threading.Thread(target=wait, daemon=True).start()
+        self.assertTrue(done.wait(5), "the wait spun on a pipe at EOF")
+        self.assertIsNone(self.gate.wakeup)
+
+    def test_the_previous_wakeup_fd_is_put_back(self):
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        before = signal.set_wakeup_fd(write_fd)
+        self.addCleanup(signal.set_wakeup_fd, before)
+        self.peer.close()
+        self.gate.serve_forever()
+        self.assertEqual(signal.set_wakeup_fd(before), write_fd)
+        self.assertIsNone(self.gate.wakeup)
+
+    def test_requests_are_still_served(self):
+        self.peer.sendall(protocol.Request(protocol.REQ_PING).encode())
+        self.peer.shutdown(socket.SHUT_WR)
+        self.gate.serve_forever()
+        reply = protocol.Response.decode(self.peer.recv(protocol.MAX_MESSAGE))
+        self.assertTrue(reply.ok)
+
+    def test_off_the_main_thread_there_is_no_pipe(self):
+        import threading
+        seen = []
+        thread = threading.Thread(
+            target=lambda: seen.append(gate_server._open_signal_wakeup()))
+        thread.start()
+        thread.join()
+        self.assertEqual(seen, [None])
+
+    def test_a_previous_fd_that_cannot_be_put_back_is_not_left_set(self):
+        """Left pointing at the closed pipe, every later signal would write a
+        byte into whatever file reused its number."""
+        wakeup = gate_server._open_signal_wakeup()
+        self.assertIsNotNone(wakeup)
+        for fd in wakeup[:2]:
+            self.addCleanup(_close_quietly, fd)
+        self.addCleanup(signal.set_wakeup_fd, wakeup[2])    # runs first
+        calls = []
+
+        def set_wakeup_fd(fd, **_kw):
+            calls.append(fd)
+            if fd != -1:
+                raise OSError("EBADF")
+            return -1
+        with mock.patch.object(gate_server.signal, "set_wakeup_fd",
+                               side_effect=set_wakeup_fd):
+            gate_server._close_signal_wakeup((wakeup[0], wakeup[1], 99))
+        self.assertEqual(calls, [99, -1])
+        for fd in wakeup[:2]:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_no_pipe_means_the_old_wait(self):
+        with mock.patch.object(gate_server.os, "pipe2",
+                               side_effect=OSError("EMFILE")):
+            self.assertIsNone(gate_server._open_signal_wakeup())
+
+    def test_a_wakeup_that_cannot_be_reset_at_all_still_closes_the_pipe(self):
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        for fd in (read_fd, write_fd):
+            self.addCleanup(_close_quietly, fd)
+        with mock.patch.object(gate_server.signal, "set_wakeup_fd",
+                               side_effect=ValueError("not main thread")):
+            gate_server._close_signal_wakeup((read_fd, write_fd, -1))
+        for fd in (read_fd, write_fd):
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_a_poll_that_fails_falls_back_to_recv(self):
+        self.gate.wakeup = 0
+        poller = mock.Mock()
+        poller.poll.side_effect = OSError("EINVAL")
+        with mock.patch.object(gate_server.select, "poll",
+                               return_value=poller):
+            self.gate._wait_for_request()    # returns instead of hanging
+        poller.poll.assert_called_once()
 
 
 class GateServeLoopSurvivesItsPeer(unittest.TestCase):

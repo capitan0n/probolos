@@ -560,6 +560,11 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
         log(f"[privsep] the gate stopped with an error: {gate_error!r}")
 
     status = _wait_for_analyzer(pid, log=log)
+    if status != ANALYZER_NOT_ENDED:
+        # Reaped, or gone: its pid is free from here on. A Ctrl-C during the
+        # cleanup below was passed on to it, so to whatever process had been
+        # given that pid meanwhile.
+        analyzer.clear()
     # Whatever the analyzer started goes with it: on a terminal run nothing
     # else would end it, and it holds the terminal.
     end_descendants(log=log)

@@ -49,6 +49,16 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ### Fixed
 
+- **Ctrl-C under `--privsep` could do nothing.** The root gate passes Ctrl-C
+  and hangup on to the analyzer, but a signal that landed just before the
+  gate's blocking `recv()` did not interrupt it, so the gate passed it on
+  only at the analyzer's next request, on an idle machine never. The gate
+  now waits on its socket and a signal wakeup pipe together. Once the
+  analyzer is reaped, nothing is passed on to its pid any more (it may
+  belong to another process by then). The test that caught this,
+  `test_ctrl_c_at_the_terminal_still_reaches_the_analyzer`, failed about one
+  run in thirty under load; it also had a race of its own (its "ready"
+  was written outside its `try`), fixed with it.
 - **Lockout: the rescue port works at the lock screen.** Internal ports and
   `--allow-port` were held while the screen was locked, so a USB keyboard on
   the rescue port could not type the password. They are admitted before the

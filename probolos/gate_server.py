@@ -28,6 +28,8 @@ from __future__ import annotations
 import array
 import os
 import re as _re
+import select
+import signal
 import socket
 import stat
 import time
@@ -170,6 +172,9 @@ class GateServer:
         # leave behind, and the lockout-safety argument the rest of this
         # project is built on applies to it exactly as written.
         self._interfaces_off: dict = {}
+        # The read end of the pipe signals are written to while serving, or
+        # None. See _wait_for_request.
+        self.wakeup: Optional[int] = None
         if watch_media:
             self._snapshot_media_hosts()
 
@@ -1096,10 +1101,17 @@ class GateServer:
     # ---- the loop ----
 
     def serve_forever(self) -> None:
+        wakeup = _open_signal_wakeup()
+        self.wakeup = wakeup[0] if wakeup else None
         try:
             self._serve_requests()
         finally:
-            self.restore()
+            try:
+                self.restore()
+            finally:
+                self.wakeup = None
+                if wakeup:
+                    _close_signal_wakeup(wakeup)
 
     def restore(self):
         # Interfaces first, and before the devices they belong to are
@@ -1134,8 +1146,62 @@ class GateServer:
             if not resp.ok:
                 self.log(f"[gate] could not restore {path}: {resp.detail}")
 
+    def _wait_for_request(self) -> None:
+        """
+        Return once the analyzer has sent something or gone, running every
+        signal handler that falls due meanwhile.
+
+        recv() alone could sit on a Ctrl-C for as long as the analyzer stayed
+        quiet. Python runs a handler between bytecodes, and a signal that
+        landed after the interpreter last looked and before recv() went to
+        sleep was taken by the C handler without interrupting the call:
+        privsep's _forward() ran only at the analyzer's next request -- on an
+        idle machine, never -- so Ctrl-C and hangup at the terminal did
+        nothing. Every signal writes a byte to the wakeup pipe, whenever it
+        lands, so the wait ends and the handler runs before the next one.
+        Without a pipe (not the main thread), or with a socket poll() cannot
+        take, recv() waits as before.
+        """
+        if self.wakeup is None:
+            return
+        poller = select.poll()
+        try:
+            poller.register(self.sock, select.POLLIN)
+            poller.register(self.wakeup, select.POLLIN)
+            sock_fd = self.sock.fileno()
+        except (OSError, TypeError, ValueError):
+            return
+        while True:
+            try:
+                ready = {fd for fd, _mask in poller.poll()}
+            except OSError:
+                return
+            if self.wakeup in ready:
+                self._drain_wakeup()        # due handlers run on the way in
+            if sock_fd in ready or self.wakeup is None:
+                return                      # a request, EOF or an error
+
+    def _drain_wakeup(self) -> None:
+        """
+        Empty the wakeup pipe. A pipe that reads end-of-file or fails is no
+        longer used: poll() would report it ready forever and the root side
+        would spin. recv() then waits as it did before the pipe.
+        """
+        fd = self.wakeup
+        if fd is None:
+            return
+        try:
+            while os.read(fd, 512):
+                pass
+        except BlockingIOError:
+            return                          # empty: the usual end
+        except OSError:
+            pass
+        self.wakeup = None
+
     def _serve_requests(self) -> None:
         while True:
+            self._wait_for_request()
             try:
                 data = self.sock.recv(protocol.MAX_MESSAGE + 1)
             except OSError:
@@ -1237,6 +1303,45 @@ class GateServer:
 
 class _PeerGone(Exception):
     """The analyzer is no longer reachable. Ends the serve loop, quietly."""
+
+
+def _open_signal_wakeup():
+    """
+    (read end, write end, previous wakeup fd) of a pipe every signal writes a
+    byte to, installed with signal.set_wakeup_fd; None where that cannot be
+    had. set_wakeup_fd works in the main thread only, which is where the
+    gate serves under privsep.start().
+    """
+    try:
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        previous = signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
+    except (OSError, ValueError):
+        os.close(read_fd)
+        os.close(write_fd)
+        return None
+    return read_fd, write_fd, previous
+
+
+def _close_signal_wakeup(wakeup) -> None:
+    """Put back the previous wakeup fd, then close the pipe."""
+    read_fd, write_fd, previous = wakeup
+    try:
+        signal.set_wakeup_fd(previous)
+    except (OSError, ValueError):
+        # Never left pointing at a descriptor about to be closed: its number
+        # is reused, and every signal would write a byte into that file.
+        try:
+            signal.set_wakeup_fd(-1)
+        except (OSError, ValueError):
+            pass
+    for fd in (read_fd, write_fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass                        # closed already; nothing to leak
 
 
 def run_gate(sock: socket.socket, log=print, watch_media: bool = False,
