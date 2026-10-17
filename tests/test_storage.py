@@ -456,6 +456,31 @@ class UdfNeedsItsRecognitionSequence(_Inspect):
         self.assertIn("ISO 9660 signature", medium.hollow_signatures[0])
 
 
+class UdfCheckNeverReadsPastTheBuffer(unittest.TestCase):
+    """
+    The recognition-sequence walk checked that a descriptor's identifier
+    (bytes 1-5) was there, then read its version byte (byte 6). A buffer
+    ending between the two raised IndexError: at 0x8806 and 0x9006 for a
+    2 KiB sequence. Found by fuzzing (fuzzing/heavy_fuzz.py, storage_fs).
+    Stage 4 reads whole sectors from a block device, so the read itself
+    cannot end there; the parser must not depend on that.
+    """
+
+    def test_every_cut_through_a_sequence_answers(self):
+        for label, data in (
+                ("2k", _media.udf_vrs()),
+                ("4k", _media.udf_vrs(0x1000, b"NSR03")),
+                ("bridge", _media.iso9660_descriptors() + _media.udf_vrs())):
+            image = bytes(_media.image(0x8000 + len(data) + 16, 0x8000,
+                                       data))
+            with self.subTest(label):
+                for cut in range(0x8000, len(image) + 1):
+                    name, note = storage.identify_filesystem(image[:cut])
+                    self.assertIn(name, (None, "UDF", "UDF (ISO 9660 bridge)",
+                                         "ISO 9660"), hex(cut))
+                    self.assertIsInstance(note, (str, type(None)))
+
+
 class InsideAPartition(_Inspect):
 
     def mbr(self, data, ptype=0x17, start=128, sectors=200):
@@ -1212,6 +1237,81 @@ class IsohybridImages(_Inspect):
         self.assertIn("filesystem-signature-without-structure",
                       [f.rule_id for f in
                        rules.storage_findings(medium_report)])
+
+
+class _GapCase(_Inspect):
+
+    def gap(self, medium_report):
+        """The large-unallocated-gap explanation, still one NOTICE."""
+        found = [f for f in rules.storage_findings(medium_report)
+                 if f.rule_id == "large-unallocated-gap"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].severity, rules.Severity.NOTICE)
+        return found[0].explanation
+
+
+class TheRefusedIsoHalfDoesNotVouchForTheGap(_GapCase):
+    """
+    Behind an MBR, a UDF/ISO 9660 bridge whose ISO half was refused is
+    reported as plain UDF, but the refused descriptor's size was still taken
+    as how far the volume reaches. One claiming 8 TB on a 100 MiB stick, the
+    reason it was refused, explained a 49 MiB gap as "an isohybrid image, as
+    written by every Linux installer", in the report that also said the ISO
+    half was not there. A real bridge dd-written onto a stick smaller than
+    the image does the same, with no forger needed.
+    """
+
+    def bridge(self, damage=None, **kwargs):
+        iso = bytearray(_media.iso9660_descriptors(**kwargs))
+        if damage:
+            damage(iso)                      # the PVD is its first sector
+        data = _media.image(DEVICE_BYTES, 0x8000, iso, _media.udf_vrs())
+        data[:512] = mbr((0x0C, 100000, 1000, False))
+        return self.inspect(data, sectors=200 * 1024)
+
+    def test_a_refused_iso_half_measures_nothing(self):
+        def no_root_record(iso):
+            iso[156] = 0
+        for label, damage, kwargs in (
+                ("8 TB volume", None, {"volume_blocks": 0xFFFFFFFF}),
+                ("4096-byte blocks", None,
+                 {"volume_blocks": 30000, "block_size": 4096}),
+                ("no root record", no_root_record, {"volume_blocks": 30000})):
+            with self.subTest(label):
+                medium_report = self.bridge(damage, **kwargs)
+                self.assertEqual(medium_report.signatures, {-1: "UDF"})
+                self.assertIsNone(medium_report.whole_device_sectors)
+                self.assertNotIn("isohybrid", self.gap(medium_report))
+
+    def test_a_valid_bridge_still_explains_the_gap(self):
+        medium_report = self.bridge(volume_blocks=25000)
+        self.assertEqual(medium_report.signatures,
+                         {-1: "UDF (ISO 9660 bridge)"})
+        self.assertEqual(medium_report.whole_device_sectors, 100000)
+        self.assertIn("isohybrid", self.gap(medium_report))
+
+
+class AnUnmeasuredUdfSizeIsNotZero(_GapCase):
+    """
+    Stage 4 measures only an ISO 9660 volume's size; a UDF volume's is not
+    in the bytes it reads. With a partition 49 MiB in, the missing size was
+    counted as zero and the operator was told the UDF volume "covers only the
+    first 0.0 MiB", a number nothing had read. The gap is still not explained
+    by the volume, but the report must not invent a size to say so.
+    """
+
+    def test_the_gap_explanation_states_no_size(self):
+        data = _media.image(DEVICE_BYTES, 0x8000, _media.udf_vrs())
+        data[:512] = mbr((0x0C, 100000, 1000, False))
+        medium_report = self.inspect(data, sectors=200 * 1024)
+        self.assertEqual(medium_report.signatures, {-1: "UDF"})
+        self.assertIsNone(medium_report.whole_device_sectors)
+        why = self.gap(medium_report)
+        self.assertNotIn("covers only", why)
+        self.assertNotIn(" 0.0 MiB", why)
+        self.assertNotIn("isohybrid", why)
+        self.assertIn("size was not measured", why)
+        self.assertIn("no filesystem describes", why)
 
 
 class TheReaderChildCannotReopenTheGate(unittest.TestCase):

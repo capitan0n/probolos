@@ -194,6 +194,13 @@ MAX_MEDIA_LAYOUTS = 32
 # Distinct device types per identity. Same shape of bound as known_hashes, and
 # the first is kept for the same reason: it is what the device said it was.
 MAX_KNOWN_TYPES = 32
+# The largest times_seen a loaded entry keeps. No device comes near it: at one
+# plug-in a second it takes 285 million years. The bound is against the file:
+# json.loads accepts an integer of up to 4300 digits, and Python will not turn
+# a longer one back into text. One record() turned 4300 nines into 4301
+# digits, and from then on save() raised, and so did LedgerAnalyzer, whose
+# CRITICAL drift finding became a NOTICE that the analyzer had failed.
+MAX_TIMES_SEEN = 2 ** 53
 
 
 @dataclass
@@ -292,6 +299,10 @@ class Entry:
         times_seen = raw.get("times_seen", 1)
         if isinstance(times_seen, bool) or not isinstance(times_seen, int):
             times_seen = 1
+        # Clamped, not refused. The count decides nothing, and refusing the
+        # entry would take its baseline and its refusals with it, losing the
+        # very drift finding the bound is there to protect.
+        times_seen = min(times_seen, MAX_TIMES_SEEN)
 
         known = as_str_list(raw.get("known_hashes"))
         # Ledgers written before baseline_hash existed still carry the answer:
@@ -676,7 +687,12 @@ class Ledger:
             # atomicio for the full rationale.
             atomicio.write_json_atomic(self.path, payload)
             return None
-        except OSError as exc:
+        except (OSError, ValueError, TypeError) as exc:
+            # ValueError and TypeError are json.dumps refusing a value in the
+            # payload: an integer too long to write out, a type JSON has no
+            # form for. That is a failed save like any other. Raised, it left
+            # the daemon's _record before the audit-log line, for every device
+            # until a restart, since the bad value stays in memory.
             message = str(exc)
             if message == self._last_save_error:
                 return None          # already reported; stay quiet

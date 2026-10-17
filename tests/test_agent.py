@@ -12,6 +12,7 @@ import ctypes.util
 import io
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -1892,6 +1893,168 @@ class AgentTimeoutIsValidated(unittest.TestCase):
         agent.dialog = mock.Mock()
         agent._handle(b'["not", "an", "object"]')
         agent.dialog.confirm.assert_not_called()
+
+
+def _bare_agent(dialog, notifier=None):
+    """An agent that has not looked for a dialog tool or connected yet."""
+    instance = agent_mod.Agent.__new__(agent_mod.Agent)
+    instance.log = lambda *_a: None
+    instance.notifier = notifier or mock.Mock(available=lambda: False)
+    instance.dialog = instance.countdown_dialog = dialog
+    instance.sock = None
+    instance._notice_window = threading.Lock()
+    return instance
+
+
+def _replies_to(instance, line):
+    """What the agent sends back for one line, instead of sending it."""
+    replies = []
+    with mock.patch.object(instance, "_reply",
+                           side_effect=lambda _id, answer:
+                           replies.append(answer)):
+        instance._handle(line)
+    return replies
+
+
+class AnIntegerPastTheDigitLimitDoesNotEndTheAgent(unittest.TestCase):
+    """
+    Python will not, by default, turn more than 4300 digits into an int,
+    and json.loads passes that on as a plain ValueError, not the
+    JSONDecodeError _handle() caught. One such number -- about 4 KB, inside
+    MAX_MESSAGE -- went out of _handle() and run(), and the agent exited:
+    the desktop prompt gone without a word, on one line from whatever
+    occupies the socket. The daemon's side (agentlink) already caught
+    ValueError.
+    """
+
+    DIGITS = b"9" * 5000
+
+    def test_the_line_does_not_end_the_agent(self):
+        instance = _bare_agent(mock.Mock(**{"confirm.return_value": None}))
+        for line in (self.DIGITS,
+                     b'{"type": "decide", "id": ' + self.DIGITS + b"}"):
+            for answer in _replies_to(instance, line):
+                self.assertNotIn(answer, (ANSWER_YES, ANSWER_ALWAYS))
+
+    def test_the_next_question_is_still_asked(self):
+        listener, peer = socket.socketpair()
+        self.addCleanup(listener.close)
+        self.addCleanup(peer.close)
+        instance = _bare_agent(mock.Mock(**{"confirm.return_value": False}))
+        instance.dialog.name = "kdialog"
+        instance.sock = listener
+        listener.settimeout(1.0)
+        peer.sendall(self.DIGITS + b"\n" + json.dumps({
+            "type": agentlink.MSG_DECIDE, "id": 2,
+            "steps": agentlink.STEPS_ONE, "timeout": 30}).encode() + b"\n")
+        peer.shutdown(socket.SHUT_WR)
+        # connect() would replace the socket; the loop is what is under test.
+        with mock.patch.object(instance, "connect", return_value=True):
+            self.assertEqual(instance.run(), 0)
+        peer.settimeout(1.0)
+        reply = json.loads(peer.recv(4096).decode())
+        self.assertEqual((reply["id"], reply["answer"]), (2, ANSWER_NO))
+
+
+class AnOverflowingCountdownDoesNotEndTheAgent(unittest.TestCase):
+    """
+    _countdown() caught TypeError and ValueError, but float() of an integer
+    past 1.8e308 raises OverflowError, which is neither. A question with the
+    countdown and such a number -- 309 digits, far inside json's own limit --
+    ended the agent before the countdown window opened. _dialog_timeout()
+    already caught it.
+    """
+
+    def test_it_is_the_default_like_any_other_unusable_value(self):
+        for value in (10 ** 400, -(10 ** 400)):
+            self.assertEqual(agent_mod._countdown(value), 10.0)
+
+    def test_the_question_is_still_asked_and_never_approved(self):
+        instance = _bare_agent(
+            mock.Mock(**{"confirm_countdown.return_value": None}))
+        replies = _replies_to(instance, json.dumps({
+            "type": agentlink.MSG_DECIDE, "id": 1,
+            "steps": agentlink.STEPS_COUNTDOWN, "countdown": 10 ** 400,
+            "timeout": 60}).encode())
+        kwargs = instance.dialog.confirm_countdown.call_args.kwargs
+        self.assertEqual(kwargs["delay"], 10.0)
+        self.assertEqual(replies, [agentlink.ANSWER_UNAVAILABLE])
+
+
+class TextThatCannotBeAnArgumentDoesNotEndTheAgent(unittest.TestCase):
+    """
+    _as_text() checked only that a field was a str, and JSON can spell two
+    characters a str holds and an argv cannot: \\u0000, which subprocess
+    refuses with ValueError, and a lone surrogate such as \\ud800, which has
+    no UTF-8 and raised UnicodeEncodeError. The dialog backends and the
+    notifier catch OSError and timeouts, so either one in a question's title,
+    body, capabilities or countdown note went out of _handle() and run(), and
+    the agent exited. A surrogate in a notice did the same through its
+    notification; a NUL there did not end the agent, but the window that
+    stands in for the notification could not show it. Probolos never sends
+    them (textsafe escapes both at the descriptor boundary), but the agent
+    does not get to choose what occupies its socket.
+    """
+
+    # What was sent, and what is shown for it.
+    HOSTILE = (("USB\x00stick", "USB" + B + "x00stick"),
+               ("USB\ud800stick", "USB" + B + "ud800stick"))
+
+    # Real processes, so the argv is really built: `false` stands in for the
+    # dialog tool and for gdbus, and never says yes.
+    FALSE = shutil.which("false")
+
+    def test_they_are_written_out_and_everything_else_is_shown_as_sent(self):
+        for text, shown in self.HOSTILE:
+            self.assertEqual(agent_mod._as_text(text, "fallback"), shown)
+        self.assertEqual(agent_mod._as_text("\udfff\x00", "fallback"),
+                         B + "udfff" + B + "x00")
+        legit = ("USB storage · port 3-9\nKingston " + B + "x1b[2J "
+                 + B + "ud800 中 \U0001f600")
+        self.assertEqual(agent_mod._as_text(legit, "fallback"), legit)
+
+    @unittest.skipIf(FALSE is None, "no `false` to stand in for a dialog")
+    def test_a_question_is_asked_and_never_approved(self):
+        notifier = agent_mod.Notifier(log=lambda *_a: None)
+        notifier._gdbus = self.FALSE
+        for backend_cls in (dialogs.KDialogBackend, dialogs.ZenityBackend):
+            backend = backend_cls()
+            backend._binary = self.FALSE
+            for field in ("title", "body", "capabilities", "note"):
+                # The note is shown only with the countdown.
+                steps = (agentlink.STEPS_COUNTDOWN if field == "note"
+                         else agentlink.STEPS_ONE)
+                for text, _shown in self.HOSTILE:
+                    with self.subTest(backend=backend.name, field=field,
+                                      text=ascii(text)):
+                        replies = _replies_to(
+                            _bare_agent(backend, notifier),
+                            json.dumps({"type": agentlink.MSG_DECIDE,
+                                        "id": 1, "timeout": 30,
+                                        "steps": steps,
+                                        field: text}).encode())
+                        self.assertEqual(replies, [ANSWER_NO])
+
+    @unittest.skipIf(FALSE is None, "no `false` to stand in for gdbus")
+    def test_a_notice_is_still_shown(self):
+        # gdbus fails, so the notice falls back to the window, which shows
+        # what the notification would have.
+        notifier = agent_mod.Notifier(log=lambda *_a: None)
+        notifier._gdbus = self.FALSE
+        for kind in (agentlink.MSG_NOTICE, agentlink.MSG_CRITICAL):
+            for text, shown in self.HOSTILE:
+                with self.subTest(kind=kind, text=ascii(text)):
+                    instance = _bare_agent(mock.Mock(), notifier)
+                    self.assertEqual(_replies_to(instance, json.dumps({
+                        "type": kind, "title": text,
+                        "body": text}).encode()), [])
+                    for _ in range(200):
+                        if not instance._notice_window.locked():
+                            break
+                        time.sleep(0.01)
+                    instance.dialog.notice.assert_called_once()
+                    self.assertEqual(instance.dialog.notice.call_args.args,
+                                     (f"Probolos — {shown}", shown))
 
 
 class AgentShowsNoticesWithoutOfferingAnAnswer(unittest.TestCase):

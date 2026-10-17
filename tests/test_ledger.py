@@ -1148,5 +1148,104 @@ class SerialsShowTheirDistinguishingEnd(unittest.TestCase):
         self.assertRegex(out, r"serial +: 000000001532")
 
 
+class AnOverlongCountCannotSilenceDrift(unittest.TestCase):
+    """
+    from_raw kept any integer as times_seen, and json.loads accepts one of up
+    to 4300 digits. A count of 4300 nines, the largest it accepts, became 4301
+    digits at the next record(), and Python will not turn that into text:
+    save() raised instead of returning the error, so the ledger could not be
+    written again until a restart, and LedgerAnalyzer raised on its own
+    message. The device's CRITICAL drift finding came out as a NOTICE that
+    the analyzer had failed. The count is clamped now, and save() returns
+    what json.dumps refuses like any other failure.
+    """
+
+    # The largest integer json.loads accepts: 4300 nines.
+    OVERLONG = int("9" * 4300)
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp(prefix="probolos-ledger-"))
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.path = self.directory / "ledger.json"
+        self.approved = make_device(descriptor_blob((0x08, 0x06, 0x50),
+                                                    bcd_device=0x0100))
+        self.reflashed = make_device(descriptor_blob((0x08, 0x06, 0x50),
+                                                     bcd_device=0x0110))
+        ident = ledger_mod.identity_of(self.approved)
+        self.baseline = ledger_mod.descriptor_fingerprint(self.approved)
+        self.path.write_text(json.dumps({
+            "schema": ledger_mod.SCHEMA_VERSION,
+            "fingerprint_scheme": "normalized-v1",
+            "entries": {ident: dict(
+                GOOD, identity=ident, descriptor_hash=self.baseline,
+                baseline_hash=self.baseline, known_hashes=[self.baseline],
+                times_seen=self.OVERLONG)}}))
+
+    def _verdict(self, led):
+        findings = analyzers.run(
+            analyzers.Context(device=self.reflashed, ledger=led))
+        return [(f.rule_id, f.severity) for f in findings
+                if f.rule_id == "descriptor-drift"
+                or f.rule_id.startswith("analyzer-failed")]
+
+    def test_the_entry_loads_whole_with_its_count_clamped(self):
+        led = Ledger(self.path)
+        self.assertIsNone(led.load_error, "clamped, not refused")
+        entry = led.lookup(self.approved)
+        self.assertEqual(entry.baseline_hash, self.baseline)
+        self.assertTrue(entry.times_seen < self.OVERLONG, "count not bounded")
+        self.assertEqual(entry.times_seen, ledger_mod.MAX_TIMES_SEEN)
+
+    def test_drift_is_still_critical_after_the_sighting_is_recorded(self):
+        drift = [("descriptor-drift", rules.Severity.CRITICAL)]
+        led = Ledger(self.path)
+        self.assertEqual(self._verdict(led), drift)
+        led.record(self.reflashed, "held: screen locked", approved=False)
+        self.assertIsNone(led.save())
+        self.assertEqual(self._verdict(led), drift, "in the same run")
+        self.assertEqual(self._verdict(Ledger(self.path)), drift,
+                         "after a restart")
+
+    def test_save_returns_what_json_refuses_instead_of_raising(self):
+        led = Ledger(self.path)
+        for error in (ValueError("Exceeds the limit (4300 digits)"),
+                      TypeError("Object of type X is not JSON serializable")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(ledger_mod.atomicio, "write_json_atomic",
+                                      side_effect=error):
+                self.assertEqual(led.save(), str(error))
+
+
+class AnImpossibleDateCannotSilenceDrift(unittest.TestCase):
+    """
+    from_raw keeps any finite number as first_seen. LedgerAnalyzer puts that
+    date into the drift finding's text, and a date past year 9999 (or before
+    the platform's epoch) made fromtimestamp() raise there: the device's
+    CRITICAL descriptor-drift came out as analyzer-failed:ledger, a NOTICE.
+    The finding does not depend on the date, so the date gives way.
+    """
+
+    def test_drift_stays_critical_whatever_the_first_date(self):
+        approved = make_device(descriptor_blob((0x08, 0x06, 0x50),
+                                               bcd_device=0x0100))
+        reflashed = make_device(descriptor_blob((0x08, 0x06, 0x50),
+                                                bcd_device=0x0110))
+        for first_seen in (1e12, -1e12, 1.7e308):
+            with self.subTest(first_seen=first_seen):
+                led = Ledger(Path("/nonexistent/ledger.json"))
+                led.record(approved, "user approved", approved=True)
+                led.lookup(approved).first_seen = first_seen
+                findings = analyzers.run(
+                    analyzers.Context(device=reflashed, ledger=led))
+                drift = [f for f in findings
+                         if f.rule_id == "descriptor-drift"]
+                self.assertEqual([f.severity for f in drift],
+                                 [rules.Severity.CRITICAL])
+                self.assertIn("an unknown date", drift[0].explanation)
+                self.assertEqual([f.rule_id for f in findings
+                                  if f.rule_id.startswith("analyzer-failed")],
+                                 [])
+
+
 if __name__ == "__main__":
     unittest.main()

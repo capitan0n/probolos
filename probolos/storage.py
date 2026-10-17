@@ -549,8 +549,12 @@ def _udf_vrs_problem(data: bytes) -> Optional[str]:
         state = "start"
         for index in range(OPTICAL_MAX_DESCRIPTORS):
             off = OPTICAL_VD_START + index * stride
+            # Bytes off .. off+6 are read below (type, identifier, version);
+            # a buffer ending inside them is not a descriptor.
+            if len(data) < off + 7:
+                break
             ident = data[off + 1:off + 6]
-            if len(ident) < 5 or ident not in UDF_VRS_IDS:
+            if ident not in UDF_VRS_IDS:
                 break
             if ident != ISO9660_ID and (data[off] != 0 or data[off + 6] != 1):
                 break
@@ -756,7 +760,15 @@ def inspect(device: str, open_fn=None) -> MediumReport:
                 optical, note = _identify_optical(chunk, limit)
                 if optical:
                     report.signatures[-1] = optical
-                    extent = _iso9660_extent(chunk)
+                    # Only an ISO 9660 half that passed _iso9660_problem may
+                    # say how far the volume reaches, and the name contains
+                    # "ISO 9660" exactly when it did. A bridge whose ISO half
+                    # was refused is plain "UDF": the refused descriptor's
+                    # size -- 8 TB on a 100 MB stick, the very reason it was
+                    # refused -- would otherwise explain the gap as an
+                    # installer image.
+                    extent = (_iso9660_extent(chunk)
+                              if "ISO 9660" in optical else None)
                     if extent:
                         report.whole_device_sectors = extent // SECTOR
                 if note:

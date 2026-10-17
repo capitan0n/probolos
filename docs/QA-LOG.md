@@ -5,8 +5,8 @@ was, how it was found, and how bad (ROADMAP §4, P0–P3). With the coverage
 table below and the hardware matrix planned for `TESTING.md` (ROADMAP 2.2),
 this is the data of the thesis's evaluation chapter.
 
-**How it was found:** review, property test, static analysis, hardware matrix,
-dogfooding or user report. The reviews:
+**How it was found:** review, property test, fuzzing, static analysis,
+hardware matrix, dogfooding or user report. The reviews:
 
 - *structure audit* (2026-10-04): six reviewers, one per angle (packaging,
   documentation, paths, tests, CI, release readiness), each finding re-checked
@@ -16,7 +16,12 @@ dogfooding or user report. The reviews:
   packaging, CI, install and docs); findings reproduced where possible and
   re-checked against the code, and every fix shown by a test that fails on
   0.11.0;
-- *fix verification*: the same method applied to a batch of fixes.
+- *fix verification*: the same method applied to a batch of fixes;
+- *fuzzing follow-up* (2026-10-16): after `fuzzing/heavy_fuzz.py` found the
+  UDF defect below, two reviewers hunted the same class of defect in every
+  parser of untrusted input, each finding was re-run by a separate skeptic,
+  and each fix was checked by a third reviewer against the finding's own
+  reproduction.
 
 **Fix commit** is filled in once the fix is committed; "open" means not fixed
 yet.
@@ -97,6 +102,17 @@ yet.
 | 2026-10-15 | Under `--privsep` a Ctrl-C or hangup that landed just before the gate's blocking `recv()` was handled at C level without interrupting it, so the gate forwarded it only at the analyzer's next request (CI: `test_ctrl_c_at_the_terminal_still_reaches_the_analyzer`, about 1 in 30 under load) | CI failure, reproduced and root-caused | P2 | |
 | 2026-10-15 | The same test raced on its own: its analyzer wrote "ready" outside its `try`, so a Ctrl-C forwarded at once ended it with the report cut to `ready ` (about 2 in 100 under load once the gate was fixed) | review (fix verification) | P3 | |
 | 2026-10-15 | After the analyzer was reaped the gate still passed Ctrl-C, Ctrl-\\ and hangup on to its pid, which another process may have been given meanwhile | review (fix verification) | P3 | |
+| 2026-10-16 | Stage 4's UDF recognition-sequence walk read a descriptor's version byte one past the bytes it had checked: `IndexError` on a buffer ending there (`0x8806` and `0x9006` for a 2 KiB sequence). Contained by the reader process, and unreachable through a block device, which returns whole sectors | fuzzing (`fuzzing/heavy_fuzz.py`, target `storage_fs`, ~3 M inputs) | P3 | |
+| 2026-10-16 | Behind an MBR, a UDF/ISO 9660 bridge whose ISO 9660 half stage 4 refused (claiming 8 TB on a 100 MB stick, a 4096-byte block, a broken root record) still had that half's size taken as the volume's reach, so `large-unallocated-gap` explained the gap as an isohybrid installer image in the report that refused it | review (fuzzing follow-up) | P2 | |
+| 2026-10-16 | `large-unallocated-gap` said a whole-device UDF volume, whose size stage 4 never measures, "covers only the first 0.0 MiB" | review (fuzzing follow-up) | P3 | |
+| 2026-10-16 | Stage 4 assumes 512-byte sectors: on a medium with 4096-byte logical blocks the GPT is not found, so the EFI-system-partition and hidden-partition checks do not run, and nothing says so | review (fuzzing follow-up) | P2 | open |
+| 2026-10-16 | `descriptors.parse` measured each configuration's `wTotalLength` against everything up to the end of the blob, later configurations included, so an overstatement in any but the last configuration counted only by what it exceeded the later ones by: configuration 0 of 2 declaring 60 bytes and delivering 18, followed by 54 bytes, raised no `descriptor-length-overstated` and left early activation on | review (fuzzing follow-up) | P2 | |
+| 2026-10-16 | The agent died on an integer of more than 4300 digits (about 4 KB, inside `MAX_MESSAGE`): `json` raises a plain `ValueError` there, not the `JSONDecodeError` the agent caught | review (fuzzing follow-up) | P3 | |
+| 2026-10-16 | The agent died on an integer `countdown` past 1.8e308 (309 digits or more): `float()` raised `OverflowError`, which `_countdown` did not catch (`_dialog_timeout` did) | review (fuzzing follow-up) | P3 | |
+| 2026-10-16 | The agent died on a NUL or a lone surrogate (`\u0000`, `\ud800`) in a question's title, body, capabilities or countdown note, or on a lone surrogate in a notice: the dialog tool's or gdbus's argv raised `ValueError` or `UnicodeEncodeError`, and only `OSError` and timeouts were caught | review (fuzzing follow-up) | P3 | |
+| 2026-10-16 | The ledger kept any integer as `times_seen`, and the trust store any as `times_admitted`. A count of 4300 nines, the largest `json.loads` accepts, became 4301 digits at the next sighting or admission, and `save()` raised `ValueError` instead of returning it. Until a restart, the ledger went unsaved and audit-log lines were lost. A reflashed device's `descriptor-drift` (CRITICAL) read as `analyzer-failed:ledger` (NOTICE), and a trusted device was admitted with its decision unrecorded. It needs write access to the state file, which could already rewrite the baseline | review (fuzzing follow-up) | P3 | |
+| 2026-10-16 | A ledger time past the year 9999 (any finite number loads) made `LedgerAnalyzer` raise while writing the date into its drift finding, so `descriptor-drift` (CRITICAL) came out as `analyzer-failed:ledger` (NOTICE); `--trusted` stopped at a trust entry with such a `trusted_at`. Needs write access to the state file | review (fuzzing follow-up) | P3 | |
+| 2026-10-16 | `tests/test_cli.py` still called `unittest.main()` mid-file (see the 2026-10-04 row): run directly, it ran 28 of its 43 tests | review (fuzzing follow-up) | P3 | |
 
 ## Coverage (privilege boundary)
 

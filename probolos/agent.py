@@ -53,7 +53,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import dialogs
+from . import dialogs, textsafe
 from .agentlink import (ANSWER_ALWAYS, ANSWER_NO, ANSWER_UNAVAILABLE,
                         ANSWER_YES, DEFAULT_DIALOG_TIMEOUT, DEFAULT_SOCKET,
                         MAX_DIALOG_TIMEOUT, MAX_MESSAGE, MIN_DIALOG_TIMEOUT,
@@ -256,6 +256,9 @@ class Notifier:
 # carry it. It approves nothing, so this only bounds how long it is in the way.
 NOTICE_TIMEOUT = 120.0
 
+# What a str can hold and an argv cannot: NUL, and a lone surrogate.
+_NOT_AN_ARGUMENT = re.compile(r"[\x00\ud800-\udfff]")
+
 
 def _as_text(value, fallback: str) -> str:
     """
@@ -265,11 +268,25 @@ def _as_text(value, fallback: str) -> str:
     concatenation in the notification path, the subprocess argv itself --
     assumes str. A JSON null, number, list or object here raised TypeError or
     AttributeError and took the agent down, which is a way to remove the
-    desktop prompt by sending one malformed message. The text is already
-    sanitised at the descriptor boundary by textsafe, so nothing is re-cleaned
-    here; this is a type check, not a second sanitiser.
+    desktop prompt by sending one malformed message.
+
+    A str was not enough either: JSON can spell two characters a str holds
+    and an argv cannot. \\u0000 made subprocess raise ValueError, and a lone
+    surrogate such as \\ud800 has no UTF-8 and raised UnicodeEncodeError.
+    The backends and the notifier catch OSError and timeouts, so either one
+    in a question's title, body, capabilities or countdown note went out of
+    _handle() and ended the agent, and so did a surrogate in a notice, on its
+    way to gdbus. Those two are written out as textsafe writes them, \\x00
+    and \\ud800.
+
+    The text is already sanitised at the descriptor boundary by textsafe,
+    which escaped both of them there, so nothing else is re-cleaned here and
+    what Probolos sends is shown unchanged. This is not a second sanitiser.
     """
-    return value if isinstance(value, str) else fallback
+    if not isinstance(value, str):
+        return fallback
+    return _NOT_AN_ARGUMENT.sub(lambda found: textsafe._escape(found.group()),
+                                value)
 
 
 def _from_confirm(answer) -> str:
@@ -298,7 +315,10 @@ def _countdown(value) -> float:
     """
     try:
         seconds = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a JSON integer past 1.8e308 has no float, and it
+        # is not a ValueError. Raised here, it ended the agent before the
+        # countdown window opened. _dialog_timeout already caught it.
         seconds = 10.0
     if seconds != seconds:          # NaN
         seconds = 10.0
@@ -431,10 +451,15 @@ class Agent:
     def _handle(self, line: bytes) -> None:
         try:
             message = json.loads(line.decode())
-        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             # RecursionError: a few KB of "[" nests deeper than json will go,
             # and uncaught it ended the agent. The daemon side already
             # catches it (agentlink).
+            #
+            # ValueError, not just JSONDecodeError: an integer of more than
+            # 4300 digits (sys.get_int_max_str_digits) comes out of json as a
+            # plain ValueError. That is about 4 KB, well under MAX_MESSAGE,
+            # and it ended the agent too. agentlink catches ValueError.
             return
 
         if not isinstance(message, dict):

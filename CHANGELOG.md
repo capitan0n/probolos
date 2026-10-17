@@ -49,6 +49,68 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ### Fixed
 
+- **Stage 4's UDF check could raise instead of answering.** The walk over the
+  volume recognition sequence checked a descriptor's identifier and then read
+  its version byte, one past what it had checked; a buffer ending between
+  the two raised `IndexError`. The reader process contained it, and a block
+  device returns whole sectors, so no real medium could end there; the parser
+  no longer relies on either. Found by fuzzing.
+- **The unused-area notice trusted a refused ISO 9660 half, and gave a UDF
+  volume 0.0 MiB.** Behind an MBR, a UDF/ISO 9660 bridge whose ISO 9660 half
+  stage 4 refused (one claiming 8 TB on a 100 MB stick, say) is reported as
+  plain UDF. The refused half's size still decided how far the volume reached,
+  so `large-unallocated-gap` called the gap "an isohybrid image, as written by
+  every Linux installer" in the same report that refused it. Only a half that
+  passed the check is measured now. A UDF volume, whose size stage 4 does not
+  measure, was said to cover "only the first 0.0 MiB"; the notice now says its
+  size was not measured. The finding and its severity are unchanged.
+- **An overstated `wTotalLength` was missed in every configuration but the
+  last.** Each configuration was measured from its own descriptor to the end
+  of the blob, so the configurations after it counted as its own data, and an
+  overstatement showed only by however much it exceeded them. A first
+  configuration of two that declared 60 bytes and delivered 18, followed by
+  one of 54 bytes, raised no `descriptor-length-overstated`, and early
+  activation (stages 3 and 4) was not switched off; followed by one of 18
+  bytes, it read as 24 bytes instead of 42. Each configuration is now measured
+  up to the next one. Real hardware can produce this, since the kernel accepts
+  a short read of a configuration. Nothing was hidden from the interface
+  checks, which see the same bytes as the kernel.
+- **One line on the agent socket could end the desktop agent.** An integer of
+  more than 4300 digits (`json` raises a plain `ValueError` there, not the
+  `JSONDecodeError` the agent caught), an integer countdown past 1.8e308
+  (`OverflowError`), or a NUL or lone surrogate in a question's title, body,
+  capabilities or countdown note (`ValueError` or `UnicodeEncodeError` from
+  the dialog tool's argv) went uncaught, and the agent exited; so did a lone
+  surrogate in a notice, on its way to gdbus. The desktop prompt was gone and
+  the gate failed closed. Such a line is now ignored like any other that is
+  not JSON, the countdown falls back to 10 s, and the two characters are shown
+  written out as textsafe writes them (`\x00`, `\ud800`); any other text is
+  shown unchanged. Only whatever occupies the agent socket can send these; the
+  daemon never does.
+- **An overlong count in a state file could stop the ledger saving and turn a
+  drift alarm into a notice.** The ledger kept any integer as a device's
+  sighting count. A count of 4300 nines, the largest `json.loads` accepts,
+  became 4301 digits at the next sighting, and Python will not write that out.
+  `save()` then raised instead of returning the error, as it promises to.
+  Until a restart, no decision reached the ledger and none reached the audit
+  log (`--log`). The ledger analyzer raised too, so a reflashed device's later
+  sightings came out as `analyzer-failed:ledger` (NOTICE) instead of
+  `descriptor-drift` (CRITICAL). The trust store's admission count had the
+  same flaw: a trusted device was admitted, but its decision went unrecorded.
+  Both counts are now capped at 2**53 when loaded, which no device reaches. A
+  value `json.dumps` refuses is now a save error like any other. Only a writer
+  of the state file could set such a count: root, or for the ledger the
+  analyzer's account (`probolos` under the service, `nobody` by default on a
+  hand run). Such a writer could already rewrite the baseline directly. Found
+  in review after fuzzing.
+- **An impossible date in a state file could turn a drift alarm into a
+  notice.** The ledger keeps any finite number as a time. One past the year
+  9999 (or before the epoch) made the drift finding's own text raise, so
+  `descriptor-drift` (CRITICAL) came out as `analyzer-failed:ledger` (NOTICE);
+  `--trusted` stopped with a traceback at such an entry. Such a date now reads
+  "an unknown date". Only a writer of the state file could set one.
+- `tests/test_cli.py` called `unittest.main()` before its last 15 tests, so
+  running the file directly skipped them (the suite itself ran them all).
 - **Ctrl-C under `--privsep` could do nothing.** The root gate passes Ctrl-C
   and hangup on to the analyzer, but a signal that landed just before the
   gate's blocking `recv()` did not interrupt it, so the gate passed it on

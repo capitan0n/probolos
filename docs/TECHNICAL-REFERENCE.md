@@ -387,5 +387,15 @@ Shared builders are in `tests/_support.py`.
 beta). Coverage of the root-side code has a floor in
 `.github/workflows/coverage.yml`.
 
+`fuzzing/` is not part of the suite and not in the sdist: a coverage-guided
+fuzzer (standard library only) for everything Probolos parses before a
+decision -- descriptors, HID reports, the medium, the gate protocol, the
+agent socket, state files -- and for the whole analysis path. Where the
+property tests try about 150 inputs per claim, it runs millions, keeps those
+that reach new code, and reports hangs and memory blow-ups as well as
+exceptions. Usage:
+[fuzzing/README.md](https://github.com/capitan0n/probolos/blob/main/fuzzing/README.md).
+<!-- Absolute link: the sdist carries docs/ but not fuzzing/. -->
+
 Kernel documentation of USB authorization:
 <https://docs.kernel.org/usb/authorization.html>

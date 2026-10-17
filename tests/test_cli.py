@@ -438,8 +438,33 @@ class ReleaseRefusesUnderARunningGate(unittest.TestCase):
                 cli.cmd_release()
         self.assertEqual(ended.exception.code, 1)
 
-if __name__ == "__main__":
-    unittest.main()
+
+# ==========================================================================
+# --trusted
+# ==========================================================================
+
+class ATrustDateNoCalendarHolds(unittest.TestCase):
+    """
+    The trust store only has to hold a finite number as trusted_at. One
+    past year 9999 made fromtimestamp() raise, and --trusted stopped at
+    that entry with a traceback instead of listing what is trusted.
+    """
+
+    def test_the_listing_goes_on(self):
+        import tempfile
+        from probolos import trust as trust_mod
+        from tests._support import make_device
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trusted.json"
+            store = trust_mod.TrustStore(path)
+            store.trust(make_device())
+            for entry in store.devices.values():
+                entry.trusted_at = 1e12
+            self.assertIsNone(store.save())
+            out = io.StringIO()
+            with redirect_stdout(out):
+                cli.cmd_trusted(path)
+        self.assertIn("trusted     : an unknown date, admitted", out.getvalue())
 
 
 # ==========================================================================
@@ -636,3 +661,7 @@ class OneGatePerMachine(unittest.TestCase):
              redirect_stdout(io.StringIO()) as out:
             self.assertIsNone(cli.claim_the_gate())
         self.assertIn("could not check", out.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

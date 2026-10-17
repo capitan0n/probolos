@@ -246,11 +246,17 @@ def cmd_trusted(path) -> None:
     import datetime
     print(f"Remembered devices ({len(entries)}) — admitted without asking:\n")
     for i, entry in enumerate(entries, start=1):
-        when = datetime.datetime.fromtimestamp(entry.trusted_at)
+        # The store only has to hold a finite number; one no date can carry
+        # stopped the listing at that entry.
+        try:
+            stamp = datetime.datetime.fromtimestamp(entry.trusted_at)
+            when = f"{stamp:%Y-%m-%d %H:%M}"
+        except (OverflowError, OSError, ValueError):
+            when = "an unknown date"
         print(f"[{i}] {entry.label}")
         print(f"      identity    : {entry.identity}")
         print(f"      descriptors : {entry.descriptor_hash[:16]}…")
-        print(f"      trusted     : {when:%Y-%m-%d %H:%M}, admitted "
+        print(f"      trusted     : {when}, admitted "
               f"{entry.times_admitted} time(s)")
         print(f"      ports       : {', '.join(entry.ports) or '-'}")
         print()

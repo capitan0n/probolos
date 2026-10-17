@@ -50,6 +50,11 @@ from . import atomicio
 
 SCHEMA_VERSION = 1
 
+# The largest times_admitted a loaded entry keeps, for the reason given at
+# ledger.MAX_TIMES_SEEN: a count of 4300 nines, the largest json.loads
+# accepts, had 4301 digits after one more admission, and save() raised on it.
+MAX_TIMES_ADMITTED = 2 ** 53
+
 
 def default_path() -> Path:
     """Beside the ledger, and with the same root/user split."""
@@ -128,6 +133,9 @@ class TrustedDevice:
         times = raw.get("times_admitted", 0)
         if isinstance(times, bool) or not isinstance(times, int) or times < 0:
             times = 0
+        # Clamped like the ledger's count: it is bookkeeping, and an entry
+        # refused over it would be trust lost over a number nothing decides on.
+        times = min(times, MAX_TIMES_ADMITTED)
         note = as_str(raw.get("note")) or ""
         ports_raw = raw.get("ports")
         ports = ([p for p in ports_raw if isinstance(p, str)]
@@ -419,7 +427,11 @@ class TrustStore:
             self._last_save_error = None
             self.repeated_save_error = False
             return None
-        except OSError as exc:
+        except (OSError, ValueError, TypeError) as exc:
+            # json.dumps refusing a value is a failed save too. Raised, it got
+            # past the daemon's `except OSError` on the trusted-device path,
+            # after the device had been admitted, and its decision went
+            # unrecorded.
             message = str(exc)
             self.repeated_save_error = message == self._last_save_error
             self._last_save_error = message

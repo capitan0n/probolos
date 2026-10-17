@@ -240,6 +240,8 @@ def parse(blob: bytes) -> DescriptorSet:
     # position exactly -- and the position is what the wTotalLength check needs.
     consumed = 0
     tail = blob[18:]
+    # (offset, wTotalLength) of each configuration descriptor, in order.
+    config_starts: list[tuple[int, int]] = []
 
     try:
         for d_type, chunk in _safe.walk_descriptors(tail):
@@ -250,9 +252,10 @@ def parse(blob: bytes) -> DescriptorSet:
                      _CONFIG_FMT, _safe.take(chunk, 0, 9, "config descriptor"))
                 # wTotalLength counts THIS configuration descriptor and
                 # everything belonging to it, starting at this descriptor --
-                # not at the start of the blob. It was being compared against
-                # the length of the entire remaining blob, which is wrong in
-                # both directions and silently:
+                # not at the start of the blob -- and ending where the next
+                # configuration starts. It was being compared against the
+                # length of the entire remaining blob, which is wrong in both
+                # directions and silently:
                 #
                 #   * with several configurations the comparison used the sum
                 #     of all of them, so an overstatement in any one config was
@@ -261,16 +264,20 @@ def parse(blob: bytes) -> DescriptorSet:
                 #     why the mistake survived -- the single-config case is the
                 #     one anybody tests by hand.
                 #
-                # Measuring from this descriptor's own offset makes the number
-                # mean what the field means. A device that overstates it is
-                # describing data it did not send: harmless in itself, but the
-                # fingerprint of a descriptor set edited by hand rather than
-                # emitted by a vendor toolchain.
-                available = len(tail) - offset
-                overstated = w_total - available
-                if overstated > 0:
-                    result.length_overstated = max(result.length_overstated,
-                                                   overstated)
+                # Measuring from this descriptor's own offset fixed the start
+                # but not the end: it still ran to the end of the blob, so the
+                # configurations after this one counted as its own, and an
+                # overstatement anywhere but in the last one showed only by
+                # what it exceeded them by. Config 0 of 2 declaring 60 bytes
+                # and delivering 18 read as honest with 54 bytes after it.
+                # Where a configuration ends is known only when the next one
+                # starts, so the comparison is made after the walk.
+                #
+                # Measured that way the number means what the field means. A
+                # device that overstates it is describing data it did not send:
+                # harmless in itself, but the fingerprint of a descriptor set
+                # edited by hand rather than emitted by a vendor toolchain.
+                config_starts.append((offset, w_total))
                 current = ConfigDescriptor(
                     value=cfg_value,
                     num_interfaces=n_ifaces,
@@ -305,6 +312,18 @@ def parse(blob: bytes) -> DescriptorSet:
         if not exc.recoverable:
             raise DescriptorParseError(str(exc)) from exc
         result.truncated = str(exc)
+
+    # Each configuration ends where the next one starts, and the last one at
+    # the end of the blob -- also after a recoverable truncation, because the
+    # bytes past the stop were still delivered. This is the kernel's own
+    # layout: sysfs writes each configuration's raw buffer after the previous
+    # one, cut to the length the kernel kept, while the configuration
+    # descriptor inside still says what the device declared.
+    bounds = [start for start, _ in config_starts] + [len(tail)]
+    for (start, w_total), end in zip(config_starts, bounds[1:], strict=True):
+        overstated = w_total - (end - start)
+        if overstated > 0:
+            result.length_overstated = max(result.length_overstated, overstated)
 
     return result
 

@@ -205,7 +205,7 @@ Rules for an LLM agent working on this repo:
 ## 6. The thesis evidence
 
 `docs/QA-LOG.md` keeps one row per defect found: date, what, how it was found
-(review, property test, hardware matrix, dogfooding or a user report),
+(review, property test, fuzzing, hardware matrix, dogfooding or a user report),
 severity and fix commit. With the coverage table and the matrix in
 `TESTING.md`, that log is the data of the evaluation chapter: what each method
 found, on a system that did not change underneath the measurement.

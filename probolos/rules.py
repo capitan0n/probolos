@@ -922,11 +922,20 @@ def storage_findings(report, config: Optional[RuleConfig] = None) -> List[Findin
         if first.start_lba > _ALIGNMENT_TOLERANCE_SECTORS:
             mib = first.start_lba * storage_mod.SECTOR / (1024 * 1024)
             whole = report.signatures.get(-1)
-            reach = getattr(report, "whole_device_sectors", None) or 0
+            reach = getattr(report, "whole_device_sectors", None)
             hidden = ("space no filesystem describes, which is where data "
                       "would go if it were meant not to be found by ordinary "
                       "tools.")
-            if whole and reach >= first.start_lba - _ALIGNMENT_TOLERANCE_SECTORS:
+            if whole and reach is None:
+                # Stage 4 measures only an ISO 9660 volume; a UDF one has no
+                # size in the bytes it reads. An unmeasured size is not zero:
+                # it was shown as "covers only the first 0.0 MiB", a number
+                # nothing had read. It does not explain the gap either.
+                why = (f"A whole-device {whole} volume starts at sector 0, "
+                       "but its size was not measured, so nothing shows that "
+                       "it reaches the first partition. If it does not, the "
+                       "gap is " + hidden)
+            elif whole and reach >= first.start_lba - _ALIGNMENT_TOLERANCE_SECTORS:
                 why = (f"Here it holds a whole-device {whole} filesystem "
                        "starting at sector 0: an isohybrid image, as written "
                        "by every Linux installer, which is what a desktop "

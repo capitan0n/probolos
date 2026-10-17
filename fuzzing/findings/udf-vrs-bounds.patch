@@ -1,0 +1,32 @@
+diff --git a/probolos/storage.py b/probolos/storage.py
+index f8362bd..5377c5c 100644
+--- a/probolos/storage.py
++++ b/probolos/storage.py
+@@ -549,8 +549,12 @@ def _udf_vrs_problem(data: bytes) -> Optional[str]:
+         state = "start"
+         for index in range(OPTICAL_MAX_DESCRIPTORS):
+             off = OPTICAL_VD_START + index * stride
++            # Bytes off .. off+6 are read below (type, identifier, version);
++            # a buffer ending inside them is not a descriptor.
++            if len(data) < off + 7:
++                break
+             ident = data[off + 1:off + 6]
+-            if len(ident) < 5 or ident not in UDF_VRS_IDS:
++            if ident not in UDF_VRS_IDS:
+                 break
+             if ident != ISO9660_ID and (data[off] != 0 or data[off + 6] != 1):
+                 break
+diff --git a/tests/test_properties.py b/tests/test_properties.py
+index 6ed2a0d..9003a1d 100644
+--- a/tests/test_properties.py
++++ b/tests/test_properties.py
+@@ -444,6 +444,9 @@ else:
+         @given(disk_images(), st.one_of(st.none(),
+                                         st.integers(min_value=0,
+                                                     max_value=2 ** 40)))
++        # Found by fuzzing/heavy_fuzz.py: a buffer ending one byte short of a
++        # recognition descriptor's version byte raised IndexError.
++        @example((bytes(0x8001) + b"NSR02", None), None)
+         def test_filesystem_identification_is_total(self, image, limit):
+             name, note = storage.identify_filesystem(image[0], limit)
+             self.assertIsInstance(name, (str, type(None)))

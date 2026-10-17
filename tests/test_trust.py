@@ -727,5 +727,55 @@ class WritableSaysWhetherAlwaysCanBeKept(unittest.TestCase):
             self.assertFalse(store.writable())
 
 
+class AnOverlongAdmissionCountStillSaves(unittest.TestCase):
+    """
+    from_raw kept any non-negative integer as times_admitted, and json.loads
+    accepts one of up to 4300 digits. A count of 4300 nines, the largest it
+    accepts, became 4301 digits at the next admission, and Python will not
+    turn that into text: save() raised ValueError instead of returning it.
+    On the daemon's trusted-device path that came after the device had been
+    admitted, and its decision went unrecorded. The count is clamped now, and
+    save() returns what json.dumps refuses like any other failure.
+    """
+
+    # The largest integer json.loads accepts: 4300 nines.
+    OVERLONG = int("9" * 4300)
+
+    def setUp(self):
+        self._d = tempfile.TemporaryDirectory()
+        self.addCleanup(self._d.cleanup)
+        self.path = Path(self._d.name) / "trusted.json"
+        self.dev = Dev()
+        key = trust.key_for(self.dev)
+        self.path.write_text(json.dumps({
+            "schema": trust.SCHEMA_VERSION,
+            "devices": {key: dict(good_entry(key),
+                                  times_admitted=self.OVERLONG)}}))
+        os.chmod(self.path, 0o600)
+
+    def test_the_device_stays_trusted_with_its_count_clamped(self):
+        store = trust.TrustStore(self.path)
+        self.assertIsNone(store.load_error, "clamped, not refused")
+        self.assertTrue(store.is_trusted(self.dev))
+        times = store.lookup(self.dev).times_admitted
+        self.assertTrue(times < self.OVERLONG, "count not bounded")
+        self.assertEqual(times, trust.MAX_TIMES_ADMITTED)
+
+    def test_the_next_admission_is_saved(self):
+        store = trust.TrustStore(self.path)
+        store.record_admission(self.dev)
+        self.assertIsNone(store.save())
+        self.assertTrue(trust.TrustStore(self.path).is_trusted(self.dev))
+
+    def test_save_returns_what_json_refuses_instead_of_raising(self):
+        store = trust.TrustStore(self.path)
+        for error in (ValueError("Exceeds the limit (4300 digits)"),
+                      TypeError("Object of type X is not JSON serializable")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(atomicio, "write_json_atomic",
+                                      side_effect=error):
+                self.assertEqual(store.save(), str(error))
+
+
 if __name__ == "__main__":
     unittest.main()

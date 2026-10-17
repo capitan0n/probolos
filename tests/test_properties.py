@@ -25,7 +25,10 @@ the input to the smallest one that still breaks it. The promises:
   * a state file is either loaded into well-typed entries or reported, and
     never takes the program down with it;
   * the analysis of a device that parsed never fails, because a check that
-    crashes is a check that did not run.
+    crashes is a check that did not run;
+  * the verdict on the BadUSB shape holds for every variant: storage with
+    any HID interface is at least a WARNING, one HID interface alone never
+    is, and a partition past the end of the medium is always reported.
 
 Optional dependency: without Hypothesis this module reports one skipped test
 and the rest of the suite is unaffected (`pip install hypothesis`, or
@@ -67,7 +70,7 @@ except ImportError:      # optional; see the module docstring
 from probolos import (agent as agent_mod, agentlink, analyzers, daemon,
                       descriptors, descriptors_safe, gate_server,
                       ledger as ledger_mod, protocol, report, rules, storage,
-                      sysfs, textsafe, trust)
+                      storage_hardening, sysfs, textsafe, trust)
 from tests._support import descriptor_blob
 
 
@@ -211,6 +214,21 @@ else:
                                   st.integers(min_value=0,
                                               max_value=2 ** 64)))
         return bytes(data), declared
+
+    @st.composite
+    def past_the_end(draw):
+        """
+        (start, sectors, device size) for an MBR partition that starts on
+        the device and provably ends past it. Built directly: filtering
+        random triples with assume() keeps too few of them. The size stops
+        two short of 2**32 so the 32-bit sector count can always reach past
+        the end.
+        """
+        size = draw(st.integers(min_value=1, max_value=2 ** 32 - 2))
+        start = draw(st.integers(min_value=0, max_value=size - 1))
+        sectors = draw(st.integers(min_value=size - start + 1,
+                                   max_value=2 ** 32 - 1))
+        return start, sectors, size
 
     def _forbidden(char: str) -> bool:
         """What cleaned text must never contain (see textsafe.sanitize)."""
@@ -412,6 +430,46 @@ else:
                           (agentlink.STEPS_ONE, agentlink.STEPS_TWO,
                            agentlink.STEPS_COUNTDOWN))
 
+    class TheBadUsbShapeIsJudgedTheSameForEveryVariant(unittest.TestCase):
+        """
+        Storage plus an HID interface is the BadUSB shape; storage plus
+        HID(0,0) once came out as a NOTICE because only the declared
+        keyboard and mouse protocols were matched. The verdict must not
+        depend on which subclass and protocol bytes the device chose, nor on
+        the order of its interfaces. And the converse, so the alarm stays
+        worth reading: one HID interface on its own -- a mouse, a keyboard,
+        a gamepad -- is never a WARNING. (Both were also checked once over
+        all 65 536 subclass/protocol pairs.)
+        """
+
+        _STORAGE = (0x08, 0x06, 0x50)
+
+        @staticmethod
+        def _worst(*interfaces):
+            dev = _device(descriptor_blob(*interfaces), "Acme", "Widget",
+                          "S1")
+            findings = rules.evaluate(dev)
+            return rules.worst(findings), [f.rule_id for f in findings]
+
+        @given(st.integers(min_value=0, max_value=255),
+               st.integers(min_value=0, max_value=255), st.booleans())
+        def test_storage_with_any_hid_is_at_least_a_warning(
+                self, subclass, protocol, hid_first):
+            hid = (0x03, subclass, protocol)
+            interfaces = ((hid, self._STORAGE) if hid_first
+                          else (self._STORAGE, hid))
+            worst, ids = self._worst(*interfaces)
+            self.assertGreaterEqual(worst, rules.Severity.WARNING,
+                                    (hid, worst.label, ids))
+
+        @given(st.integers(min_value=0, max_value=255),
+               st.integers(min_value=0, max_value=255))
+        def test_one_hid_interface_alone_never_alarms(self, subclass,
+                                                       protocol):
+            worst, ids = self._worst((0x03, subclass, protocol))
+            self.assertLess(worst, rules.Severity.WARNING,
+                            (subclass, protocol, worst.label, ids))
+
     # ------------------------------------------------------------------
     # Storage: the medium's account of itself
     # ------------------------------------------------------------------
@@ -444,6 +502,9 @@ else:
         @given(disk_images(), st.one_of(st.none(),
                                         st.integers(min_value=0,
                                                     max_value=2 ** 40)))
+        # Found by fuzzing/heavy_fuzz.py: a buffer ending one byte short of a
+        # recognition descriptor's version byte raised IndexError.
+        @example((bytes(0x8001) + b"NSR02", None), None)
         def test_filesystem_identification_is_total(self, image, limit):
             name, note = storage.identify_filesystem(image[0], limit)
             self.assertIsInstance(name, (str, type(None)))
@@ -458,9 +519,26 @@ else:
                 fh.write(data)
                 fh.flush()
                 with mock.patch.object(storage, "read_size_sectors",
-                                       return_value=declared):
+                                       return_value=declared), \
+                        mock.patch.object(storage, "_read_at",
+                                          wraps=storage._read_at) as reads:
                     medium = storage.inspect(fh.name)
             self.assertIsNone(medium.error)
+            # Whatever the medium says about its size and its partitions,
+            # every read it got out of stage 4 starts inside the device when
+            # the size was believed, and below the cap when it was not.
+            # (The reads themselves are observed: checking safe_read_offset's
+            # answer again would only restate its own postcondition.)
+            if medium.size_sectors is not None:
+                self.assertLessEqual(medium.size_sectors,
+                                     storage_hardening.MAX_PLAUSIBLE_SECTORS)
+            for call in reads.call_args_list:
+                offset = call.args[1]
+                self.assertLessEqual(offset,
+                                     storage_hardening.MAX_SEEK_OFFSET)
+                if offset and medium.size_sectors is not None:
+                    self.assertLess(offset,
+                                    medium.size_sectors * storage.SECTOR)
             findings = rules.storage_findings(medium)
             dev = _device(_SEED_BLOBS[0], "Kingston", "DataTraveler", "S1")
             ran = analyzers.run(
@@ -470,6 +548,34 @@ else:
                               if f.rule_id.startswith("analyzer-failed:")],
                              [])
             self.assertIsInstance(report.render_medium(medium, findings), str)
+
+        @settings(suppress_health_check=_SLOW)
+        @given(past_the_end())
+        def test_a_partition_past_the_end_is_always_reported(self, case):
+            """
+            A capacity lie or an image for a larger disk: the partition is
+            either refused as impossible or reported as too long, a WARNING
+            either way, never accepted in silence.
+            """
+            start, sectors, size = case
+            data = bytearray(storage.SECTOR)
+            struct.pack_into("<BBBBBBBBII", data, 446, 0, 0, 0, 0, 0x0C,
+                             0, 0, 0, start, sectors)
+            data[510:512] = b"\x55\xaa"
+            with tempfile.NamedTemporaryFile(suffix=".img") as fh:
+                fh.write(data)
+                fh.flush()
+                with mock.patch.object(storage, "read_size_sectors",
+                                       return_value=size):
+                    medium = storage.inspect(fh.name)
+            reported = {f.rule_id: f.severity
+                        for f in rules.storage_findings(medium)}
+            self.assertTrue(
+                reported.get("impossible-partition-geometry",
+                             rules.Severity.INFO) >= rules.Severity.WARNING
+                or reported.get("partition-beyond-end-of-device",
+                                rules.Severity.INFO)
+                >= rules.Severity.WARNING, (case, reported))
 
     # ------------------------------------------------------------------
     # The two sockets
@@ -616,8 +722,17 @@ else:
                             <= agent_mod.MAX_DIALOG_TIMEOUT)
             self.assertTrue(10.0 <= agent_mod._countdown(value) <= 30.0)
             shown = agent_mod._as_text(value, "fallback")
-            self.assertEqual(shown, value if isinstance(value, str)
-                             else "fallback")
+            if not isinstance(value, str):
+                self.assertEqual(shown, "fallback")
+            else:
+                # Whatever is shown can be an argument to the dialog tool --
+                # no NUL, nothing without a UTF-8 encoding -- and text that
+                # already could be one is shown exactly as it was sent.
+                self.assertNotIn("\x00", shown)
+                shown.encode("utf-8")
+                if not any(char == "\x00" or "\ud800" <= char <= "\udfff"
+                           for char in value):
+                    self.assertEqual(shown, value)
 
         @given(st.one_of(
             st.binary(max_size=400),

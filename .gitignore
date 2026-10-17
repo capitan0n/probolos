@@ -38,6 +38,10 @@ htmlcov/
 .DS_Store
 
 
-fuzzing/
+# --- Fuzzing: the code is tracked, what it produces is not ---
+# corpus/ holds seeds read from YOUR devices (VID:PID, a disk's first
+# sectors) and everything the fuzzer kept; crashes/ is per-run output.
+fuzzing/corpus/
+fuzzing/crashes/
 experiments/
 .hypothesis/

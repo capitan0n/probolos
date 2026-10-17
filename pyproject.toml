@@ -112,6 +112,10 @@ ignore = [
 # made group- or world-writable on purpose to prove they are refused (S103),
 # and test helpers that build real disk images with tools run by name (S607).
 "tests/**" = ["S101", "S103", "S607"]
+# The fuzzer: its invariants are asserts (S101), and `random` chooses
+# mutations, never a secret (S311). Not shipped; nothing in it needs root
+# except build_corpus.py --disk, to read a medium.
+"fuzzing/**" = ["S101", "S311"]
 
 [tool.mypy]
 # The code that runs as root, and the contract it is driven through: the

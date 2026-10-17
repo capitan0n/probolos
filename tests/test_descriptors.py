@@ -25,6 +25,7 @@ from tests._support import (
     device_desc,
     endpoint_desc,
     iface_desc,
+    make_widget_device,
     power_config_desc,
     power_device_desc,
 )
@@ -526,6 +527,67 @@ class ParserUsesTheHardenedWalker(unittest.TestCase):
         blob = hid_device_desc() + b"\x00\x02\xff\xff"
         with self.assertRaises(descriptors.DescriptorParseError):
             descriptors.parse(blob)
+
+
+class OverstatedLengthMaskedByTheNextConfiguration(unittest.TestCase):
+    """
+    wTotalLength was measured from the configuration descriptor to the end of
+    the blob, so the configurations after it counted as its own, and an
+    overstatement in any but the last showed only by what it exceeded them
+    by. A first configuration declaring 60 bytes and delivering 18 read as
+    honest with a 54-byte one after it: no finding, and inspection_safe
+    stayed True, so early activation was not switched off. Real hardware gets
+    here: the kernel accepts a short read of configuration 0 and exposes it
+    at the length delivered, while the descriptor inside still declares the
+    original length.
+    """
+
+    # 18 bytes that declare 60: overstated by 42.
+    LIAR = config_desc(60, 1, value=1) + iface_desc(0, 0x08, 0x06, 0x50)
+
+    @staticmethod
+    def honest(n_ifaces, value=2):
+        return (config_desc(9 + 9 * n_ifaces, n_ifaces, value=value)
+                + b"".join(iface_desc(n, 0x08, 0x06, 0x50)
+                           for n in range(n_ifaces)))
+
+    @staticmethod
+    def blob(*configs):
+        return (device_desc(0x0951, 0x1666, num_configs=len(configs))
+                + b"".join(configs))
+
+    def test_an_overstated_first_configuration_is_reported(self):
+        ds = descriptors.parse(self.blob(self.LIAR, self.honest(5)))
+        self.assertIn("descriptor-length-overstated",
+                      {f.rule_id for f in rules.evaluate(_Stub(ds))})
+
+    def test_the_same_configuration_reads_the_same_wherever_it_sits(self):
+        """Alone and last it was already 42; first of two it was 0."""
+        for name, configs in (("alone", [self.LIAR]),
+                              ("first", [self.LIAR, self.honest(5)]),
+                              ("last", [self.honest(5), self.LIAR])):
+            with self.subTest(name):
+                ds = descriptors.parse(self.blob(*configs))
+                self.assertEqual(ds.length_overstated, 42)
+
+    def test_a_smaller_next_configuration_hides_none_of_it(self):
+        """An 18-byte second configuration made it 24 instead of 42."""
+        ds = descriptors.parse(self.blob(self.LIAR, self.honest(1)))
+        self.assertEqual(ds.length_overstated, 42)
+
+    def test_early_activation_is_switched_off(self):
+        dev = make_widget_device(self.blob(self.LIAR, self.honest(5)))
+        self.assertFalse(dev.inspection_safe)
+
+    def test_honest_configurations_stay_quiet(self):
+        """The false-positive guard: measured one by one, honest
+        configurations must still match their own declarations."""
+        raw = self.blob(self.honest(1, value=1), self.honest(5))
+        ds = descriptors.parse(raw)
+        self.assertEqual(ds.length_overstated, 0)
+        self.assertNotIn("descriptor-length-overstated",
+                         {f.rule_id for f in rules.evaluate(_Stub(ds))})
+        self.assertTrue(make_widget_device(raw).inspection_safe)
 
 
 if __name__ == "__main__":

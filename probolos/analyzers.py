@@ -323,5 +323,18 @@ def run(ctx: Context,
 
 
 def _stamp(epoch: float) -> str:
+    """
+    A ledger time as a date, or "an unknown date".
+
+    The time comes from the ledger file, which only has to hold a finite
+    number. One past year 9999, or before the platform's epoch, made
+    fromtimestamp() raise inside LedgerAnalyzer's own message, and a
+    device's CRITICAL descriptor-drift came out as analyzer-failed:ledger,
+    a NOTICE. The finding does not depend on the date it mentions.
+    """
     import datetime
-    return datetime.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+    try:
+        return datetime.datetime.fromtimestamp(epoch).strftime(
+            "%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "an unknown date"
