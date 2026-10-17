@@ -13,4 +13,4 @@ setuptools==84.0.0
 # build's own dependencies
 packaging==26.3
 pyproject_hooks==1.3.3
-tomli==2.4.1 ; python_version < "3.11"
+tomli==2.5.0 ; python_version < "3.11"
