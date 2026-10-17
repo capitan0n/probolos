@@ -105,12 +105,30 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
   in review after fuzzing.
 - **An impossible date in a state file could turn a drift alarm into a
   notice.** The ledger keeps any finite number as a time. One past the year
-  9999 (or before the epoch) made the drift finding's own text raise, so
+  9999 (or before the year 1) made the drift finding's own text raise, so
   `descriptor-drift` (CRITICAL) came out as `analyzer-failed:ledger` (NOTICE);
   `--trusted` stopped with a traceback at such an entry. Such a date now reads
   "an unknown date". Only a writer of the state file could set one.
+- **What the state files hold could stop `--trusted`, or write to the
+  terminal.** Any JSON string loads as a trust entry's label, identity or
+  port: a lone surrogate in one ended the listing with a traceback, and an
+  escape sequence reached the terminal raw. So did the schema a trust store
+  or ledger claims, printed in the "unreadable" warnings and the
+  `ledger-unavailable` finding, and a refused device's ports from the
+  ledger, printed in `previously-rejected`. All of them are written out
+  through textsafe now; an ordinary device name is shown as it was stored.
+  Only a writer of the state file could set them (root for the trust store;
+  for the ledger also the analyzer's account).
+- **A disk with 4096-byte sectors got a clean stage 4 report for a layout
+  that was never read.** Stage 4 reads partition tables in 512-byte blocks.
+  On a 4Kn medium the GPT header sits at byte 4096, so it was not found: the
+  disk read as MBR, the EFI-system-partition and hidden-partition checks did
+  not run, and nothing said so. Such a medium is now reported as not
+  inspected (`storage-unreadable`, "its sectors are not 512 bytes"), and the
+  block size goes to the log. Reading 4Kn layouts is for after 1.0.
 - `tests/test_cli.py` called `unittest.main()` before its last 15 tests, so
-  running the file directly skipped them (the suite itself ran them all).
+  running the file directly skipped them (the suite itself ran them all). A
+  test now checks that every test file ends with its guard.
 - **Ctrl-C under `--privsep` could do nothing.** The root gate passes Ctrl-C
   and hangup on to the analyzer, but a signal that landed just before the
   gate's blocking `recv()` did not interrupt it, so the gate passed it on
@@ -178,6 +196,21 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
   `network-with-keyboard` needs a declared keyboard.
 - SECURITY.md lists a newly found weakness: while the screen is locked, the
   internal-port and `--allow-port` exemptions do not apply.
+
+### Tests
+
+- **`fuzzing/`, a coverage-guided fuzzer** for everything Probolos parses
+  before a decision (descriptors, HID report descriptors, the medium, the gate
+  protocol, the agent socket, the state files) and for the whole analysis
+  path. Standard library only, with an optional atheris engine; not part of
+  the suite or the sdist (`fuzzing/README.md`, and a paragraph in
+  `docs/TECHNICAL-REFERENCE.md`). It found the UDF defect above, and the
+  review that followed it found the other fixes of this batch.
+- New property tests: storage with any HID interface is at least a WARNING
+  and one HID interface alone never is (also checked once over all 65 536
+  subclass/protocol pairs); a partition past the end of the medium is always
+  reported; and stage 4's reads, observed, start inside a device whose size
+  was believed.
 
 ## [1.0.0b1] — 2026-10-09 · first beta
 

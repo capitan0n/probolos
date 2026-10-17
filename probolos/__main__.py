@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Optional
 
 from . import (agentlink, daemon, gate, instance, ledger as ledger_mod,
-               report, rules, safety, session as session_mod, sysfs, textsafe,
-               trust as trust_mod, usbclass)
+               protocol, report, rules, safety, session as session_mod, sysfs,
+               textsafe, trust as trust_mod, usbclass)
 
 # The rename from Cerberus reached ~60 files and missed this one, which is the
 # first thing every user sees. Same figlet font ("small"), without smushing.
@@ -246,19 +246,29 @@ def cmd_trusted(path) -> None:
     import datetime
     print(f"Remembered devices ({len(entries)}) — admitted without asking:\n")
     for i, entry in enumerate(entries, start=1):
-        # The store only has to hold a finite number; one no date can carry
-        # stopped the listing at that entry.
+        # The store only has to hold a finite number; one that is no date
+        # (past year 9999, before year 1) stopped the listing with a traceback.
         try:
             stamp = datetime.datetime.fromtimestamp(entry.trusted_at)
             when = f"{stamp:%Y-%m-%d %H:%M}"
         except (OverflowError, OSError, ValueError):
             when = "an unknown date"
-        print(f"[{i}] {entry.label}")
-        print(f"      identity    : {entry.identity}")
-        print(f"      descriptors : {entry.descriptor_hash[:16]}…")
+        # Every string here comes from the store, and the store holds any
+        # JSON string it was given. A lone surrogate stopped the listing
+        # (print() cannot encode one), and a control character reached the
+        # terminal raw. So they are shown the way the gate writes labels and
+        # --remove-trusted prints identities: through textsafe, with the
+        # gate's own length limits, which leave what Probolos wrote as it is.
+        label = textsafe.clean(entry.label, protocol.MAX_LABEL)
+        identity = textsafe.clean(entry.identity, protocol.MAX_KEY)
+        ports = ", ".join(textsafe.clean(p) for p in entry.ports)
+        print(f"[{i}] {label}")
+        print(f"      identity    : {identity}")
+        print(f"      descriptors : "
+              f"{textsafe.clean(entry.descriptor_hash[:16])}…")
         print(f"      trusted     : {when}, admitted "
               f"{entry.times_admitted} time(s)")
-        print(f"      ports       : {', '.join(entry.ports) or '-'}")
+        print(f"      ports       : {ports or '-'}")
         print()
     print("Remove one with:  sudo python -m probolos --remove-trusted N   "
           "(N is the number in brackets)")

@@ -44,9 +44,11 @@ import queue
 import random
 import re
 import resource
+import shutil
 import signal
 import struct
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -459,16 +461,21 @@ def _json_values(corpus):
 # worker
 # ---------------------------------------------------------------------------
 
-def worker(wid, args, targets, stats_q, stop_at):
-    for p in (str(REPO), str(HERE)):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    if args.rss_mb:
-        lim = args.rss_mb * 1024 * 1024
+def _cap_memory(rss_mb):
+    """The --rss-mb cap, so a memory blow-up is a MemoryError, not swap."""
+    if rss_mb:
+        lim = rss_mb * 1024 * 1024
         try:
             resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
         except (ValueError, OSError):
             pass
+
+
+def worker(wid, args, targets, stats_q, stop_at):
+    for p in (str(REPO), str(HERE)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    _cap_memory(args.rss_mb)
     signal.signal(signal.SIGINT, signal.SIG_IGN)     # parent handles Ctrl-C
     signal.signal(signal.SIGALRM, _on_alarm)
 
@@ -613,9 +620,10 @@ def _target_of(path: Path, explicit):
     return m.group(1)
 
 
-def reproduce(path: Path, target, timeout):
+def reproduce(path: Path, target, timeout, rss_mb=0):
     import targets as T
-    signal.signal(signal.SIGALRM, _on_alarm)
+    _cap_memory(rss_mb)              # what the fuzzer ran under, or an OOM
+    signal.signal(signal.SIGALRM, _on_alarm)   # replays as "no crash"
     name = _target_of(path, target)
     data = path.read_bytes()
     print(f"target {name}, {len(data)} bytes")
@@ -635,9 +643,10 @@ def reproduce(path: Path, target, timeout):
     return 0
 
 
-def minimize(path: Path, target, timeout):
+def minimize(path: Path, target, timeout, rss_mb=0):
     """Delta-debugging: drop chunks while the SAME crash signature remains."""
     import targets as T
+    _cap_memory(rss_mb)
     signal.signal(signal.SIGALRM, _on_alarm)
     name = _target_of(path, target)
     fn = T.TARGETS[name]
@@ -742,9 +751,11 @@ def main():
             print(f"  {name:18} [{T.SEED_GROUP[name]:11}] {first}")
         return 0
     if args.reproduce:
-        return reproduce(args.reproduce, args.target, args.timeout)
+        return reproduce(args.reproduce, args.target, args.timeout,
+                         args.rss_mb)
     if args.minimize:
-        return minimize(args.minimize, args.target, args.timeout)
+        return minimize(args.minimize, args.target, args.timeout,
+                        args.rss_mb)
 
     targets = list(T.TARGETS) if args.target == "all" else \
         [t.strip() for t in args.target.split(",")]
@@ -766,6 +777,12 @@ def main():
                            if args.iterations else f"{args.duration:.0f}s"))
 
     stop_at = time.time() + args.duration if args.duration else None
+    # The ledger and trust targets need real files in a private directory.
+    # Workers make theirs inside this one, and the parent removes it at the
+    # end: a worker's own cleanup does not run when it is terminated, nor on
+    # Python 3.10, whose fork children leave through os._exit.
+    work_dir = tempfile.mkdtemp(prefix="probolos-fuzz-")
+    os.environ["PROBOLOS_FUZZ_TMP"] = work_dir
     stats_q = mp.Queue()
     procs = [mp.Process(target=worker, args=(i, args, targets, stats_q,
                                              stop_at), daemon=True)
@@ -801,6 +818,7 @@ def main():
             dead += 1
             print(f"\nworker exited with {p.exitcode} (traceback above; "
                   f"-9 = OOM killer, -11 = a crash in C code)")
+    shutil.rmtree(work_dir, ignore_errors=True)
 
     files = sorted(Path(args.crash_dir).glob("*.txt"))
     print(f"\n\n{'=' * 64}\n{sum(v[0] for v in state.values()):,} execs in "

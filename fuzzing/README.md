@@ -106,7 +106,9 @@ python fuzzing/fuzz_atheris.py protocol_request -max_len=8256 \
 Always give it the seed directory: from nothing, libFuzzer rarely produces
 valid JSON, and the JSON targets (`protocol_request`, `ledger`, `trust`,
 `agent_*`) then sit at a handful of covered edges. It writes what it finds
-back into that directory.
+back into that directory, crash inputs into `fuzzing/crashes/`, and the
+ledger and trust targets' scratch files into `fuzzing/corpus/.tmp/`; `-jobs`
+leaves `fuzz-N.log` files where you ran it. All of these are git-ignored.
 
 ## Adding a target
 

@@ -26,6 +26,9 @@ import os
 import sys
 from pathlib import Path
 
+# No __pycache__: under sudo it would be root's, in the user's checkout.
+sys.dont_write_bytecode = True
+
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent), str(HERE)]
 
@@ -94,12 +97,18 @@ def main() -> int:
                                 "report_descriptor"):
         saved += _save(out, "hid", name.replace(":", "_"), data)
     if args.disk:
-        fd = os.open(args.disk, os.O_RDONLY | os.O_CLOEXEC)
         try:
-            saved += _save(out, "disk", Path(args.disk).name,
-                           os.pread(fd, DISK_BYTES, 0))
-        finally:
-            os.close(fd)
+            fd = os.open(args.disk, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                data = os.pread(fd, DISK_BYTES, 0)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            hint = "" if os.geteuid() == 0 else " (reading a disk needs sudo)"
+            print(f"  --disk {args.disk}: {exc.strerror or exc}{hint}",
+                  file=sys.stderr)
+        else:
+            saved += _save(out, "disk", Path(args.disk).name, data)
 
     if not args.no_synthetic:
         import seeds
@@ -108,8 +117,6 @@ def main() -> int:
                 saved += _save(out, group, f"synthetic{i:02d}", data)
 
     print(f"\n{saved} new seed(s) in {out}/")
-    if os.geteuid() != 0 and args.disk:
-        print("(not root: reading --disk usually needs sudo)")
     return 0
 
 

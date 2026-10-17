@@ -1216,11 +1216,17 @@ class Probolos:
                 medium = storage.inspect_safely(
                     devices[0], open_fn=sysfs.open_block_device)
                 if medium.error:
+                    # A stall and an unsupported layout are reasons in their
+                    # own right; anything else is a read that failed, with
+                    # the raw error kept for the log.
+                    plain = (medium.timed_out or medium.error
+                             == storage.UNSUPPORTED_BLOCK_SIZE)
                     medium = self._medium_not_examined(
                         dev,
-                        medium.error if medium.timed_out
+                        medium.error if plain
                         else "its block device could not be read",
-                        detail=f"{devices[0]}: {medium.error}",
+                        detail=medium.detail if medium.detail
+                        else f"{devices[0]}: {medium.error}",
                         device=devices[0])
             elif devices:
                 medium = self._medium_not_examined(

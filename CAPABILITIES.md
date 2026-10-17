@@ -105,7 +105,8 @@ the MBR or GPT, and filesystem signatures (NTFS, exFAT, FAT, ext2/3/4, btrfs,
 ISO 9660, UDF; the last two only when their structure checks out). Anything
 else (f2fs, squashfs, ...) reads as "no known filesystem". An installer image
 written with `dd` (ISO 9660 behind an MBR) is shown as such. The read runs in
-a separate process with a time limit.
+a separate process with a time limit. Media with 512-byte logical blocks only:
+one with 4096-byte blocks is reported as not inspected.
 
 Stage 4 is skipped for composite devices (storage plus anything else) and for
 devices with incomplete descriptors, because switching them on would switch

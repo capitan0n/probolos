@@ -1915,5 +1915,79 @@ class Stage4ReachesTheMedium(_TreeCase):
                          ["The drive's contents could not be read"])
 
 
+
+class FourKSectorMediaAreNotJudgedAs512(unittest.TestCase):
+    """
+    Stage 4 reads partition tables in 512-byte blocks. A medium with 4096-byte
+    logical blocks keeps its GPT header at byte 4096, not 512, and its MBR
+    counts in 4096-byte blocks, so read as 512 it was the wrong layout: the
+    GPT went unseen, the EFI-system-partition and hidden-partition checks did
+    not run, and the report came out clean. Such a medium is reported as not
+    examined now, which is what it was.
+    """
+
+    @staticmethod
+    def _gpt_4k():
+        """A protective MBR, and a GPT header in LBA 1 of a 4Kn disk."""
+        data = bytearray(64 * 4096)
+        struct.pack_into("<BBBBBBBBII", data, 446,
+                         0, 0, 0, 0, 0xEE, 0, 0, 0, 1, 63)
+        data[510:512] = b"\x55\xaa"
+        data[4096:4104] = storage.GPT_SIGNATURE
+        return bytes(data)
+
+    def _inspect(self, data, block):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "disk.img")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            with mock.patch.object(storage, "read_size_sectors",
+                                   return_value=len(data) // 512), \
+                    mock.patch.object(storage, "read_logical_block_size",
+                                      return_value=block), \
+                    mock.patch("os.pread", wraps=os.pread) as reads:
+                return storage.inspect(path), reads.call_count
+
+    def test_a_4k_medium_is_reported_as_not_examined(self):
+        medium, reads = self._inspect(self._gpt_4k(), 4096)
+        self.assertEqual(medium.error, storage.UNSUPPORTED_BLOCK_SIZE)
+        self.assertIn("4096", medium.detail)
+        self.assertEqual(reads, 0, "nothing read in a layout it does not have")
+        findings = rules.storage_findings(medium)
+        self.assertEqual([f.rule_id for f in findings], ["storage-unreadable"])
+        self.assertIn("not inspected", report.render_medium(medium, findings))
+
+    def test_512_and_an_unknown_size_are_read_as_before(self):
+        for block in (512, None):
+            with self.subTest(block=block):
+                medium, reads = self._inspect(self._gpt_4k(), block)
+                self.assertIsNone(medium.error)
+                self.assertGreater(reads, 0)
+
+    def test_the_size_comes_from_sysfs(self):
+        for text, expected in (("4096\n", 4096), ("512\n", 512),
+                               ("junk", None)):
+            with self.subTest(text=text), \
+                    mock.patch.object(storage.Path, "read_text",
+                                      return_value=text):
+                self.assertEqual(storage.read_logical_block_size("/dev/sdb"),
+                                 expected)
+        with mock.patch.object(storage.Path, "read_text",
+                               side_effect=FileNotFoundError):
+            self.assertIsNone(storage.read_logical_block_size("/dev/sdb"))
+
+    def test_the_card_watcher_keeps_the_reason(self):
+        unsupported = storage.MediumReport(
+            device="/dev/sdb", error=storage.UNSUPPORTED_BLOCK_SIZE,
+            detail="/dev/sdb: logical block size 4096 bytes")
+        with mock.patch.object(mediawatch.sysfs, "block_node_pending",
+                               return_value=None), \
+                mock.patch.object(mediawatch.storage, "inspect_safely",
+                                  return_value=unsupported):
+            medium = mediawatch.MediaWatch._inspect("sdb")
+        self.assertEqual(medium.error, storage.UNSUPPORTED_BLOCK_SIZE)
+        self.assertIn("4096", medium.detail)
+
+
 if __name__ == "__main__":
     unittest.main()

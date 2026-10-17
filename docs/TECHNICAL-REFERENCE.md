@@ -267,7 +267,9 @@ reach the terminal, the dialogs, the JSON log, the trust store and the ledger.
   128-byte entries) for their type GUID and attributes, and only the card rules
   use them; the geometry rules judge the protective MBR. A medium with no
   partition table is read up to `0x10200` bytes, past the ISO 9660/UDF
-  descriptors at sector 16.
+  descriptors at sector 16. Only media with 512-byte logical blocks are read:
+  on one with 4096-byte blocks (4Kn) the partition table is laid out in
+  those, so stage 4 does not read it and says so (`not inspected`).
 - **Filesystems.** A fixed set, not libblkid: NTFS, exFAT, FAT12/16/32,
   ext2/3/4, btrfs, ISO 9660, UDF. ISO 9660 counts only when the descriptor set,
   the primary volume descriptor's both-byte-order fields, the root directory
@@ -279,7 +281,8 @@ reach the terminal, the dialogs, the JSON log, the trust store and the ledger.
   partition only if the volume actually reaches that partition; a tiny ISO
   does not explain away hidden space.
 - **Failures** (switch-on refused, no block node, node never ready, unreadable
-  or stalled read, removal mid-scan, re-block refused) all show as
+  or stalled read, a logical block size other than 512 bytes, removal
+  mid-scan, re-block refused) all show as
   `not inspected: <reason>` from a fixed vocabulary, plus `storage-unreadable`.
   The raw error goes to the JSON log only (`medium.detail`).
 - **Deadline.** The read runs in a forked child with a hard time limit while

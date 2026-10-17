@@ -1220,7 +1220,7 @@ class AnImpossibleDateCannotSilenceDrift(unittest.TestCase):
     """
     from_raw keeps any finite number as first_seen. LedgerAnalyzer puts that
     date into the drift finding's text, and a date past year 9999 (or before
-    the platform's epoch) made fromtimestamp() raise there: the device's
+    year 1) made fromtimestamp() raise there: the device's
     CRITICAL descriptor-drift came out as analyzer-failed:ledger, a NOTICE.
     The finding does not depend on the date, so the date gives way.
     """
@@ -1245,6 +1245,61 @@ class AnImpossibleDateCannotSilenceDrift(unittest.TestCase):
                 self.assertEqual([f.rule_id for f in findings
                                   if f.rule_id.startswith("analyzer-failed")],
                                  [])
+
+
+
+class LedgerTextReachesNoTerminalRaw(unittest.TestCase):
+    """
+    The ledger file is written by the analyzer's account, and two of its
+    strings were printed as they were: the schema it claims, in the startup
+    warning and the ledger-unavailable finding, and the ports of a refused
+    device, in the previously-rejected finding. An escape sequence in either
+    reached the terminal, and a lone surrogate ended the prompt's output.
+    """
+
+    HOSTILE = "\x1b]0;pwned\x07\x1b[2J\udc9b"
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp(prefix="probolos-ledger-"))
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.path = self.directory / "ledger.json"
+
+    def assertSafe(self, text):
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x07", text)
+        text.encode("utf-8")                 # no lone surrogate
+
+    def test_the_schema_is_not_echoed_raw(self):
+        self.path.write_text(json.dumps({"schema": self.HOSTILE,
+                                         "entries": {}}))
+        led = Ledger(self.path)
+        self.assertIn("unsupported ledger schema", led.load_error)
+        self.assertSafe(led.load_error)
+        findings = analyzers.run(analyzers.Context(
+            device=make_device(), ledger=led))
+        unavailable = [f for f in findings
+                       if f.rule_id == "ledger-unavailable"]
+        self.assertEqual(len(unavailable), 1)
+        self.assertSafe(unavailable[0].explanation)
+
+    def test_a_refused_device_s_ports_are_not_echoed_raw(self):
+        device = make_device()
+        ident = ledger_mod.identity_of(device)
+        digest = ledger_mod.descriptor_fingerprint(device)
+        self.path.write_text(json.dumps({
+            "schema": ledger_mod.SCHEMA_VERSION,
+            "fingerprint_scheme": "normalized-v1",
+            "entries": {ident: dict(
+                GOOD, identity=ident, descriptor_hash=digest,
+                baseline_hash=digest, known_hashes=[digest],
+                decisions=["user rejected"], ports=["1-4" + self.HOSTILE])}}))
+        led = Ledger(self.path)
+        self.assertIsNone(led.load_error)
+        findings = analyzers.run(analyzers.Context(device=device, ledger=led))
+        refused = [f for f in findings if f.rule_id == "previously-rejected"]
+        self.assertEqual(len(refused), 1)
+        self.assertSafe(refused[0].explanation)
+        self.assertIn("1-4\\x1b]0;pwned", refused[0].explanation)
 
 
 if __name__ == "__main__":

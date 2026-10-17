@@ -1472,6 +1472,25 @@ class EveryMediumFailureTakesOnePath(unittest.TestCase):
         self.assertNotIn("/dev/sda", medium.error)
         self.assertIn("Input/output error", medium.detail)
 
+    def test_an_unsupported_block_size_is_named_not_called_unreadable(self):
+        """A 4Kn medium was not read at all; "could not be read" is wrong."""
+        unsupported = storage.MediumReport(
+            device="/dev/sda", error=storage.UNSUPPORTED_BLOCK_SIZE,
+            detail="/dev/sda: logical block size 4096 bytes")
+        out = io.StringIO()
+        with mock.patch.object(daemon_mod.sysfs, "set_authorized"), \
+             mock.patch.object(daemon_mod.storage, "find_block_devices",
+                               return_value=["/dev/sda"]), \
+             mock.patch.object(daemon_mod.sysfs, "block_node_pending",
+                               return_value=None), \
+             mock.patch.object(daemon_mod.storage, "inspect_safely",
+                               return_value=unsupported), \
+             contextlib.redirect_stdout(out):
+            medium = self.engine._inspect_medium(self.dev)
+        self._assert_unexamined_and_clean(medium, out.getvalue())
+        self.assertEqual(medium.error, storage.UNSUPPORTED_BLOCK_SIZE)
+        self.assertIn("4096", medium.detail)
+
     def test_the_warning_survives_the_rule_being_disabled(self):
         medium, _printed = self._switch_on_fails()
         rendered = " ".join(report.render_medium(medium, []).split())

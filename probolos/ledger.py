@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import atomicio, usbclass
+from . import atomicio, textsafe, usbclass
 
 def default_path() -> Path:
     """
@@ -586,7 +586,12 @@ class Ledger:
             self.load_error = "state file is not a JSON object"
             return
         if data.get("schema") != SCHEMA_VERSION:
-            self.load_error = f"unsupported ledger schema {data.get('schema')}"
+            # repr, cleaned and cut: the value is whatever the file holds,
+            # and this message is printed at startup and put into the
+            # ledger-unavailable finding. Raw, an escape sequence in it
+            # reached the terminal.
+            self.load_error = ("unsupported ledger schema "
+                               f"{textsafe.clean(repr(data.get('schema')), 40)}")
             return
         media_error = self._load_media(data.get("media"))
         entries = data.get("entries")

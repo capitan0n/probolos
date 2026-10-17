@@ -526,9 +526,11 @@ else:
             self.assertIsNone(medium.error)
             # Whatever the medium says about its size and its partitions,
             # every read it got out of stage 4 starts inside the device when
-            # the size was believed, and below the cap when it was not.
-            # (The reads themselves are observed: checking safe_read_offset's
-            # answer again would only restate its own postcondition.)
+            # the size was believed. (The reads themselves are observed:
+            # checking safe_read_offset's answer again would only restate its
+            # own postcondition.) With no believed size only the 32-bit MBR
+            # field bounds a read, at most 2 TiB, so the cap below cannot
+            # fail today; it is there for the day an offset is not 32 bits.
             if medium.size_sectors is not None:
                 self.assertLessEqual(medium.size_sectors,
                                      storage_hardening.MAX_PLAUSIBLE_SECTORS)

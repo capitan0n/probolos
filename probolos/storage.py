@@ -239,6 +239,23 @@ def read_size_sectors(device: str) -> Optional[int]:
         return None
 
 
+def read_logical_block_size(device: str) -> Optional[int]:
+    """The medium's logical block size in bytes, from sysfs, or None."""
+    name = Path(device).name
+    try:
+        return int(Path(f"/sys/block/{name}/queue/logical_block_size")
+                   .read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+# The operator-facing reason (MediumReport.error's fixed vocabulary) for a
+# medium whose logical blocks are not 512 bytes. The size itself goes to
+# `detail`: the device reports it, and it does not get to write the prompt.
+UNSUPPORTED_BLOCK_SIZE = ("its sectors are not 512 bytes, and stage 4 reads "
+                          "512-byte layouts only")
+
+
 # --------------------------------------------------------------------------
 # Parsing
 # --------------------------------------------------------------------------
@@ -721,6 +738,20 @@ def inspect(device: str, open_fn=None) -> MediumReport:
     if not size_ok:
         report.suspicious.append(f"declared device size rejected: {size_reason}")
         report.size_sectors = None
+
+    # Every offset below is in 512-byte blocks: the MBR's starts and lengths,
+    # the GPT header at LBA 1, its entries at LBA 2. A medium with larger
+    # logical blocks (4Kn disks and some enclosures) is laid out in those,
+    # and the kernel reads it that way, so read as 512 it was the wrong
+    # layout: the GPT was not found, the EFI-system-partition and
+    # hidden-partition checks did not run, partitions were sniffed at the
+    # wrong offsets -- and the report came out clean. Saying it was not
+    # examined is the truth; judging a layout the system does not use was not.
+    block = read_logical_block_size(device)
+    if block is not None and block != SECTOR:
+        report.error = UNSUPPORTED_BLOCK_SIZE
+        report.detail = f"{device}: logical block size {block} bytes"
+        return report
 
     fd = None
     try:

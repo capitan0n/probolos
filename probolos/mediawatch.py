@@ -580,7 +580,8 @@ class MediaWatch:
                 device=node, error="its block device did not become ready",
                 detail=f"{node}: {pending}")
         medium = storage.inspect_safely(node, open_fn=sysfs.open_block_device)
-        if medium.error and not medium.timed_out:
+        if medium.error and not medium.timed_out \
+                and medium.error != storage.UNSUPPORTED_BLOCK_SIZE:
             medium.detail = f"{node}: {medium.error}"
             medium.error = "its block device could not be read"
         return medium

@@ -43,5 +43,7 @@ htmlcov/
 # sectors) and everything the fuzzer kept; crashes/ is per-run output.
 fuzzing/corpus/
 fuzzing/crashes/
+# libFuzzer's per-job logs (fuzz_atheris.py -jobs), in the directory it ran in
+fuzz-*.log
 experiments/
 .hypothesis/

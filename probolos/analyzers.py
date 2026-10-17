@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence
 
 from . import payload as payload_mod
-from . import rules
+from . import rules, textsafe
 
 
 @dataclass
@@ -179,7 +179,9 @@ class LedgerAnalyzer(Analyzer):
                 "You have refused this device before",
                 f"This identity was rejected on a previous occasion "
                 f"(seen {entry.times_seen} time(s), ports: "
-                f"{', '.join(entry.ports)})."))
+                # The ports are the ledger file's strings; a finding is
+                # printed at the prompt.
+                f"{', '.join(textsafe.clean(p) for p in entry.ports)})."))
 
         return findings
 
@@ -327,7 +329,7 @@ def _stamp(epoch: float) -> str:
     A ledger time as a date, or "an unknown date".
 
     The time comes from the ledger file, which only has to hold a finite
-    number. One past year 9999, or before the platform's epoch, made
+    number. One past year 9999, or before year 1, made
     fromtimestamp() raise inside LedgerAnalyzer's own message, and a
     device's CRITICAL descriptor-drift came out as analyzer-failed:ledger,
     a NOTICE. The finding does not depend on the date it mentions.

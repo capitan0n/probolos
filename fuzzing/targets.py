@@ -73,9 +73,16 @@ _PRIVATE_DIR = None
 
 
 def _private_dir() -> Path:
+    """
+    Made inside $PROBOLOS_FUZZ_TMP when the engine sets it (heavy_fuzz.py
+    removes that whole directory itself, fuzz_atheris.py keeps it under
+    fuzzing/corpus/, which git ignores), else in the system temp dir.
+    """
     global _PRIVATE_DIR
     if _PRIVATE_DIR is None:
-        _PRIVATE_DIR = Path(tempfile.mkdtemp(prefix="probolos-fuzz-"))
+        _PRIVATE_DIR = Path(tempfile.mkdtemp(
+            prefix="probolos-fuzz-",
+            dir=os.environ.get("PROBOLOS_FUZZ_TMP") or None))
         atexit.register(shutil.rmtree, _PRIVATE_DIR, ignore_errors=True)
     return _PRIVATE_DIR
 
@@ -272,7 +279,9 @@ def target_storage_inspect(data: bytes) -> None:
     if med.size_sectors is not None:
         assert med.size_sectors <= storage_hardening.MAX_PLAUSIBLE_SECTORS
     # The reads stage 4 actually made (not safe_read_offset's own answer):
-    # inside the device when its size was believed, below the cap always.
+    # inside the device when its size was believed. The cap cannot fail while
+    # every offset comes from a 32-bit MBR field (at most 2 TiB); it guards
+    # the day one does not.
     for offset in _READS:
         assert offset <= storage_hardening.MAX_SEEK_OFFSET, hex(offset)
         if offset and med.size_sectors is not None:
@@ -446,6 +455,9 @@ def target_textsafe(data: bytes) -> None:
     if textsafe.NOTE_TRUNCATED in result.notes:
         assert result.text.endswith("...")
         assert len(result.text) - 3 <= limit
+        # A cut keeps the start of what was sent, never a later piece.
+        whole = textsafe.sanitize(value, 10 ** 9).text
+        assert whole.startswith(result.text[:-3]), (result.text, whole)
     else:
         assert len(result.text) <= limit
     for columns in (3, 17, 80):

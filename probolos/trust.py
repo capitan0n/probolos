@@ -46,7 +46,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import atomicio
+from . import atomicio, textsafe
 
 SCHEMA_VERSION = 1
 
@@ -285,7 +285,10 @@ class TrustStore:
             self.load_error = "state file is not a JSON object"
             return
         if data.get("schema") != SCHEMA_VERSION:
-            self.load_error = f"unsupported trust schema {data.get('schema')}"
+            # repr, cleaned and cut, as in the ledger: this is printed by
+            # --trusted and at startup, and the value is the file's.
+            self.load_error = ("unsupported trust schema "
+                               f"{textsafe.clean(repr(data.get('schema')), 40)}")
             return
         devices = data.get("devices", {})
         if not isinstance(devices, dict):

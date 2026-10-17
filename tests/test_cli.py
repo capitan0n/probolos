@@ -467,6 +467,73 @@ class ATrustDateNoCalendarHolds(unittest.TestCase):
         self.assertIn("trusted     : an unknown date, admitted", out.getvalue())
 
 
+class ATrustEntryCannotStopOrSteerTheListing(unittest.TestCase):
+    """
+    The trust store holds any JSON string as a label, identity or port. A
+    lone surrogate in one ended --trusted with UnicodeEncodeError at that
+    entry (print() to a UTF-8 terminal cannot encode it), and an escape
+    sequence reached the terminal raw, from an entry or from the schema the
+    file claims. Both are written out through textsafe now, as
+    --remove-trusted already prints identities, and an ordinary device name
+    is shown as it was stored.
+    """
+
+    def _listing(self, label, identity, port, digest=None):
+        import tempfile
+        from probolos import trust as trust_mod
+        from tests._support import make_device
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trusted.json"
+            store = trust_mod.TrustStore(path)
+            store.trust(make_device())
+            for entry in store.devices.values():
+                entry.label, entry.identity, entry.ports = (label, identity,
+                                                            [port])
+                entry.descriptor_hash = digest or entry.descriptor_hash
+            self.assertIsNone(store.save())
+            # A real terminal's encoding: a StringIO would accept anything.
+            raw = io.BytesIO()
+            out = io.TextIOWrapper(raw, encoding="utf-8")
+            with redirect_stdout(out):
+                cli.cmd_trusted(path)
+            out.flush()
+        return raw.getvalue().decode("utf-8")
+
+    def test_hostile_text_is_written_out(self):
+        shown = self._listing("Evil\ud800Stick\x1b[2J", "0951:1666:\udfff",
+                              "1-4\x1b]0;x\x07", digest="\x1b[2J\udc9bab")
+        self.assertIn("[1] Evil\\ud800Stick\\x1b[2J", shown)
+        self.assertIn("identity    : 0951:1666:\\udfff", shown)
+        self.assertIn("descriptors : \\x1b[2J\\udc9b", shown)
+        self.assertNotIn("\x1b", shown)
+        self.assertNotIn("\x07", shown)
+
+    def test_an_unreadable_store_says_so_without_its_contents(self):
+        """The schema the file claims was put into the error raw."""
+        import json
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trusted.json"
+            path.write_text(json.dumps({"schema": "\x1b]0;pwned\x07\udc9b",
+                                        "devices": {}}))
+            os.chmod(path, 0o600)
+            with self.assertRaises(SystemExit) as stop:
+                cli.cmd_trusted(path)
+        message = str(stop.exception.code)
+        self.assertIn("unsupported trust schema", message)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\x07", message)
+        message.encode("utf-8")              # no lone surrogate either
+
+    def test_what_probolos_writes_is_shown_as_it_is(self):
+        shown = self._listing("Kingston DataTraveler 3.0", "0951:1666:AABBCCDD",
+                              "1-4")
+        self.assertIn("[1] Kingston DataTraveler 3.0\n", shown)
+        self.assertIn("identity    : 0951:1666:AABBCCDD\n", shown)
+        self.assertIn("ports       : 1-4\n", shown)
+
+
 # ==========================================================================
 # --remove-trusted / --remove-all
 # ==========================================================================
@@ -661,6 +728,34 @@ class OneGatePerMachine(unittest.TestCase):
              redirect_stdout(io.StringIO()) as out:
             self.assertIsNone(cli.claim_the_gate())
         self.assertIn("could not check", out.getvalue())
+
+
+
+# ==========================================================================
+# The suite's own files
+# ==========================================================================
+
+class EveryTestFileEndsWithItsMainGuard(unittest.TestCase):
+    """
+    A test file run directly stops at unittest.main(), so the classes after
+    it are never defined and never run, silently. This file had its guard
+    15 tests early -- after the QA log had recorded the same defect as
+    fixed. run_all and discover import the files and are not affected, which
+    is why nothing noticed.
+    """
+
+    def test_the_guard_is_the_last_statement(self):
+        import ast
+        late = []
+        for path in sorted(Path(__file__).resolve().parent.glob("test_*.py")):
+            body = ast.parse(path.read_text(encoding="utf-8")).body
+            guards = [i for i, node in enumerate(body)
+                      if isinstance(node, ast.If)
+                      and ast.unparse(node.test).replace("'", '"')
+                      == '__name__ == "__main__"']
+            if guards and guards != [len(body) - 1]:
+                late.append(path.name)
+        self.assertEqual(late, [])
 
 
 if __name__ == "__main__":

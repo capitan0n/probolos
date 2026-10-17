@@ -13,7 +13,9 @@ after it goes to libFuzzer (-runs, -max_total_time, -jobs, -dict, corpus
 dirs...). Pointing it at heavy_fuzz's corpus/<group> or corpus/queue/<group>
 reuses what that already found, and heavy_fuzz loads what atheris adds there.
 With -jobs/-workers libFuzzer re-runs this file without the target name; it
-is passed on in PROBOLOS_FUZZ_TARGET.
+is passed on in PROBOLOS_FUZZ_TARGET. Crash inputs go to fuzzing/crashes/
+(-artifact_prefix), and -jobs writes its fuzz-N.log files to the current
+directory.
 
 Why both? atheris instruments bytecode and gets libFuzzer's comparison
 feedback (it solves magic values like b"EFI PART" by itself); heavy_fuzz
@@ -33,6 +35,18 @@ if len(sys.argv) >= 2 and not sys.argv[1].startswith("-"):
     os.environ["PROBOLOS_FUZZ_TARGET"] = NAME     # for -jobs children
 else:
     NAME = os.environ.get("PROBOLOS_FUZZ_TARGET") or sys.exit(__doc__)
+
+# Keep what libFuzzer and the targets write inside fuzzing/, where git ignores
+# it: crash inputs (libFuzzer's default is the current directory, often the
+# repo root) and the ledger/trust targets' temporary files (libFuzzer ends the
+# process without running Python's exit handlers, so they would stay in /tmp).
+_CRASHES = HERE / "crashes"
+_CRASHES.mkdir(exist_ok=True)
+if not any(a.startswith("-artifact_prefix=") for a in sys.argv):
+    sys.argv.append(f"-artifact_prefix={_CRASHES}/")
+_TMP = HERE / "corpus" / ".tmp"
+_TMP.mkdir(parents=True, exist_ok=True, mode=0o700)
+os.environ.setdefault("PROBOLOS_FUZZ_TMP", str(_TMP))
 
 with atheris.instrument_imports(include=["probolos"]):
     import targets  # noqa: E402
