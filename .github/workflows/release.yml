@@ -69,7 +69,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      - run: python -m pip install -r .github/requirements-release.txt
+      # Hash-checked: see the header of requirements-release.txt.
+      - run: python -m pip install --require-hashes -r .github/requirements-release.txt
       # The tag must name the version the files will carry. pyproject.toml is
       # the single source of truth (see probolos/__init__.py), and a v1.0.0
       # tag on a tree that still says 1.0.0rc2 would publish the wrong thing
