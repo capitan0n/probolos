@@ -6,13 +6,13 @@
 #
 # Locally: pip install -r .github/requirements-ci.txt
 coverage[toml]==7.16.2
-hypothesis==6.168.3
+hypothesis==6.168.5
 pyyaml==6.0.3
-ruff==0.16.10
+ruff==0.17.0
 
 # coverage's TOML support on Python 3.10, which has no tomllib: without it
 # coverage refuses to start with the [tool.coverage] config in pyproject.toml.
-tomli==2.4.1 ; python_version < "3.11"
+tomli==2.5.0 ; python_version < "3.11"
 
 # hypothesis's own dependencies
 sortedcontainers==2.4.0
