@@ -522,6 +522,7 @@ class ATrustEntryCannotStopOrSteerTheListing(unittest.TestCase):
                 cli.cmd_trusted(path)
         message = str(stop.exception.code)
         self.assertIn("unsupported trust schema", message)
+        self.assertIn("Nothing in it is admitted without asking", message)
         self.assertNotIn("\x1b", message)
         self.assertNotIn("\x07", message)
         message.encode("utf-8")              # no lone surrogate either
@@ -532,6 +533,59 @@ class ATrustEntryCannotStopOrSteerTheListing(unittest.TestCase):
         self.assertIn("[1] Kingston DataTraveler 3.0\n", shown)
         self.assertIn("identity    : 0951:1666:AABBCCDD\n", shown)
         self.assertIn("ports       : 1-4\n", shown)
+
+
+class RemovingTrustFromABrokenStoreSaysWhatItRestored(unittest.TestCase):
+    """
+    A store with a malformed entry trusts nothing. --remove-trusted repairs
+    it, and the rewrite keeps only what could be read, so the remaining
+    entries are trusted again -- which used to happen without a word. And
+    with no readable entry at all, "--remove-trusted all" said "No
+    remembered devices." and left the broken file as it was.
+    """
+
+    def setUp(self):
+        import json
+        import os
+        import tempfile
+        from probolos import trust as trust_mod
+        from tests._support import make_device
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "trusted.json"
+        store = trust_mod.TrustStore(self.path)
+        store.trust(make_device())
+        store.trust(make_device(serial="SECOND"))
+        self.assertIsNone(store.save())
+        data = json.loads(self.path.read_text())
+        data["devices"]["planted"] = {"key": 1}
+        self.path.write_text(json.dumps(data))
+        os.chmod(self.path, 0o600)
+        self.trust_mod = trust_mod
+
+    def _remove(self, pattern):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli.cmd_remove_trusted(self.path, pattern, assume_yes=True)
+        return out.getvalue(), self.trust_mod.TrustStore(self.path)
+
+    def test_removing_one_says_the_rest_are_trusted_again(self):
+        printed, after = self._remove("1")
+        self.assertIsNone(after.load_error)
+        self.assertEqual(len(after.devices), 1)
+        self.assertIn("1 remembered device(s) are admitted without asking "
+                      "again", printed)
+
+    def test_all_repairs_a_store_with_nothing_readable(self):
+        import json
+        import os
+        self.path.write_text(json.dumps({"schema": 1, "devices": {
+            "planted": {"key": 1}}}))
+        os.chmod(self.path, 0o600)
+        printed, after = self._remove("all")
+        self.assertNotIn("No remembered devices", printed)
+        self.assertIsNone(after.load_error)
+        self.assertEqual(after.devices, {})
 
 
 # ==========================================================================

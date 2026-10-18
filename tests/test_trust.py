@@ -777,5 +777,84 @@ class AnOverlongAdmissionCountStillSaves(unittest.TestCase):
                 self.assertEqual(store.save(), str(error))
 
 
+
+class AStoreThatDidNotLoadCleanlyTrustsNothing(unittest.TestCase):
+    """
+    One malformed entry made load() skip it and report the store, and the
+    entries it could read went on admitting their devices without a
+    question, while startup said "nothing will be treated as trusted" and
+    --trusted refused to list them: the operator was told the opposite of
+    what happened, and could not see what was let in. A broken entry is
+    corruption or tampering; either way the file is not what was written,
+    so it vouches for nothing until it loads cleanly.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "trusted.json"
+        self.dev = make_kingston_device(storage_device_blob())
+        writer = trust.TrustStore(self.path)
+        self.assertIsNotNone(writer.trust(self.dev))
+        self.assertIsNone(writer.save())
+        self.clean = self.path.read_text()
+        data = json.loads(self.clean)
+        data["devices"]["planted"] = {"key": 1}
+        self.path.write_text(json.dumps(data))
+        os.chmod(self.path, 0o600)
+
+    def test_one_malformed_entry_stops_every_entry_admitting(self):
+        store = trust.TrustStore(self.path)
+        self.assertIn("malformed", store.load_error)
+        self.assertEqual(len(store.devices), 1, "the readable entry is kept")
+        self.assertFalse(store.is_trusted(self.dev))
+        self.assertIsNone(store.lookup(self.dev))
+
+    def test_a_repaired_file_counts_again_without_a_restart(self):
+        store = trust.TrustStore(self.path)
+        self.assertFalse(store.is_trusted(self.dev))
+        self.path.write_text(self.clean)
+        os.chmod(self.path, 0o600)
+        self.assertTrue(store.is_trusted(self.dev))
+        self.assertIsNone(store.load_error)
+
+    def test_trust_can_still_be_removed(self):
+        """Removing trust is the safe direction, and how the file is fixed:
+        an explicit repair, which nothing but --remove-trusted asks for."""
+        store = trust.TrustStore(self.path)
+        self.assertEqual(store.clear(), 1)
+        self.assertIsNone(store.save(repair=True))
+        repaired = trust.TrustStore(self.path)
+        self.assertIsNone(repaired.load_error)
+        self.assertEqual(repaired.devices, {})
+
+    def test_nothing_else_rewrites_it(self):
+        """A save that is not a repair would keep only the readable entries
+        and drop the rest -- trusting again what the operator was told is
+        not trusted. The daemon's "always" and admission bookkeeping write
+        through save(); a store that broke while a question was open was
+        rewritten that way."""
+        store = trust.TrustStore(self.path)
+        before = self.path.read_text()
+        self.assertIn("did not load cleanly", store.save())
+        self.assertEqual(self.path.read_text(), before)
+        self.assertIsNone(store.trust(self.dev), "nothing added to it")
+
+    def test_a_store_that_breaks_while_a_question_is_open_is_not_rewritten(self):
+        """The race: clean when "always" was offered, broken by the time the
+        answer is saved."""
+        self.path.write_text(self.clean)
+        os.chmod(self.path, 0o600)
+        store = trust.TrustStore(self.path)
+        self.assertIsNone(store.load_error)
+        self.path.write_text(json.dumps(dict(
+            json.loads(self.clean), devices=dict(
+                json.loads(self.clean)["devices"], planted={"key": 1}))))
+        os.chmod(self.path, 0o600)
+        self.assertIsNone(store.trust(self.dev))
+        self.assertIn("did not load cleanly", store.save())
+        self.assertIn("planted", self.path.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

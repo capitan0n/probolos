@@ -394,7 +394,8 @@ class TrustStore:
 
         return None
 
-    def save(self, readable: bool = False) -> Optional[str]:
+    def save(self, readable: bool = False, repair: bool = False
+             ) -> Optional[str]:
         """
         Write the store; None on success, else the error -- every time.
 
@@ -409,8 +410,22 @@ class TrustStore:
         and a store it created 0600 would be one the analyzer (`nobody`) could
         not read back -- the device remembered on disk and asked about anyway.
         An existing file keeps the read bits it has, whatever this says.
+
+        A store that did not load cleanly is not rewritten unless `repair`
+        says so: saved, it would keep only what could be read, and the
+        entries the operator was told are not trusted would be trusted again
+        with nobody having decided it. The daemon's writes checked this when
+        the question was asked, and a store that broke while it was open was
+        rewritten anyway. Only --remove-trusted repairs, and says what the
+        store holds afterwards.
         """
         import os
+        if self.load_error and not repair:
+            message = (f"refusing to rewrite a trust store that did not load "
+                       f"cleanly ({self.load_error})")
+            self.repeated_save_error = message == self._last_save_error
+            self._last_save_error = message
+            return message
         # Keep the read bits the file already has, never any write bits.
         # Under --privsep the launcher makes this file 0644 so the analyzer
         # can read it; a root-run `--remove-trusted` rewriting it at 0600
@@ -466,6 +481,16 @@ class TrustStore:
 
     def lookup(self, dev) -> Optional[TrustedDevice]:
         self.refresh()
+        # Fail closed. A store that did not load cleanly vouches for nothing,
+        # not even the entries it could read: one malformed entry left the
+        # others admitted without a question, while startup said "nothing
+        # will be treated as trusted" and --trusted refused to list them. A
+        # broken entry is corruption or tampering, and either way the file
+        # is not what was written. The entries stay loaded, so removing trust
+        # (--remove-trusted) still works, and a repaired file counts again at
+        # the next lookup, since refresh() reloads it.
+        if self.load_error:
+            return None
         key = key_for(dev)
         return self.devices.get(key) if key else None
 
@@ -478,6 +503,11 @@ class TrustStore:
         if key is None:
             return None
         self.refresh()
+        if self.load_error:
+            # Not into a store that did not load cleanly: saved, it would
+            # keep only what could be read. The caller says why from
+            # load_error.
+            return None
         now = time.time()
         entry = TrustedDevice(
             key=key,

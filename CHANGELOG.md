@@ -16,6 +16,19 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ### Security
 
+- **A trust store with one malformed entry still admitted the others
+  without asking.** The broken entry was skipped and reported, startup said
+  "nothing will be treated as trusted" and `--trusted` refused to list the
+  store, but every entry it could read went on admitting its device without
+  a question. A store that does not load cleanly now trusts nothing until it
+  does, and a corrected file counts again without a restart. Nothing
+  rewrites it but `--remove-trusted`, which repairs it and says what is
+  trusted afterwards (with nothing readable left, `all` used to answer "No
+  remembered devices." and leave the file broken). An "always" answered
+  after the store broke used to be saved over it, keeping only the readable
+  entries, so a restart trusted them all again. Only a writer of the
+  root-owned store could cause any of this, and a broken entry means
+  corruption or tampering.
 - **The 2026-10-13 batch was never in the code.** Its fixes (the storage
   reader below, the card-reader watch fixes, isohybrid images, `--history`
   serials) were committed as `probolos-fixes.patch` and deleted again

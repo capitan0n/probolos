@@ -134,10 +134,14 @@ Run by hand without root, the history defaults to the XDG state directory.
   one link, and ownership changes use pinned descriptors. Without it,
   `--ledger /etc/x.json` would have given `/etc` to `nobody`.
 - **Everything is validated on load.** Trust entries with wrong types, an
-  empty fingerprint or a key that disagrees with their name are ignored and
-  counted. Non-object JSON, bad encodings, non-finite timestamps, special files
-  and files over 8 MiB are rejected. The trust checks apply to the opened file
-  and its directory chain; a store that fails them trusts nothing.
+  empty fingerprint or a key that disagrees with their name are counted, and
+  one of them is enough for the store to trust nothing until it loads cleanly:
+  the file is not what was written. Nothing rewrites such a store but
+  `--remove-trusted`, which repairs it: it keeps what could be read (or
+  nothing, with `all`) and says what is trusted afterwards. Non-object JSON,
+  bad encodings, non-finite timestamps, special files and files over 8 MiB are
+  rejected. The trust checks apply to the opened file and its directory chain;
+  a store that fails them trusts nothing.
 - The trust store is re-read whenever it changes, so `--remove-trusted`
   reaches a running daemon. The history is not; `--remove-all` refuses while a
   daemon runs.

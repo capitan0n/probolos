@@ -132,8 +132,8 @@ their other functions on too. Its result is context: decisions rest on stages
   changes between USB 2 and USB 3 ports. `--history [-v]` shows it.
 - **Trust store:** devices allowed "always", pinned by identity *and* the
   exact descriptor bytes, so a remembered device moved between a USB 2 and a
-  USB 3 port may be asked about again. A trust store that cannot be read
-  trusts nothing.
+  USB 3 port may be asked about again. A trust store that cannot be read, or
+  that holds a malformed entry, trusts nothing.
 
 | Rule | Severity | Fires when |
 |---|---|---|

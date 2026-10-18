@@ -2511,6 +2511,67 @@ class ShortcutsNeverOutrankACriticalFinding(unittest.TestCase):
                               findings=[self.critical])
         admit.assert_not_called()
 
+    def _real_store(self, tmp, malformed):
+        path = Path(tmp) / "trusted.json"
+        store = trust.TrustStore(path)
+        self.assertIsNotNone(store.trust(self.dev))
+        self.assertIsNone(store.save())
+        if malformed:
+            data = json.loads(path.read_text())
+            data["devices"]["planted"] = {"key": 1}
+            path.write_text(json.dumps(data))
+            os.chmod(path, 0o600)
+        return trust.TrustStore(path)
+
+    def test_a_store_with_a_malformed_entry_admits_nothing(self):
+        """The readable entries of a store that did not load cleanly used to
+        admit their devices without a question."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._real_store(tmp, malformed=True)
+            self.assertIsNotNone(store.load_error)
+            admit, _ = self._plug(self._engine(trust_store=store), typed="")
+        admit.assert_not_called()
+
+    def test_always_over_a_store_broken_meanwhile_keeps_nothing(self):
+        """Offered while the store was clean, answered after it broke: the
+        answer used to be saved over it, keeping only the readable entries,
+        so a restart trusted them all again."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._real_store(tmp, malformed=False)
+            path = store.path
+            data = json.loads(path.read_text())
+            data["devices"]["planted"] = {"key": 1}
+            path.write_text(json.dumps(data))
+            os.chmod(path, 0o600)
+            engine = self._engine(trust_store=store)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                engine._remember_admitted(self.dev)
+            self.assertIn("planted", path.read_text(), "the file was rewritten")
+        self.assertIn("trust could not be saved: the trust store did not "
+                      "load cleanly", out.getvalue())
+
+    def test_privsep_read_back_of_a_broken_store_is_not_remembered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._real_store(tmp, malformed=True)
+            engine = self._engine(trust_store=store)
+            out = io.StringIO()
+            with mock.patch.object(store, "writable", return_value=False), \
+                    mock.patch.object(daemon_mod.sysfs,
+                                      "remember_via_backend"), \
+                    redirect_stdout(out):
+                engine._remember_admitted(self.dev)
+        self.assertNotIn("remembered for future admissions", out.getvalue())
+        self.assertIn("cannot be read back", out.getvalue())
+
+    def test_a_clean_real_store_still_admits(self):
+        """GUARD for the test above: the same device, the store intact."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._real_store(tmp, malformed=False)
+            self.assertIsNone(store.load_error)
+            admit, _ = self._plug(self._engine(trust_store=store))
+        admit.assert_called_once_with(self.dev)
+
     def test_a_remembered_device_with_no_finding_goes_through(self):
         """GUARD: the shortcut itself still works."""
         store = mock.Mock(load_error=None, **{"is_trusted.return_value": True,

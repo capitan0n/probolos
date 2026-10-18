@@ -238,7 +238,9 @@ def cmd_trusted(path) -> None:
     """Show what this machine currently lets in without asking, numbered."""
     store = trust_mod.TrustStore(path)
     if store.load_error:
-        sys.exit(f"trust store unreadable: {store.load_error}")
+        sys.exit(f"trust store unreadable: {store.load_error}\n"
+                 f"Nothing in it is admitted without asking until it loads "
+                 f"cleanly: correct {store.path}, or remove it to start over.")
     entries = store.ordered()
     if not entries:
         print("No remembered devices. Every device will be asked about.")
@@ -302,16 +304,24 @@ def cmd_remove_trusted(path, pattern: str, assume_yes: bool = False) -> None:
     goes without ceremony, like `ufw delete N`.
     """
     store = trust_mod.TrustStore(path)
+    # A store that did not load cleanly trusts nothing, and removing from it
+    # is how it is repaired: the rewrite keeps only what could be read, so
+    # the rest of it is trusted again. That is said below, from the file as
+    # it reads afterwards, rather than happening silently.
+    broken = store.load_error
     if pattern.lower() == "all":
-        if not store.devices:
+        if not store.devices and not broken:
             print("No remembered devices.")
             return
-        if not _confirm(f"Remove all {len(store.devices)} remembered "
-                        f"device(s)?", assume_yes):
+        what = (f"all {len(store.devices)} remembered device(s)" if not broken
+                else "everything in the trust store, including what could "
+                     "not be read")
+        if not _confirm(f"Remove {what}?", assume_yes):
             print("Nothing removed.")
             return
         count = store.clear()
-        print(f"Removed all {count} remembered device(s).")
+        print(f"Removed all {count} remembered device(s)." if not broken
+              else f"Removed everything ({count} readable device(s)).")
     elif pattern.isdigit():
         # A bare number refers to the position shown by --trusted, like
         # `ufw delete N`. This is the common case: look, then delete by number.
@@ -327,9 +337,20 @@ def cmd_remove_trusted(path, pattern: str, assume_yes: bool = False) -> None:
             return
         for identity in removed:
             print(f"  removed {textsafe.clean(identity)}")
-    error = store.save()
+    error = store.save(repair=True)
     if error:
         sys.exit(f"could not write trust store: {error}")
+    if broken:
+        after = trust_mod.TrustStore(path)
+        if after.load_error:
+            print(f"[!] The trust store still does not load cleanly "
+                  f"({after.load_error}); nothing in it is admitted without "
+                  f"asking.")
+        else:
+            print(f"[!] The trust store did not load cleanly ({broken}). It "
+                  f"was rewritten with what could be read, so its "
+                  f"{len(after.devices)} remembered device(s) are admitted "
+                  f"without asking again; --trusted lists them.")
     print("Device history is kept (--history). --remove-all clears both.")
 
 

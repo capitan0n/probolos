@@ -1432,11 +1432,17 @@ class Probolos:
         """
         if self.trust.writable():
             entry = self.trust.trust(dev)
-            if entry is not None:
-                self.trust.record_admission(dev)
-                error = self.trust.save()
-                print(f"  trust could not be saved: {error}" if error
-                      else "  remembered for future admissions")
+            if entry is None:
+                why = (f"the trust store did not load cleanly "
+                       f"({self.trust.load_error})" if self.trust.load_error
+                       else "this device's descriptors could not be read, "
+                            "so there is nothing to pin it to")
+                print(f"  trust could not be saved: {why}")
+                return
+            self.trust.record_admission(dev)
+            error = self.trust.save()
+            print(f"  trust could not be saved: {error}" if error
+                  else "  remembered for future admissions")
             return
 
         # Under --privsep: the analyzer cannot write the store, so the root
@@ -1459,7 +1465,7 @@ class Probolos:
         # cannot read back (permissions, an integrity refusal) would otherwise
         # be reported as remembered and then ask again anyway.
         self.trust.refresh()
-        if key in self.trust.devices:
+        if key in self.trust.devices and not self.trust.load_error:
             print("  remembered for future admissions")
         else:
             why = self.trust.load_error or "the new entry is not there"
