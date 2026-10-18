@@ -133,6 +133,18 @@ def _quiet(*_args, **_kwargs):
 B = "\\"
 
 
+def _qt():
+    """Qt's rich-text detection and parser, if PySide6 is installed."""
+    try:
+        from PySide6.QtGui import QGuiApplication, QTextDocument, Qt
+    except ImportError:
+        return None
+    if QGuiApplication.instance() is None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        _qt.app = QGuiApplication([])
+    return Qt, QTextDocument
+
+
 def _glib():
     name = ctypes.util.find_library("glib-2.0")
     if not name:
@@ -2299,7 +2311,7 @@ class DialogTextIsNotUnescapedByTheBackend(unittest.TestCase):
                 self._argv(dialogs.KDialogBackend, method,
                            self.FORGED_LINES)[-1])
             self.assertNotIn("\n", shown)
-            self.assertEqual(shown, dialogs._markup_safe(self.FORGED_LINES))
+            self.assertEqual(shown, dialogs._qt_rich_text(self.FORGED_LINES))
 
     @unittest.skipIf(_glib() is None, "libglib-2.0 not available")
     def test_zenity_shows_the_text_it_was_given(self):
@@ -2485,6 +2497,40 @@ class DialogMarkupEscaping(unittest.TestCase):
     def test_markup_safe_leaves_ordinary_text_untouched(self):
         self.assertEqual(self.dialogs._markup_safe("Kingston DataTraveler"),
                          "Kingston DataTraveler")
+
+    def test_kdialog_text_is_always_read_as_rich_text(self):
+        """
+        Qt::mightBeRichText() guesses from the first line alone. Escaped text
+        has no tag there, so kdialog showed it as plain text and the entities
+        appeared literally: "maker&#x27;s" in the confirm window.
+        """
+        backend = self.dialogs.KDialogBackend()
+        backend._binary = "/usr/bin/kdialog"
+        calls = (lambda: backend.confirm("t", "x", "y", "n", 1.0),
+                 lambda: backend.choose("t", "x", "o", "a", "n", 1.0),
+                 lambda: backend.notice("t", "x", 1.0))
+        for call in calls:
+            with mock.patch.object(self.dialogs.subprocess, "run",
+                                   return_value=mock.Mock(
+                                       returncode=1)) as run:
+                call()
+            self.assertEqual(run.call_args[0][0][-1],
+                             self.dialogs._qt_rich_text("x"))
+        self.assertTrue(self.dialogs._qt_rich_text("x").startswith("<qt>"))
+
+    @unittest.skipIf(_qt() is None, "PySide6 not available")
+    def test_qt_shows_the_text_as_sent(self):
+        Qt, QTextDocument = _qt()
+        for raw in ("Switch this device on?\n\nOnly its maker's software",
+                    'Kingston <a href="file:///etc/shadow">x</a>\nnext',
+                    "A<B & C>D  two  spaces", "&lt; already &amp; escaped"):
+            with self.subTest(text=raw):
+                rich = self.dialogs._qt_rich_text(raw)
+                self.assertTrue(Qt.mightBeRichText(rich))
+                document = QTextDocument()
+                document.setHtml(rich)
+                self.assertEqual(
+                    document.toPlainText().replace("\u2028", "\n"), raw)
 
 
 class AgentUnavailableIsNotARefusal(unittest.TestCase):

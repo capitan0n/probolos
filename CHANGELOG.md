@@ -62,6 +62,13 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ### Fixed
 
+- **kdialog showed escape codes instead of characters.** The confirm window
+  read "its maker&#x27;s software" for "its maker's software". kdialog lets
+  Qt guess rich or plain text from the first line only, and escaped text
+  usually looked plain, so the escapes were shown as typed; an escaped `<` on
+  the first line flipped the guess and ran every line together. kdialog text
+  now always opens with `<qt>`, so Qt reads it as rich text and shows exactly
+  what was sent, line breaks and spacing included. Device names stay inert.
 - **Stage 4's UDF check could raise instead of answering.** The walk over the
   volume recognition sequence checked a descriptor's identifier and then read
   its version byte, one past what it had checked; a buffer ending between

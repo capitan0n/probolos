@@ -66,6 +66,22 @@ def _markup_safe(text: str) -> str:
     return html.escape(text, quote=True)
 
 
+def _qt_rich_text(text: str) -> str:
+    """
+    Escape text for kdialog and make Qt read it as rich text every time.
+
+    kdialog shows the text in a QLabel left on Qt::AutoText, so Qt guesses
+    rich or plain with Qt::mightBeRichText(), which looks only at the first
+    line. Escaped text has no tag there, so most prompts were shown as plain
+    text and the entities appeared literally: "maker&#x27;s" for "maker's".
+    An escaped '<' on the first line flips the guess to rich text, and every
+    line break then collapsed. Opening with <qt>, a tag Qt knows, removes the
+    guess; white-space:pre-wrap keeps the line breaks and spacing as sent.
+    """
+    return ('<qt><div style="white-space:pre-wrap">'
+            + _markup_safe(text) + "</div></qt>")
+
+
 def _backslash_safe(text: str) -> str:
     """
     Protect a dialog's TEXT argument from the backend's own unescaping.
@@ -181,12 +197,13 @@ class KDialogBackend(DialogBackend):
         # --warningyesno gives a warning icon and two labelled buttons. Exit
         # code 0 means the first (yes) button and 1 the second, which is also
         # what closing the window gives.
-        # kdialog renders the body as Qt rich text, so the device-controlled
-        # text is escaped; the title is our own string but escaped too for
-        # uniformity and in case a device name is ever folded into it.
+        # kdialog renders the body as Qt rich text (see _qt_rich_text), so the
+        # device-controlled text is escaped; the title is our own string but
+        # escaped too for uniformity and in case a device name is ever folded
+        # into it.
         args = [self._binary, "--title", _markup_safe(title),
                 "--yes-label", yes_label, "--no-label", no_label,
-                "--warningyesno", _backslash_safe(_markup_safe(text))]
+                "--warningyesno", _backslash_safe(_qt_rich_text(text))]
         try:
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
@@ -215,7 +232,7 @@ class KDialogBackend(DialogBackend):
                 "--yes-label", once_label,
                 "--no-label", always_label,
                 "--cancel-label", no_label,
-                "--warningyesnocancel", _backslash_safe(_markup_safe(text))]
+                "--warningyesnocancel", _backslash_safe(_qt_rich_text(text))]
         try:
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
@@ -233,7 +250,7 @@ class KDialogBackend(DialogBackend):
         # keeps the device blocked. When the time is up, subprocess.run kills
         # kdialog, which closes the window.
         args = [self._binary, "--title", _markup_safe(title),
-                "--sorry", _backslash_safe(_markup_safe(text))]
+                "--sorry", _backslash_safe(_qt_rich_text(text))]
         try:
             result = subprocess.run(args, timeout=timeout,
                                     capture_output=True)
