@@ -1801,6 +1801,21 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
             print("[!] desktop agent socket unavailable: devices that cannot "
                   "be asked in a terminal are held, not denied")
 
+    if json_log is not None:
+        # Checked here, by the process that writes it. Under --privsep that
+        # is the unprivileged analyzer, which cannot create a file in a
+        # root-owned directory such as /var/log: every decision then printed
+        # "could not write log" and none was logged.
+        from .securefs import append_problem
+        problem = append_problem(json_log)
+        if problem:
+            print(f"[!] --log {json_log}: decisions cannot be logged there: "
+                  f"{problem}.")
+            if os.geteuid() != 0:
+                print("    This process does not run as root (under "
+                      "--privsep the analyzer writes the log): put it in "
+                      "/var/lib/probolos/state/, the directory it is given.")
+
     monitor = session_mod.detect(force_locked)
     if lock_policy != session_mod.POLICY_IGNORE:
         print(f"  - screen-lock policy: {lock_policy} "

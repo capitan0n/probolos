@@ -597,6 +597,70 @@ class DeferredBindTests(unittest.TestCase):
         deferred_bind.emergency_restore()
         self.assertEqual((self.tree / "drivers_autoprobe").read_text(), "1")
 
+    def test_the_gate_restore_puts_autoprobe_back_too(self):
+        """
+        The watchdog and the panic file reopen the gate from another thread
+        through AuthorizationGate.restore(), while the main thread may be
+        wedged inside the bus-wide window (a hostile device stalling the
+        authorize write). Reopening the hubs with drivers_autoprobe still 0
+        lets every new device enumerate with no driver: the rescue keyboard
+        the panic file was used for stays dead.
+        """
+        from probolos import gate as gate_mod
+        db = deferred_bind.DeferredBind(self.device, log=lambda _m: None)
+        db.__enter__()                      # held at 0, as mid-window
+        self.assertEqual((self.tree / "drivers_autoprobe").read_text(), "0")
+        opened = gate_mod.AuthorizationGate(log=lambda *_a: None)
+        opened._armed = True
+        opened._original = {Path("usb1"): 1}
+        with mock.patch.object(sysfs, "set_authorized_default"):
+            opened.restore()                # what on_stall does
+        self.assertEqual((self.tree / "drivers_autoprobe").read_text(), "1")
+        # The DeferredBind's own release afterwards is a no-op, not a
+        # second write of a value it no longer holds.
+        writes = list(self.backend.autoprobe_writes)
+        db._release_autoprobe()
+        self.assertEqual(self.backend.autoprobe_writes, writes)
+
+    def test_a_restore_from_another_thread_cannot_strand_autoprobe(self):
+        """
+        The watchdog's restore landing while __enter__ writes 0. Without a
+        lock around record-and-write it restored 1 and cleared the record,
+        the 0 landed after it, and nothing was left to put it back.
+        """
+        import threading
+        real_write = self.backend.set_drivers_autoprobe
+        late = []
+
+        def write(value):
+            if value == 0 and not late:
+                late.append(threading.Thread(
+                    target=deferred_bind.emergency_restore))
+                late[0].start()
+                late[0].join(0.2)       # it must wait for this write to land
+            real_write(value)
+
+        self.backend.set_drivers_autoprobe = write
+        db = deferred_bind.DeferredBind(self.device, log=lambda _m: None)
+        db.__enter__()
+        late[0].join(5)
+        self.assertFalse(late[0].is_alive())
+        self.assertEqual((self.tree / "drivers_autoprobe").read_text(), "1")
+        db._release_autoprobe()             # nothing left to do, no error
+        self.assertEqual((self.tree / "drivers_autoprobe").read_text(), "1")
+
+    def test_a_forked_child_does_not_touch_autoprobe(self):
+        """restore() in a forked child (the storage reader) changes nothing."""
+        from probolos import gate as gate_mod
+        db = deferred_bind.DeferredBind(self.device, log=lambda _m: None)
+        db.__enter__()
+        opened = gate_mod.AuthorizationGate(log=lambda *_a: None)
+        opened._armed = True
+        opened._owner_pid = os.getpid() + 1     # "not the process that closed it"
+        opened.restore()
+        self.assertEqual((self.tree / "drivers_autoprobe").read_text(), "0")
+        deferred_bind.emergency_restore()
+
     def test_original_value_is_preserved_not_assumed(self):
         """Some systems run with autoprobe already at 0. Restoring 1 would be
         a silent configuration change made by a security tool."""

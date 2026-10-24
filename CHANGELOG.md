@@ -16,6 +16,17 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ### Security
 
+- **The panic file could leave no USB driver binding under
+  `--close-race-window`.** The watchdog and the panic file reopened the hubs
+  but not `drivers_autoprobe`, which that flag holds at 0 around one
+  authorize write a hostile device can stall: new devices then enumerated
+  with no driver, the rescue keyboard included. The gate's restore now puts
+  the bus switch back first, under a lock shared with the code that set it.
+- **Blank letters in device names went unreported.** The Hangul fillers and
+  the default-ignorable combining marks (variation selectors and the like)
+  are now escaped and reported like zero-width spaces. A trust entry or
+  history for a device whose serial holds one is keyed differently and asks
+  again once.
 - **A trust store with one malformed entry still admitted the others
   without asking.** The broken entry was skipped and reported, startup said
   "nothing will be treated as trusted" and `--trusted` refused to list the
@@ -62,6 +73,11 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ### Fixed
 
+- **`--log` under `--privsep` logged nothing.** The analyzer writes it, and
+  could not create it in a root-owned directory such as `/var/log`: every
+  decision printed "could not write log". The problem is now named once at
+  startup, a log under `/var/lib/probolos/state/` has its directory handed to
+  the analyzer (also with `--no-ledger`), and the README says so.
 - **kdialog showed escape codes instead of characters.** The confirm window
   read "its maker&#x27;s software" for "its maker's software". kdialog lets
   Qt guess rich or plain text from the first line only, and escaped text

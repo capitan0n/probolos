@@ -83,6 +83,40 @@ def open_regular_at(directory_fd, name):
         raise
 
 
+def append_problem(path):
+    """
+    Why append_json_line(path, ...) would fail from this process, or None.
+
+    Writes nothing. Checked once at startup so that a log this process can
+    never write -- under --privsep the analyzer, not root, appends to it --
+    is reported once with its reason, rather than as a failure per decision.
+    """
+    path = Path(path)
+    try:
+        directory_fd = open_directory(path.parent)
+    except OSError as exc:
+        return f"its directory cannot be opened ({exc.strerror or exc})"
+    try:
+        try:
+            st = os.stat(path.name, dir_fd=directory_fd,
+                         follow_symlinks=False)
+        except FileNotFoundError:
+            if not os.access(".", os.W_OK | os.X_OK, dir_fd=directory_fd):
+                return "this process cannot create a file in its directory"
+            return None
+        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1
+                or st.st_uid != os.geteuid()):
+            return ("it exists but is not a regular file owned by this "
+                    "process")
+        if not os.access(path.name, os.W_OK, dir_fd=directory_fd):
+            return "this process cannot write to it"
+        return None
+    except OSError as exc:
+        return f"it cannot be checked ({exc.strerror or exc})"
+    finally:
+        os.close(directory_fd)
+
+
 def append_json_line(path, payload):
     """Append an audit record without following links or opening a FIFO."""
     import json

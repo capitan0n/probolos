@@ -188,6 +188,22 @@ class CommandLineWiring(unittest.TestCase):
                               "--watch-media"])
         self.assertTrue(captured["watch_media"])
 
+    def test_a_log_in_the_state_directory_is_handed_to_the_analyzer(self):
+        """
+        Under --privsep the analyzer appends to --log. Its directory is
+        prepared like the ledger's, also when there is no ledger at all.
+        """
+        log = "/var/lib/probolos/state/decisions.jsonl"
+        captured = self._run(["--privsep", "--no-trust", "--no-ledger",
+                              "--log", log])
+        self.assertEqual([str(p) for p in captured["state_paths"]], [log])
+
+    def test_a_log_outside_the_state_roots_is_never_handed_over(self):
+        """chown of /var/log to the analyzer is what STATE_ROOTS prevents."""
+        captured = self._run(["--privsep", "--no-trust", "--no-ledger",
+                              "--log", "/var/log/probolos.jsonl"])
+        self.assertEqual(captured["state_paths"], [])
+
     def test_the_analyzer_is_told_to_close_the_gate_lock(self):
         captured = self._run(["--privsep", "--no-trust", "--no-ledger"],
                              lock=7)

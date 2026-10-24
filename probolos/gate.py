@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
-from . import sysfs
+from . import deferred_bind, sysfs
 
 
 class AuthorizationGate:
@@ -117,7 +117,17 @@ class AuthorizationGate:
             self._restore_locked()
 
     def _restore_locked(self) -> None:
-        if not self._armed or os.getpid() != self._owner_pid:
+        if os.getpid() != self._owner_pid:
+            return
+        # The bus-wide driver switch first, armed or not. --close-race-window
+        # holds drivers_autoprobe at 0 around one authorize write, and the
+        # watchdog and the panic file reach this from another thread while
+        # the main thread may be stuck in exactly that write. Reopening the
+        # hubs with autoprobe still 0 let every new device enumerate with no
+        # driver -- the rescue keyboard the panic file was used for included.
+        # A no-op unless deferred_bind is holding it.
+        deferred_bind.emergency_restore()
+        if not self._armed:
             return
         remaining = {}
         for hub, value in list(self._original.items()):

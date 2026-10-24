@@ -783,6 +783,33 @@ class MissingPyudevIsRefusedBeforeTheGateCloses(unittest.TestCase):
         gate.assert_not_called()
 
 
+class AnUnwritableAuditLogIsReportedAtStartup(unittest.TestCase):
+    """
+    Under --privsep the unprivileged analyzer appends to --log, and a log in a
+    root-owned directory failed at every decision without one being written.
+    It is now said once, before the gate closes.
+    """
+
+    def _serve(self, log):
+        out = io.StringIO()
+        with mock.patch.object(daemon_mod, "pyudev", None), \
+                mock.patch.object(daemon_mod.gate, "AuthorizationGate"), \
+                redirect_stdout(out):
+            with self.assertRaises(SystemExit):
+                daemon_mod.serve(dry_run=True, json_log=log)
+        return out.getvalue()
+
+    def test_a_log_that_cannot_be_written_is_named_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            printed = self._serve(Path(tmp) / "missing" / "audit.jsonl")
+        self.assertEqual(printed.count("decisions cannot be logged"), 1)
+
+    def test_a_writable_log_raises_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            printed = self._serve(Path(tmp) / "audit.jsonl")
+        self.assertNotIn("cannot be logged", printed)
+
+
 class PromptIgnoresTypeAhead(unittest.TestCase):
     """A line queued before the question was asked answered it."""
 

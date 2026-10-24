@@ -84,6 +84,7 @@ from __future__ import annotations
 
 import atexit
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -106,6 +107,13 @@ _INTERFACE_POLL_S = 0.005
 # signal handler or a crash path can put it back without having the DeferredBind
 # object to hand. None means "we are not holding it".
 _autoprobe_original: Optional[int] = None
+
+# Guards the record and the write that goes with it. emergency_restore() is
+# also reached from the watchdog thread (AuthorizationGate.restore), and a
+# restore landing between "record the original" and "write 0" cleared the
+# record and let the 0 stick, with nothing left to undo it. Re-entrant: a
+# signal handler runs on the main thread, possibly while it holds this.
+_autoprobe_lock = threading.RLock()
 
 
 def interface_dirs(usb_syspath: Path) -> List[Path]:
@@ -193,17 +201,19 @@ def emergency_restore() -> None:
     a machine that will not bind a driver to anything.
     """
     global _autoprobe_original
-    if _autoprobe_original is None:
-        return
-    value, _autoprobe_original = _autoprobe_original, None
-    try:
-        sysfs.set_drivers_autoprobe(value)
-    except Exception as exc:  # noqa: BLE001 - last line of defence
-        import sys
-        print(f"\n!! FAILED to restore drivers_autoprobe: {exc}\n"
-              f"!! No USB device will bind a driver until you run, as root:\n"
-              f"!!   echo {value} > {sysfs.DRIVERS_AUTOPROBE}\n",
-              file=sys.stderr)
+    with _autoprobe_lock:
+        if _autoprobe_original is None:
+            return
+        value, _autoprobe_original = _autoprobe_original, None
+        try:
+            sysfs.set_drivers_autoprobe(value)
+        except Exception as exc:  # noqa: BLE001 - last line of defence
+            import sys
+            print(f"\n!! FAILED to restore drivers_autoprobe: {exc}\n"
+                  f"!! No USB device will bind a driver until you run, as "
+                  f"root:\n"
+                  f"!!   echo {value} > {sysfs.DRIVERS_AUTOPROBE}\n",
+                  file=sys.stderr)
 
 
 atexit.register(emergency_restore)
@@ -247,14 +257,16 @@ class DeferredBind:
         if original is None:
             raise OSError(f"cannot read {sysfs.DRIVERS_AUTOPROBE}")
         # Record BEFORE writing. If the write itself is what kills us, the
-        # atexit handler still knows what to put back.
-        _autoprobe_original = original
-        try:
-            sysfs.set_drivers_autoprobe(0)
-        except Exception:
-            _autoprobe_original = None
-            raise
-        self._holding_autoprobe = True
+        # atexit handler still knows what to put back. Under the lock, so a
+        # restore from the watchdog thread sees both or neither.
+        with _autoprobe_lock:
+            _autoprobe_original = original
+            try:
+                sysfs.set_drivers_autoprobe(0)
+            except Exception:
+                _autoprobe_original = None
+                raise
+            self._holding_autoprobe = True
         return self
 
     # ---------- steps 2 and 3 ----------

@@ -66,7 +66,20 @@ _BIDI = {
 # Invisible characters. Two trust-store entries that look identical to a human
 # but differ by a zero-width joiner are a way to make a device appear to be
 # one that was already approved.
-_INVISIBLE = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"}
+#
+# Beyond the zero-width spaces, the Unicode default-ignorable code points
+# that the category rules below do not reach: the Hangul fillers are letters
+# (Lo) that draw as blank space, and the rest are combining marks (Mn) that
+# draw nothing at all -- so up to MAX_COMBINING_RUN of them passed as
+# accents. Format characters (Cf) with the same property are caught by
+# category already.
+_INVISIBLE = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff",
+              "\u115f", "\u1160", "\u3164", "\uffa0",      # Hangul fillers
+              "\u034f",                                    # grapheme joiner
+              "\u17b4", "\u17b5",                          # Khmer inherent vowels
+              "\u180b", "\u180c", "\u180d", "\u180f",      # Mongolian selectors
+              *map(chr, range(0xFE00, 0xFE10)),            # variation selectors
+              *map(chr, range(0xE0100, 0xE01F0))}          # ... supplement
 
 # Notes are stable identifiers, not sentences: the rules layer matches on
 # them, and the report turns them into English. Changing the wording of a

@@ -779,9 +779,16 @@ def main(argv=None) -> None:
             # admitted storage hosts), so the gate learns it from the root
             # side here and never from the analyzer. The trust path likewise:
             # it names the one file the gate writes.
+            # The --log file is appended to by the analyzer too. Inside the
+            # state roots its directory is handed over like the ledger's (it
+            # usually is the ledger's), also under --no-ledger; anywhere else
+            # serve() says, once, that it cannot be written.
+            log_path = (args.log if args.log and privsep._within_allowed_root(
+                os.path.dirname(os.path.abspath(args.log))) else None)
             rc = privsep.start(analyzer_main, drop_to=args.privsep_user,
                                state_paths=([] if args.dry_run else
-                                            [p for p in (ledger_path,) if p]),
+                                            [p for p in (ledger_path, log_path)
+                                             if p]),
                                watch_media=args.watch_media and not args.dry_run,
                                trust_path=None if args.no_trust else trust_path,
                                close_in_child=(() if gate_lock is None

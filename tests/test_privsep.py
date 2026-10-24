@@ -1322,6 +1322,38 @@ class FilesystemPreparation(unittest.TestCase):
             append_json_line(log, {"authorized": True})
         self.assertEqual(self.victim.read_text(), "private")
 
+    def test_audit_log_check_passes_a_writable_directory_and_writes_nothing(self):
+        from probolos.securefs import append_problem
+        log = self.state / "audit.jsonl"
+        self.assertIsNone(append_problem(log))
+        self.assertFalse(os.path.lexists(log))
+
+    def test_audit_log_check_names_a_directory_it_cannot_create_in(self):
+        """The --privsep analyzer and a root-owned /var/log, say."""
+        from probolos import securefs
+        with mock.patch.object(securefs.os, "access", return_value=False):
+            problem = securefs.append_problem(self.state / "audit.jsonl")
+        self.assertIn("cannot create", problem)
+
+    def test_audit_log_check_on_an_existing_log(self):
+        from probolos import securefs
+        log = self.state / "audit.jsonl"
+        securefs.append_json_line(log, {"first": True})
+        self.assertIsNone(securefs.append_problem(log))
+        with mock.patch.object(securefs.os, "access", return_value=False):
+            self.assertIn("cannot write", securefs.append_problem(log))
+        with mock.patch.object(securefs.os, "stat",
+                               side_effect=PermissionError(13, "denied")):
+            self.assertIn("cannot be checked", securefs.append_problem(log))
+
+    def test_audit_log_check_refuses_what_append_would_refuse(self):
+        from probolos.securefs import append_problem
+        log = self.state / "audit.jsonl"
+        log.symlink_to(self.victim)
+        self.assertIn("not a regular file", append_problem(log))
+        self.assertIn("cannot be opened",
+                      append_problem(self.state / "missing" / "audit.jsonl"))
+
     def test_atomic_save_refuses_symlink_ancestor(self):
         from probolos import atomicio
         alias = self.root / "alias"

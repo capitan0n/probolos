@@ -79,6 +79,34 @@ class DangerousStrings(unittest.TestCase):
         """
         self.assertNeutralised("Log\u200bitech", NOTE_INVISIBLE, "\u200b")
 
+    def test_blank_letters_are_made_visible(self):
+        """
+        The Hangul fillers are letters (category Lo), so no category rule
+        caught them, yet they draw as blank space: "Logitech\\u3164Keyboard"
+        showed as "Logitech Keyboard" with nothing reported.
+        """
+        for filler in ("\u115f", "\u1160", "\u3164", "\uffa0"):
+            with self.subTest(code_point=f"U+{ord(filler):04X}"):
+                self.assertNeutralised(f"Logitech{filler}Keyboard",
+                                       NOTE_INVISIBLE, filler)
+
+    def test_invisible_selectors_are_made_visible(self):
+        """
+        Default-ignorable combining marks draw nothing at all, and up to three
+        in a row passed as ordinary accents: a variation selector or the
+        combining grapheme joiner hid inside a name unreported.
+        """
+        for mark in ("\u034f", "\u17b4", "\u180b", "\u180f", "\ufe00",
+                     "\ufe0f", "\U000e0100", "\U000e01ef"):
+            with self.subTest(code_point=f"U+{ord(mark):04X}"):
+                self.assertNeutralised(f"King{mark}ston", NOTE_INVISIBLE, mark)
+
+    def test_ordinary_hangul_is_untouched(self):
+        name = "\ud55c\uae00 \ud0a4\ubcf4\ub4dc"      # "Hangul keyboard"
+        result = sanitize(name)
+        self.assertEqual(result.text, name)
+        self.assertEqual(result.notes, [])
+
     # ---- bounds ----
 
     def test_an_over_long_string_is_truncated_and_reported(self):

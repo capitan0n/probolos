@@ -161,7 +161,7 @@ sudo udevadm control --reload      # then replug the device
 | `--trusted`, `--remove-trusted N\|PATTERN\|all` | list or forget remembered devices (history is kept) |
 | `--remove-all` | forget remembered devices **and** all history (asks first) |
 | `--capture-payload` | record what a quarantined device typed (off by default) |
-| `--log FILE` | append every decision to FILE as JSON lines |
+| `--log FILE` | append every decision to FILE as JSON lines (under `--privsep` the analyzer writes it: use `/var/lib/probolos/state/`) |
 | `--release` | recovery: switch blocked devices on and reopen the gate |
 
 `python3 -m probolos --help` lists them all.
