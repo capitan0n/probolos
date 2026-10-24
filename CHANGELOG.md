@@ -85,6 +85,9 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
   the first line flipped the guess and ran every line together. kdialog text
   now always opens with `<qt>`, so Qt reads it as rich text and shows exactly
   what was sent, line breaks and spacing included. Device names stay inert.
+  Quotes are no longer escaped either: the text only goes between tags, so
+  only `&`, `<` and `>` need it, and an apostrophe now reads correctly even
+  where the text is shown as plain (a notification server without markup).
 - **Stage 4's UDF check could raise instead of answering.** The walk over the
   volume recognition sequence checked a descriptor's identifier and then read
   its version byte, one past what it had checked; a buffer ending between

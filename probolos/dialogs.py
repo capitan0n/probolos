@@ -56,14 +56,20 @@ def _markup_safe(text: str) -> str:
     to the Allow button. That is the one surface where the decision is actually
     made, so it must show the name literally.
 
-    This escapes the five characters that begin or end markup (& < > " ')
-    via html.escape. A legitimate name like 'A<B & C>D' survives intact, just
-    inert: it renders as written instead of being interpreted. Backends that
-    render PLAIN text (tkinter, the terminal) must NOT call this -- there the
-    escaped entities would show up literally as '&lt;', which is its own kind
-    of corruption.
+    This escapes the three characters that begin markup or an entity in text
+    (& < >). A legitimate name like 'A<B & C>D' survives intact, just inert:
+    it renders as written instead of being interpreted. Backends that render
+    PLAIN text (tkinter, the terminal) must NOT call this -- there the escaped
+    entities would show up literally as '&lt;', which is its own kind of
+    corruption.
+
+    Quotes are left as typed. The text only ever goes between tags, never
+    into an attribute value, so ' and " cannot end anything there. Escaped,
+    they turned every apostrophe into an entity, and anything that showed the
+    text as plain -- kdialog guessing plain text, a notification server
+    without markup -- printed "its maker&#x27;s software" in the prompt.
     """
-    return html.escape(text, quote=True)
+    return html.escape(text, quote=False)
 
 
 def _qt_rich_text(text: str) -> str:

@@ -2498,6 +2498,31 @@ class DialogMarkupEscaping(unittest.TestCase):
         self.assertEqual(self.dialogs._markup_safe("Kingston DataTraveler"),
                          "Kingston DataTraveler")
 
+    def test_markup_safe_leaves_quotes_as_typed(self):
+        """
+        The text only goes between tags, where quotes end nothing. Escaped,
+        the apostrophe became "&#x27;", shown literally whenever the text was
+        read as plain: "its maker&#x27;s software" in the confirm window.
+        """
+        raw = "its maker's \"own\" software"
+        self.assertEqual(self.dialogs._markup_safe(raw), raw)
+
+    def test_confirm_prompt_carries_the_apostrophe(self):
+        text = ("Switch this device on?\n\nOnce on, it will be able to: do "
+                "things only its maker's software knows about.")
+        for backend_cls in (self.dialogs.KDialogBackend,
+                            self.dialogs.ZenityBackend):
+            backend = backend_cls()
+            backend._binary = "/usr/bin/dialog-tool"
+            with self.subTest(backend=backend_cls.name), \
+                    mock.patch.object(self.dialogs.subprocess, "run",
+                                      return_value=mock.Mock(
+                                          returncode=1, stdout="")) as run:
+                backend.confirm("t", text, "y", "n", 1.0)
+                shown = " ".join(run.call_args[0][0])
+                self.assertIn("maker's software", shown)
+                self.assertNotIn("&#", shown)
+
     def test_kdialog_text_is_always_read_as_rich_text(self):
         """
         Qt::mightBeRichText() guesses from the first line alone. Escaped text
