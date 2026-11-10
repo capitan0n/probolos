@@ -6,6 +6,8 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ## Unreleased
 
+## [1.0.0b2] — 2026-11-10 · second audit
+
 ### Added
 
 - **`--history` shows what each device is:** a TYPE column (`mouse`,

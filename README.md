@@ -8,7 +8,7 @@ holds.
 *Probolos* (πρόβολος) is Greek for a barrier set in front: the thing you must
 get past first.
 
-> **Beta (1.0.0b1).** It runs on real hardware, but it has **never been tested
+> **Beta (1.0.0b2).** It runs on real hardware, but it has **never been tested
 > against a real attack device** (Rubber Ducky, O.MG cable). Do not make it
 > your only protection. Its known weak spots are listed in
 > [SECURITY.md][security].
