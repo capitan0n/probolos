@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Optional, Set
 
+from . import ledger as ledger_mod
 from . import report, rules, storage, sysfs, usbclass
 
 POLICY_LOG = "log"
@@ -465,6 +466,9 @@ class MediaWatch:
             error = self.ledger.save()
             if error:
                 self.log(f"[!] could not write ledger: {error}")
+            note = ledger_mod.shed_note(self.ledger)
+            if note:
+                self.log(f"[!] {note}.")
 
         if exempt:
             # One use only: the same card taken out and put back is judged.

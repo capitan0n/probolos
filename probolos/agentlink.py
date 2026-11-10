@@ -252,7 +252,9 @@ def prepare_socket_dir(path: Path, owner_uid: int, group_gid: int) -> None:
     root = str(DEFAULT_SOCKET.parent)
     if directory != root and not directory.startswith(root + os.sep):
         raise OSError(f"agent socket directory must be under {root}")
-    fd = open_directory(directory, create=True)
+    # mode: for a directory made on the way to this one; this one is set
+    # below. The desktop user has to pass through all of them.
+    fd = open_directory(directory, create=True, mode=0o755)
     try:
         os.fchown(fd, owner_uid, group_gid)
         # Only when the mode is not already right. The shipped unit runs with
@@ -370,8 +372,13 @@ class AgentLink:
         try:
             if os.geteuid() == 0:
                 from .securefs import open_directory
+                # mode: 0755 if this call creates it. Root's umask decided
+                # before, and under 077 the directory came out 0700: the
+                # socket inside was handed to the desktop user, who could
+                # not reach it, and every device waited for an agent that
+                # could never connect.
                 directory_fd = open_directory(self.path.parent, create=True,
-                                              secure=True)
+                                              secure=True, mode=0o755)
             else:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
             # lexists, not exists: exists() follows symlinks, so a DANGLING

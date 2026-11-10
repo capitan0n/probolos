@@ -1682,6 +1682,60 @@ class StorageStall(unittest.TestCase):
         self.assertIsNone(report.error)
 
 
+def _answers_then_lingers(device, conn, fd=None):
+    """A reader that sends its report and then does not exit: what a child
+    forked while another thread held a lock does on its way out."""
+    import time
+    conn.send(("ok", storage.MediumReport(device=device, scheme="mbr")))
+    time.sleep(60)
+
+
+def _dies_without_a_word(device, conn, fd=None):
+    conn.close()
+    os._exit(3)
+
+
+def _answers_with_nonsense(device, conn, fd=None):
+    conn.send(("ok", "not a report"))
+
+
+class TheReportIsWhatIsWaitedFor(unittest.TestCase):
+    """
+    inspect_safely() waited for the reader PROCESS to exit, and one still
+    alive at the timeout was a stall, whatever it had already sent. A reader
+    that had read the medium and sent its report, and then hung on its way
+    out, cost the full timeout with the device switched on, and its report
+    was thrown away for "device did not respond".
+    """
+
+    def run_with(self, worker, timeout):
+        import time
+        started = time.monotonic()
+        with mock.patch.object(storage, "_inspect_worker", worker):
+            report = storage.inspect_safely("/dev/sdz", timeout=timeout)
+        return report, time.monotonic() - started
+
+    def test_a_report_that_arrived_is_used_though_the_reader_lingers(self):
+        report, took = self.run_with(_answers_then_lingers, timeout=6.0)
+        self.assertIsNone(report.error)
+        self.assertFalse(report.timed_out)
+        self.assertEqual(report.scheme, "mbr")
+        self.assertLess(took, 5.0, "waited for the reader, not its report")
+
+    def test_a_reader_that_dies_without_a_report_is_not_a_stall(self):
+        report, took = self.run_with(_dies_without_a_word, timeout=6.0)
+        self.assertEqual(report.error,
+                         "inspection process produced no result")
+        self.assertFalse(report.timed_out)
+        self.assertLess(took, 5.0)
+
+    def test_something_that_is_not_a_report_is_not_taken_for_one(self):
+        report, _ = self.run_with(_answers_with_nonsense, timeout=6.0)
+        self.assertEqual(report.error,
+                         "inspection process produced no result")
+        self.assertFalse(report.inspected)
+
+
 # ---------------------------------------------------------------------------
 # Storage: ordinary media must stay silent
 # ---------------------------------------------------------------------------
@@ -1876,6 +1930,21 @@ class StorageHardeningIsInForce(unittest.TestCase):
         self.assertEqual(report.suspicious, [])
         self.assertEqual(
             [f.rule_id for f in rules.storage_findings(report)], [])
+
+    def test_the_refused_partition_has_the_number_the_report_gives_it(self):
+        """The geometry messages counted from 0 and everything else the
+        operator is shown counts from 1: the finding said "partition 0"
+        about the entry listed just above it as "partition 1"."""
+        device = self._mbr([(1, 6), (1, 0xFFFFFFFF)])
+        self._pretend_disk_is(8192)
+        report = storage.inspect(device, open_fn=lambda p: os.open(p, os.O_RDONLY))
+        self.assertEqual(len(report.suspicious), 1)
+        self.assertTrue(report.suspicious[0].startswith("partition 2:"),
+                        report.suspicious[0])
+        shown = report_mod.render_medium(report,
+                                         rules.storage_findings(report))
+        self.assertIn("partition 2", shown)
+        self.assertNotIn("partition 0", shown)
 
 
 class Stage4ReachesTheMedium(_TreeCase):

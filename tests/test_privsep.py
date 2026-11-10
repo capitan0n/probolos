@@ -1376,6 +1376,125 @@ class FilesystemPreparation(unittest.TestCase):
         self.assertEqual(self.victim.read_text(), "private")
 
 
+class WhatTheRootSideCreatesDoesNotDependOnItsUmask(unittest.TestCase):
+    """
+    A directory the root side made got 0755 less root's umask. Under 077 or
+    027 -- an ordinary hardening choice -- /var/lib/probolos came out 0700
+    or 0750, and the --privsep analyzer could reach neither the trust store
+    in it nor its own state directory below it; a /run/probolos made the
+    same way kept the desktop user from the agent socket inside. The
+    directories other accounts must pass through now say their mode.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.addCleanup(os.umask, os.umask(0o077))
+
+    @staticmethod
+    def mode(path):
+        return path.stat().st_mode & 0o7777
+
+    def make(self, path, **kwargs):
+        from probolos import securefs
+        os.close(securefs.open_directory(path, create=True, **kwargs))
+
+    def test_without_a_mode_the_umask_still_decides(self):
+        """A user's own state directory keeps the privacy their umask asks."""
+        self.make(self.root / "a" / "b")
+        self.assertEqual(self.mode(self.root / "a"), 0o700)
+        self.assertEqual(self.mode(self.root / "a" / "b"), 0o700)
+
+    def test_a_mode_applies_to_every_directory_the_call_creates(self):
+        self.make(self.root / "a" / "b", mode=0o755)
+        self.assertEqual(self.mode(self.root / "a"), 0o755)
+        self.assertEqual(self.mode(self.root / "a" / "b"), 0o755)
+
+    def test_a_directory_that_already_exists_keeps_its_mode(self):
+        (self.root / "a").mkdir()
+        self.assertEqual(self.mode(self.root / "a"), 0o700)
+        self.make(self.root / "a" / "b", mode=0o755)
+        self.assertEqual(self.mode(self.root / "a"), 0o700,
+                         "an existing directory was re-moded")
+        self.assertEqual(self.mode(self.root / "a" / "b"), 0o755)
+
+    def test_the_lock_directory_lets_the_analyzer_through(self):
+        from probolos import instance
+        fd = instance.acquire(self.root / "lib" / "instance.lock")
+        self.addCleanup(os.close, fd)
+        self.assertEqual(self.mode(self.root / "lib"), 0o755)
+        self.assertEqual(self.mode(self.root / "lib" / "instance.lock"),
+                         0o600)
+
+    def test_the_way_to_the_state_directory_lets_the_analyzer_through(self):
+        state = self.root / "lib" / "state"
+        with mock.patch.object(privsep, "STATE_ROOTS", (str(state),)):
+            privsep.prepare_state_dir(state / "ledger.json", os.getuid(),
+                                      os.getgid(), log=lambda *_: None)
+        self.assertEqual(self.mode(self.root / "lib"), 0o755)
+        self.assertEqual(self.mode(state), 0o700,
+                         "the directory handed over is the analyzer's alone")
+
+    def test_the_way_to_the_agent_socket_directory_is_open_too(self):
+        run = self.root / "run" / "probolos"
+        with mock.patch.object(agentlink, "DEFAULT_SOCKET",
+                               run / "agent.sock"), \
+                mock.patch.object(agentlink.os, "fchown"):
+            agentlink.prepare_socket_dir(run / "sub" / "agent.sock", 0,
+                                         os.getgid())
+        self.assertEqual(self.mode(self.root / "run"), 0o755)
+        self.assertEqual(self.mode(run), 0o755)
+        self.assertEqual(self.mode(run / "sub"), 0o2750)
+
+    @unittest.skipUnless(os.geteuid() == 0, "root binds the direct-mode socket")
+    def test_the_direct_mode_socket_directory_is_reachable(self):
+        directory = self.root / "run"
+        link = agentlink.AgentLink(directory / "agent.sock",
+                                   log=lambda *_: None)
+        link.listen()               # where sockets are refused, still made
+        self.addCleanup(link.stop)
+        self.assertEqual(self.mode(directory), 0o755)
+
+
+@unittest.skipUnless(os.geteuid() == 0, "privsep.start() needs root")
+class TheAnalyzersOutputIsNotLostInAPipe(unittest.TestCase):
+    """
+    The analyzer leaves through os._exit(), which flushes nothing. With its
+    stdout a pipe or a file, everything it had printed and Python was still
+    buffering went with it: the reports, the decisions, the gate reopening.
+    Only the root side's own lines came out.
+    """
+
+    def test_what_the_analyzer_printed_reaches_the_pipe_once(self):
+        import subprocess
+        import sys
+        try:
+            privsep.resolve_user("nobody")
+        except privsep.PrivsepError as exc:
+            self.skipTest(str(exc))
+        repo = str(Path(__file__).resolve().parent.parent)
+        code = ("import sys\n"
+                f"sys.path.insert(0, {repo!r})\n"
+                # Imported before the drop: `nobody` need not be able to
+                # read this checkout.
+                "from probolos import privsep, gate_client\n"
+                "print('[root] before the fork')\n"
+                "def analyzer_main(client):\n"
+                "    print('[analyzer] a decision')\n"
+                "    return 0\n"
+                "rc = privsep.start(analyzer_main, drop_to='nobody',\n"
+                "                   log=lambda *a: None)\n"
+                "print('[root] after', rc)\n")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+        result = subprocess.run([sys.executable, "-B", "-c", code],
+                                capture_output=True, text=True, env=env,
+                                timeout=120)
+        self.assertEqual(result.stdout.splitlines(),
+                         ["[root] before the fork", "[analyzer] a decision",
+                          "[root] after 0"], result.stderr)
+
+
 class GateAdmission(unittest.TestCase):
     def setUp(self):
         # Reuse the existing synthetic kernel tree, not its inherited tests.

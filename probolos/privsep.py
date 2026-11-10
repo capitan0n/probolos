@@ -163,7 +163,10 @@ def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
         return
     directory_fd = fd = None
     try:
-        directory_fd = open_directory(path.parent, create=True)
+        # mode: what this call creates on the way must let the analyzer
+        # through, whatever root's umask is; the directory handed over is
+        # then made 0700 and the analyzer's own, below.
+        directory_fd = open_directory(path.parent, create=True, mode=0o755)
         try:
             os.stat("trusted.json", dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -191,6 +194,49 @@ def prepare_state_dir(path, uid: int, gid: int, log=print) -> None:
             os.close(directory_fd)
 
 
+def _quiet(log):
+    """
+    `log`, unable to raise.
+
+    The root side's log is its stdout, and that can be gone while there is
+    still work that must not stop: the terminal was closed, the pipe's reader
+    exited. A line that raised between the gate stopping and the analyzer
+    being reaped left the analyzer running with nobody behind its socket.
+    """
+    def say(*args) -> None:
+        try:
+            log(*args)
+        except Exception:   # noqa: BLE001, S110 -- a log that is gone
+            pass
+    return say
+
+
+def _complain(text) -> None:
+    """One line on stderr. Never raises: stderr may be the thing that broke."""
+    try:
+        print(text, file=sys.stderr)
+    except Exception:   # noqa: BLE001, S110 -- nowhere left to say it
+        pass
+
+
+def _flush_stdio() -> None:
+    """
+    Write out what stdout and stderr still hold. Never raises.
+
+    Before fork(), so the child does not start with a copy of lines the
+    parent has yet to write; and in the analyzer before os._exit(), which
+    flushes nothing. Without the second, an analyzer whose output went to a
+    file or a pipe (`> probolos.log`, `| tee`, a service manager other than
+    the shipped unit, which sets PYTHONUNBUFFERED) lost everything Python
+    was still buffering: the reports, the decisions, the gate reopening.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:   # noqa: BLE001, S110 -- closed, gone, or None
+            pass
+
+
 def _run_analyzer(analyzer_main, client) -> int:
     """
     Run the analyzer and turn every way it can end into an exit status.
@@ -201,6 +247,12 @@ def _run_analyzer(analyzer_main, client) -> int:
     is caught for that reason too -- serve() raises it (a leftover panic file,
     a missing pyudev) and so does the gate's signal handler -- and it is not
     an Exception, so the handler below never saw it.
+
+    What it says on the way is said through _complain, which cannot raise.
+    The two prints here used to be able to: with stderr gone (the terminal
+    closed, which is also what ends the analyzer) "[analyzer] crashed" raised
+    out of its own except clause, and the exception unwound into the
+    parent's stack after all.
     """
     try:
         rc = analyzer_main(client)
@@ -209,10 +261,10 @@ def _run_analyzer(analyzer_main, client) -> int:
     except SystemExit as exc:
         if exc.code is None or isinstance(exc.code, int):
             return exc.code or 0
-        print(exc.code, file=sys.stderr)
+        _complain(exc.code)
         return 1
     except Exception as exc:  # noqa: BLE001
-        print(f"[analyzer] crashed: {exc}", file=sys.stderr)
+        _complain(f"[analyzer] crashed: {exc}")
         return 1
     return rc or 0
 
@@ -490,6 +542,10 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
         log("[privsep] could not become a subreaper: processes the analyzer "
             "starts may outlive it")
 
+    # Nothing buffered crosses the fork: the child would write it a second
+    # time, or -- leaving through os._exit() -- never.
+    _flush_stdio()
+
     pid = os.fork()
     if pid == 0:
         # ---- child: becomes the unprivileged analyzer ----
@@ -517,25 +573,41 @@ def start(analyzer_main, drop_to: str = "nobody", log=print,
         try:
             os.setsid()
         except OSError as exc:
-            print(f"[privsep] child could not leave the terminal's session: "
-                  f"{exc}", file=sys.stderr)
+            _complain(f"[privsep] child could not leave the terminal's "
+                      f"session: {exc}")
             os._exit(70)
         try:
             drop_privileges(uid, gid)
         except PrivsepError as exc:
-            print(f"[privsep] child could not drop privilege: {exc}",
-                  file=sys.stderr)
+            _complain(f"[privsep] child could not drop privilege: {exc}")
             os._exit(70)
-        from .gate_client import GateClient
+        # Whatever happens below, this process ends in os._exit() and
+        # nowhere else. The exit sat after a try/finally that let anything
+        # _run_analyzer raised carry on up the parent's stack -- through
+        # main()'s own cleanup and the atexit handlers copied by the fork,
+        # as the unprivileged analyzer.
+        rc = 1
         try:
+            from .gate_client import GateClient
             rc = _run_analyzer(analyzer_main, GateClient(child_sock))
+        except BaseException:   # noqa: BLE001, S110 -- see above
+            pass
         finally:
-            child_sock.close()
-        os._exit(rc)
+            # The socket first: closing it is what tells the root side this
+            # process is on its way out, and it must not wait for the flush.
+            try:
+                child_sock.close()
+            except OSError:
+                pass
+            _flush_stdio()
+            os._exit(rc if isinstance(rc, int) else 1)
 
     # ---- parent: stays root, runs the gate ----
     analyzer.append(pid)
     child_sock.close()
+    # From here to the end nothing this side logs can raise (see _quiet):
+    # there is an analyzer to serve, then to reap, whatever became of stdout.
+    log = _quiet(log)
     _stop_serving_when_it_exits(pid, parent_sock)
 
     log(f"[privsep] gate running as root (pid {os.getpid()}), "

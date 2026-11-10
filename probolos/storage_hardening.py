@@ -144,7 +144,12 @@ def filter_safe_partitions(partitions: List,
         if ok:
             safe.append(part)
         else:
+            # Numbered from 1, as the report and every other finding number
+            # them. These messages used the table's own index, from 0, so the
+            # geometry finding said "partition 0" about the entry the block
+            # above it had just listed as "partition 1".
             idx = getattr(part, "index", "?")
+            number = idx + 1 if isinstance(idx, int) else idx
             if reason != "empty slot (sectors=0)":  # empty slots are not suspicious
-                suspicious.append(f"partition {idx}: {reason}")
+                suspicious.append(f"partition {number}: {reason}")
     return safe, suspicious

@@ -104,17 +104,30 @@ class LedgerAnalyzer(Analyzer):
             return []
         findings = []
 
+        entry = ctx.ledger.lookup(ctx.device)
+
         if ctx.ledger.load_error:
+            # Said, and then the history that IS there is still used. This
+            # used to return here, and load_error stands for the whole run:
+            # one malformed entry in the file -- or a file that was refused
+            # outright -- switched descriptor-drift and previously-rejected
+            # off for EVERY device until the next start, the ones whose
+            # entries had loaded and the ones refused since, in this very
+            # run, included. A device turned away an hour ago came back
+            # without its countdown, behind a NOTICE.
+            if entry is None:
+                rest = ("This device was judged without any knowledge of how "
+                        "it has behaved before.")
+            else:
+                rest = ("What could be read, and what this run has recorded "
+                        "since, was still used for this device.")
             findings.append(rules.Finding(
                 "ledger-unavailable", rules.Severity.NOTICE,
                 "Device history could not be read",
-                f"{ctx.ledger.load_error}. This device was judged without any "
-                "knowledge of how it has behaved before."))
-            return findings
+                f"{ctx.ledger.load_error}. {rest}"))
 
-        entry = ctx.ledger.lookup(ctx.device)
         if entry is None:
-            return []
+            return findings
 
         digest = ledger_mod.descriptor_fingerprint(ctx.device)
         # Compared against the BASELINE -- the set first seen under this

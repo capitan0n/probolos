@@ -20,6 +20,11 @@ PREFIX=/opt/probolos
 BIN=/usr/local/bin/probolos
 PY=/usr/bin/python3
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This file by an absolute path, and the command line as it was typed: both
+# are needed after the `cd /` below and after the option loop has shifted
+# the arguments away.
+SELF="$SRC/$(basename "${BASH_SOURCE[0]}")"
+INVOCATION="$0 $*"
 # Out of whatever directory sudo was run in: python as root must not import
 # a module that happens to sit there (and every path below is absolute).
 cd /
@@ -33,19 +38,23 @@ MARKER="# installed by probolos install.sh"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "run as root: sudo $0 $*"
-
 user="${SUDO_USER:-}"
 action=install
 while [ $# -gt 0 ]; do
     case "$1" in
         --uninstall) action=uninstall ;;
         --user) [ $# -ge 2 ] || die "--user needs a NAME"; shift; user="$1" ;;
-        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # "$SELF", not "$0": after the `cd /` above a relative $0 (the usual
+        # ./install.sh) names nothing, and --help printed a sed error.
+        -h|--help) sed -n '2,16p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
     shift
 done
+
+# After the options, so that --help needs no root and a mistyped option is
+# reported as one, not as a missing sudo.
+[ "$(id -u)" -eq 0 ] || die "run as root: sudo $INVOCATION"
 
 # systemctl --user for the desktop account. Best effort: it only works while
 # that account is logged in, and the agent starts at its next login anyway.

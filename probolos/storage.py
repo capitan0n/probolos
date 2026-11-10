@@ -654,16 +654,37 @@ def inspect_safely(device: str, timeout: float = 10.0,
     parent_conn, child_conn = ctx.Pipe()
     proc = ctx.Process(
         target=_inspect_worker, args=(device, child_conn, fd), daemon=True)
-    try:
-        proc.start()
-        child_conn.close()
-        proc.join(timeout)
+
+    def end_the_reader(grace: float) -> None:
+        """Reap the child, giving it `grace` seconds to go by itself."""
+        proc.join(grace)
         if proc.is_alive():
             proc.terminate()
             proc.join(1.0)
             if proc.is_alive():
                 proc.kill()
                 proc.join(0.1)
+
+    try:
+        proc.start()
+        child_conn.close()
+        # Wait for the ANSWER, not for the process to exit.
+        #
+        # This used to be proc.join(timeout), and a reader still alive at
+        # the end of it was a stall -- whether or not its report was already
+        # sitting in the pipe. The reader is forked from a process with
+        # other threads (the watchdog, the agent's accept loop), and a child
+        # forked while one of them held a lock -- stdout's, in the middle of
+        # a line -- finishes its work and then hangs on that lock on its way
+        # out. The medium had been read, the report sent, and after the full
+        # timeout, with the device switched on all the while, the operator
+        # was told "device did not respond" and the report was thrown away.
+        #
+        # poll() answers as soon as the report arrives (or the pipe closes
+        # because the reader died), so the device is also switched off again
+        # that much sooner: nothing waits for the child's own exit any more.
+        if not parent_conn.poll(timeout):
+            end_the_reader(0)
             # `inspected` stays False (scheme unknown), so no rule mistakes a
             # stalled device for one that passed. The silence is the finding.
             return MediumReport(
@@ -671,10 +692,18 @@ def inspect_safely(device: str, timeout: float = 10.0,
                 error=f"device did not respond within {timeout:.0f}s -- "
                       f"inspection abandoned",
                 timed_out=True)
-        if parent_conn.poll():
+        try:
             kind, payload = parent_conn.recv()
-            return payload if kind == "ok" else MediumReport(device=device,
-                                                             error=payload)
+        except Exception:   # noqa: BLE001 -- EOF, or nothing that unpickles
+            # The pipe closed with no report in it: the reader died first.
+            kind, payload = None, None
+        # It has answered, or died: either way it is on its way out, and one
+        # that is not (see above) is not waited for with the device on.
+        end_the_reader(0.5)
+        if kind == "ok" and isinstance(payload, MediumReport):
+            return payload
+        if kind == "error" and isinstance(payload, str):
+            return MediumReport(device=device, error=payload)
         return MediumReport(device=device,
                             error="inspection process produced no result")
     finally:
@@ -856,7 +885,7 @@ def inspect(device: str, open_fn=None) -> MediumReport:
                 part.start_lba, report.size_sectors)
             if offset is None:
                 report.suspicious.append(
-                    f'partition {part.index}: start_lba {part.start_lba} '
+                    f'partition {part.index + 1}: start_lba {part.start_lba} '
                     f'does not fit the device; not read')
                 continue
             chunk = _read_at(fd, offset, PARTITION_SNIFF_READ)

@@ -7,6 +7,7 @@ Covers probolos.__main__.
 from __future__ import annotations
 
 import io
+import os
 import pwd
 import re
 import unittest
@@ -218,6 +219,68 @@ class CommandLineWiring(unittest.TestCase):
     def test_off_unless_asked(self):
         captured = self._run(["--no-trust", "--no-ledger"])
         self.assertFalse(captured["watch_media"])
+
+
+class TheDaemonsOutputIsNotHeldBack(unittest.TestCase):
+    """
+    Python line-buffers stdout only on a terminal. Sent to a file or a pipe
+    the daemon's lines sat in an 8 KiB buffer, so its log said nothing until
+    that much had been printed. (The shipped unit sets PYTHONUNBUFFERED; a
+    run by hand with `> log` or `| tee`, or any other supervisor, did not.)
+    """
+
+    def test_stdout_is_switched_to_line_buffering(self):
+        from probolos import __main__ as cli
+        stream = mock.Mock()
+        with mock.patch("sys.stdout", stream):
+            cli.line_buffer_stdout()
+        stream.reconfigure.assert_called_once_with(line_buffering=True)
+
+    def test_a_stream_that_cannot_be_reconfigured_is_left_alone(self):
+        from probolos import __main__ as cli
+        for stream in (io.StringIO(), None):
+            with mock.patch("sys.stdout", stream):
+                cli.line_buffer_stdout()            # must not raise
+
+    def test_it_happens_before_the_gate_says_anything(self):
+        from probolos import __main__ as cli
+        order = []
+        with mock.patch.object(cli, "require_usb"), \
+             mock.patch.object(cli, "require_root"), \
+             mock.patch.object(cli, "claim_the_gate", return_value=None), \
+             mock.patch.object(cli, "line_buffer_stdout",
+                               side_effect=lambda: order.append("buffer")), \
+             mock.patch.object(cli.daemon, "serve",
+                               side_effect=lambda **kw: order.append("serve")), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: order.append("print")):
+            cli.main(["--no-trust", "--no-ledger"])
+        self.assertEqual(order[0], "buffer")
+        self.assertIn("serve", order)
+
+    def test_a_line_reaches_a_pipe_while_the_process_is_still_running(self):
+        import select
+        import subprocess
+        import sys
+        repo = str(Path(__file__).resolve().parent.parent)
+        code = ("import sys, time\n"
+                f"sys.path.insert(0, {repo!r})\n"
+                "from probolos.__main__ import line_buffer_stdout\n"
+                "line_buffer_stdout()\n"
+                "print('[*] Listening.')\n"
+                "time.sleep(60)\n")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+        proc = subprocess.Popen([sys.executable, "-B", "-c", code],
+                                stdout=subprocess.PIPE, env=env)
+        try:
+            ready, _, _ = select.select([proc.stdout], [], [], 30)
+            self.assertTrue(ready, "the line was still in Python's buffer")
+            self.assertEqual(os.read(proc.stdout.fileno(), 100),
+                             b"[*] Listening.\n")
+        finally:
+            proc.kill()
+            proc.wait()
+            proc.stdout.close()
 
 
 # ---------------------------------------------------------------------------

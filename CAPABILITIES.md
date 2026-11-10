@@ -129,7 +129,9 @@ their other functions on too. Its result is context: decisions rest on stages
 - **History (the ledger):** every device seen, with its type (from its
   interface classes, never from its own name), the decisions about it, and a
   fingerprint of its descriptors. The fingerprint ignores what legitimately
-  changes between USB 2 and USB 3 ports. `--history [-v]` shows it.
+  changes between USB 2 and USB 3 ports. `--history [-v]` shows it. The file
+  is kept under 4 MiB: past that, devices nobody ever answered a question
+  about are forgotten first, and the daemon says so.
 - **Trust store:** devices allowed "always", pinned by identity *and* the
   exact descriptor bytes, so a remembered device moved between a USB 2 and a
   USB 3 port may be asked about again. A trust store that cannot be read, or
@@ -139,7 +141,7 @@ their other functions on too. Its result is context: decisions rest on stages
 |---|---|---|
 | `descriptor-drift` | CRITICAL | a known device now presents different descriptors |
 | `previously-rejected` | CRITICAL | you refused this device before |
-| `ledger-unavailable` | NOTICE | the history could not be read |
+| `ledger-unavailable` | NOTICE | the history could not be read, or not all of it (what was read is still used) |
 
 ### 1.7 When nobody can answer
 

@@ -16,6 +16,53 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ### Security
 
+- **Closing the terminal left USB ports dead.** A run started as
+  `sudo python3 -m probolos` in a terminal that was then closed (or over an
+  SSH session that dropped) exited with every root hub but the first still at
+  `authorized_default=0`: no new USB device on those ports worked until
+  `--release`. Restoring depended on being able to print. The hangup handler
+  logged before it restored, each hub's "restored" line was inside the same
+  `try` as its write, and with the terminal gone every line failed with
+  `EIO`: the first hub's line was taken for a failed write, and the error
+  message about it, on a stderr that was gone too, raised out of the loop.
+  `atexit` repeated it. The same happened with output going to a pipe whose
+  reader had exited; with a pipe nobody reads, the line printed before the
+  restore never returned at all. The watchdog and the panic file also
+  printed before they reopened the gate, the root gate logged from inside
+  its own restore, and the watchdog thread ended at the first line it could
+  not log, so the panic file did nothing after that. Now every hub is
+  written before anything is said, nothing that fails to print can stop
+  anything, and the report of what stays blocked comes after the gate has
+  reopened. The service was not affected (its gate is the root half, which
+  restores without logging unless something fails).
+- **A device that was refused could come back without its countdown.** One
+  malformed entry in the history file, or a file that could not be read at
+  all, switched `descriptor-drift` and `previously-rejected` off for every
+  device until the next start: also for devices whose entries had loaded,
+  and for devices refused later in that same run. Only the
+  `ledger-unavailable` notice was shown. The history that is there is now
+  still used, and the notice says so.
+- **A device could empty the history.** The lists inside a history entry
+  were bounded, the number of entries was not, and a new serial number is a
+  new entry. A device that re-enumerates under a fresh serial each time
+  (behind a locked screen every sighting is recorded at once) grew the file
+  by about 700 bytes per attempt. Past 8 MiB, some 12 000 attempts, the next
+  start refused to read it and the first save replaced it: every refusal and
+  every drift baseline was gone. The file is now kept under 4 MiB. When it
+  would grow past that, a quarter of the entries are forgotten, those nobody
+  ever answered a question about first, oldest first; an entry with an
+  approval or a refusal goes only when nothing else is left. The daemon says
+  when this happens.
+- **The analyzer could fail to start, and the gate never closed.** On Python
+  3.10 to 3.13 the history's constructor raised when its directory could not
+  be reached, before the gate had closed; under the service that is a restart
+  loop with the ports open. It happens to the `--privsep` analyzer when
+  `/var/lib/probolos` was created under a restrictive umask (below), and when
+  the launcher refuses to hand the state directory over because the history
+  file in it is a symlink or has a second link, which any process running as
+  the directory's previous owner (`nobody`, after a run by hand) can arrange.
+  An unreachable history is now a reported load error, as an unreachable
+  trust store already was.
 - **The panic file could leave no USB driver binding under
   `--close-race-window`.** The watchdog and the panic file reopened the hubs
   but not `drivers_autoprobe`, which that flag holds at 0 around one
@@ -73,6 +120,56 @@ in [docs/QA-LOG.md](docs/QA-LOG.md).
 
 ### Fixed
 
+- **`--privsep` by hand under a umask of 077 or 027.** Directories the root
+  side created took their mode from root's umask. `/var/lib/probolos` came
+  out `0700` or `0750`, so the analyzer could read neither the trust store
+  ("nothing will be treated as trusted", and "always" was lost) nor reach its
+  own state directory; a `/run/probolos` made the same way kept the desktop
+  agent from the socket of a run without `--privsep`. Directories another
+  account has to pass through are now created `0755` whatever the umask. One
+  that already exists is never changed (`chmod 755 /var/lib/probolos` repairs
+  an old one), and a user's own state directory still follows their umask.
+- **Under `--privsep`, output sent to a file or a pipe lost everything the
+  analyzer printed.** The analyzer leaves through `os._exit()`, which flushes
+  nothing, so with `> probolos.log`, `| tee` or a supervisor other than the
+  shipped unit (which sets `PYTHONUNBUFFERED`) the reports, the decisions and
+  the gate reopening never came out. The analyzer now flushes before it
+  exits, nothing buffered crosses the fork, and the daemon and the agent
+  line-buffer their output, so a line is written when it is printed and not
+  when 8 KiB have collected.
+- **The analyzer could unwind into the root side's code.** With stderr gone,
+  its "[analyzer] crashed" message raised out of its own handler, and the
+  exception carried on up the stack the fork had copied, through `main()`'s
+  cleanup and the `atexit` handlers, instead of ending in `os._exit()`. On
+  the root side, a log line that raised after the gate stopped skipped
+  reaping the analyzer. Neither can raise now.
+- **Refusing a device that had been unplugged raised the loudest alarm.**
+  Pull a device out while its question is open, answer no (or let it time
+  out), and the daemon printed "COULD NOT DEAUTHORIZE ... The device may
+  still be live. Unplug it now". A device that is gone is now said to be
+  gone; one that is still there and will not switch off is as loud as before.
+- **Stage 4 could wait ten seconds and then throw a good report away.** The
+  daemon waited for the reader process to exit, not for its report: a reader
+  that had read the medium and answered, and then did not exit (a child
+  forked while another thread held a lock hangs on its way out), was a
+  "device did not respond", with the device switched on for the whole
+  timeout. A reader that died without a report raised instead of being
+  reported as one. The report is now what is waited for; the device is
+  switched off again as soon as it arrives.
+- **The geometry finding numbered partitions from 0.** It said
+  "partition 0" about the entry the block above it listed as "partition 1".
+- **A terminal prompt with no stdin** (descriptor 0 closed, or its terminal
+  gone) ended in an "unhandled error" with no decision recorded; it is "no
+  input", like an end-of-file.
+- **A history save error that came back was never reported again.** A
+  repeated error is reported once, but the memory of it survived a
+  successful save: a disk that filled up a second time did so in silence.
+- **`sudo ./install.sh --help`** printed a `sed` error and failed (the script
+  had already changed to `/` and read itself by a relative path), and without
+  `sudo` it only said "run as root". `--help` now works either way.
+- The root gate checked three names (root hub, disk, interface) with
+  `match()` where it used `fullmatch()` everywhere else; `$` also matches
+  before a trailing newline. No kernel name ends in one.
 - **`--log` under `--privsep` logged nothing.** The analyzer writes it, and
   could not create it in a root-owned directory such as `/var/log`: every
   decision printed "could not write log". The problem is now named once at

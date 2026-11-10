@@ -30,6 +30,26 @@ BANNER = r"""
 """
 
 
+def line_buffer_stdout() -> None:
+    """
+    Have every line the daemon prints written when it is printed.
+
+    Python line-buffers stdout only on a terminal. Sent to a file or a pipe
+    (`> probolos.log`, `| tee`, a service manager other than the shipped
+    unit, which sets PYTHONUNBUFFERED for this reason) the daemon's output
+    sat in an 8 KiB buffer: nothing appeared until that much had been said,
+    and the report of a device could arrive long after its question. For a
+    program whose output is its log, a line is due when it is written.
+
+    Anything that is not a reconfigurable text stream (a test's StringIO, a
+    closed stdout) is left as it is.
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
 def require_root() -> None:
     if os.geteuid() != 0:
         sys.exit("This needs root: writing to /sys/bus/usb/.../authorized "
@@ -618,6 +638,7 @@ def main(argv=None) -> None:
         # Held until the process exits. Before the banner, so a refusal is
         # the only thing printed.
         gate_lock = claim_the_gate()
+    line_buffer_stdout()
     print(BANNER)
     if not args.dry_run:
         print("[!] The gate will close: NEW USB devices will not work until")

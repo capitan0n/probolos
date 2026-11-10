@@ -369,7 +369,16 @@ class Watchdog:
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
-            reason = self.check_once()
+            # One pass that raises must not be the end of the watchdog: this
+            # thread is also what checks for the panic file. check_once()
+            # logs when it refuses an invalid one, and a log that is gone
+            # (the terminal was closed, the pipe's reader exited) raised out
+            # of the thread; from then on nothing watched for a stall and
+            # `touch /run/probolos.panic` did nothing, with no word said.
+            try:
+                reason = self.check_once()
+            except Exception:   # noqa: BLE001, S112 -- the next pass still runs
+                continue
             if reason:
                 self.on_stall(reason)
                 return

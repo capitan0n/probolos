@@ -81,6 +81,10 @@ SYS_DEV_BLOCK = "/sys/dev/block"
 # Root hubs -- usb1, usb2, ... -- are the only devices that own
 # authorized_default. Anything else asking for it is either confused or
 # probing, and neither deserves a write.
+#
+# These three patterns are applied with fullmatch(), never match(): `$` also
+# matches just before a trailing newline, so match() takes "usb1\n" for a root
+# hub. No kernel name ends in one, but the gate does not rest a check on that.
 _ROOT_HUB_NAME = _re.compile(r"^usb\d+$")
 # USB interface directories under a device: <device>:<config>.<interface>.
 _INTERFACE_NAME = _re.compile(r"^[0-9]+-[0-9.]+:[0-9]+\.[0-9]+$")
@@ -264,7 +268,7 @@ class GateServer:
         block_dir = BLOCK_PREFIX.rstrip("/")
         if str(p.parent) != block_dir:
             return None, f"not a node directly under {block_dir}"
-        if not _BLOCK_NAME.match(p.name):
+        if not _BLOCK_NAME.fullmatch(p.name):
             return None, "not a SCSI disk node (sdX)"
         try:
             st = os.stat(resolved)
@@ -439,7 +443,7 @@ class GateServer:
         except OSError:
             return False
         for name in names:
-            if not _INTERFACE_NAME.match(name):
+            if not _INTERFACE_NAME.fullmatch(name):
                 continue
             classes.append(cls._read_attr_pinned(usb_path / name,
                                                  "bInterfaceClass"))
@@ -686,7 +690,7 @@ class GateServer:
         if hubpath is None:
             return protocol.Response(protocol.DENIED,
                                      f"path not under {USB_LINK_PREFIX}")
-        if not _ROOT_HUB_NAME.match(hubpath.name):
+        if not _ROOT_HUB_NAME.fullmatch(hubpath.name):
             return protocol.Response(
                 protocol.DENIED,
                 f"authorized_default belongs to a root hub, not to "
@@ -1095,7 +1099,7 @@ class GateServer:
         if error:
             return protocol.Response(protocol.ERROR,
                                      f"could not save the trust store: {error}")
-        self.log(f"[gate] remembered {devpath.name} in {self.trust_path}")
+        self._say(f"[gate] remembered {devpath.name} in {self.trust_path}")
         return protocol.Response(protocol.OK)
 
     # ---- the loop ----
@@ -1113,7 +1117,41 @@ class GateServer:
                 if wakeup:
                     _close_signal_wakeup(wakeup)
 
+    def _say(self, message: str) -> None:
+        """
+        One log line that can stop nothing.
+
+        The gate's log is the root process's stdout, and it can go away
+        while the gate still has work to do: the terminal is closed, the
+        pipe's reader exits. A line that raised out of restore() left the
+        root hubs after it closed, and one that raised out of a handler
+        ended the gate. What the gate does never depends on saying so.
+        """
+        try:
+            self.log(message)
+        except Exception:   # noqa: BLE001, S110 -- a log that is gone
+            pass
+
     def restore(self):
+        """
+        Undo what this gate changed. Never raises.
+
+        Three steps, each of which still runs when the one before it failed,
+        and nothing is logged until all three are done: a log line that
+        raised, or never returned, between two root hubs used to leave the
+        second one closed, with the gate already on its way out.
+        """
+        notes: list = []
+        for step in (self._restore_interfaces, self._reblock_inspected,
+                     self._reopen_hubs):
+            try:
+                step(notes)
+            except Exception as exc:   # noqa: BLE001 -- the next step still runs
+                notes.append(f"[gate] {step.__name__} stopped early: {exc!r}")
+        for note in notes:
+            self._say(note)
+
+    def _restore_interfaces(self, notes: list) -> None:
         # Interfaces first, and before the devices they belong to are
         # re-blocked: writing `authorized` on an interface of a device that
         # has just been unconfigured fails with ENODEV, and an interface left
@@ -1128,23 +1166,43 @@ class GateServer:
                 # nobody inspected is exactly what _do_authorize_interface
                 # refuses to do on the request path.
                 if instance is not None and self._instance(node) != instance:
-                    self.log(f"[gate] not restoring {node.name}: a different "
-                             f"device now occupies that path")
+                    notes.append(f"[gate] not restoring {node.name}: a "
+                                 f"different device now occupies that path")
                     continue
                 self._write_authorized_at(node, 1)
-            except OSError as exc:
-                self.log(f"[gate] could not re-authorize {node.name}: {exc}")
+            except Exception as exc:   # noqa: BLE001 -- the next one is still tried
+                notes.append(f"[gate] could not re-authorize {node.name}: "
+                             f"{exc}")
+
+    def _reblock_inspected(self, notes: list) -> None:
         for path in list(self._authorized_here):
-            if self._owns_instance(Path(path)):
+            # Per device, like the hubs below: one that raises must not
+            # leave the next switched on with nobody having approved it.
+            try:
+                if not self._owns_instance(Path(path)):
+                    continue
                 resp = self._do_authorize(protocol.Request(
                     protocol.REQ_AUTHORIZE, path, 0, self._instances[path]))
-                if not resp.ok:
-                    self.log(f"[gate] could not re-block {path}: {resp.detail}")
-        for path, previous in list(self._closed_defaults.items()):
-            resp = self._do_set_default(protocol.Request(
-                protocol.REQ_SET_DEFAULT, path, previous or 1))
+            except Exception as exc:   # noqa: BLE001 -- the next one is still tried
+                notes.append(f"[gate] could not re-block {path}: {exc!r}")
+                continue
             if not resp.ok:
-                self.log(f"[gate] could not restore {path}: {resp.detail}")
+                notes.append(f"[gate] could not re-block {path}: "
+                             f"{resp.detail}")
+
+    def _reopen_hubs(self, notes: list) -> None:
+        for path, previous in list(self._closed_defaults.items()):
+            # One hub that raises must not be the reason the next stays
+            # closed; _do_set_default answers with a Response, so reaching
+            # the except is a bug, and still not a reason.
+            try:
+                resp = self._do_set_default(protocol.Request(
+                    protocol.REQ_SET_DEFAULT, path, previous or 1))
+            except Exception as exc:   # noqa: BLE001 -- see above
+                notes.append(f"[gate] could not restore {path}: {exc!r}")
+                continue
+            if not resp.ok:
+                notes.append(f"[gate] could not restore {path}: {resp.detail}")
 
     def _wait_for_request(self) -> None:
         """
@@ -1247,7 +1305,7 @@ class GateServer:
                 else:
                     resp = protocol.Response(protocol.ERROR, "unhandled kind")
             except Exception as exc:   # noqa: BLE001 -- see above
-                self.log(f"[gate] handler for {req.kind!r} raised: {exc!r}")
+                self._say(f"[gate] handler for {req.kind!r} raised: {exc!r}")
                 resp = protocol.Response(protocol.ERROR, "internal gate error")
 
             peer_gone = False
@@ -1297,7 +1355,7 @@ class GateServer:
                               array.array("i", [fd]))]
                 self.sock.sendmsg([payload], ancillary)
         except OSError as exc:
-            self.log(f"[gate] analyzer went away before the reply ({exc})")
+            self._say(f"[gate] analyzer went away before the reply ({exc})")
             raise _PeerGone from exc
 
 

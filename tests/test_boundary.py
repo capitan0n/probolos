@@ -16,6 +16,7 @@ Covers probolos.privsep, probolos.gate_client and probolos.gate_server.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import signal
@@ -115,6 +116,47 @@ class AnalyzerExitStatus(unittest.TestCase):
     def test_a_normal_return_is_its_status(self):
         self.assertEqual(privsep._run_analyzer(lambda _c: None, None), 0)
         self.assertEqual(privsep._run_analyzer(lambda _c: 4, None), 4)
+
+    def test_a_crash_it_cannot_report_is_still_only_a_status(self):
+        """With the terminal closed, "[analyzer] crashed" raised EIO out of
+        its own except clause, and the analyzer unwound into the parent's
+        stack instead of leaving through os._exit()."""
+        def crashes(_client):
+            raise RuntimeError("boom")
+
+        def leaves(_client):
+            raise SystemExit("a panic file is still there")
+        with mock.patch("sys.stderr", _GoneStream()):
+            self.assertEqual(privsep._run_analyzer(crashes, None), 1)
+            self.assertEqual(privsep._run_analyzer(leaves, None), 1)
+
+
+class _GoneStream:
+    """stdout or stderr after the terminal was closed: every write is EIO."""
+
+    def write(self, _text):
+        raise OSError(errno.EIO, "Input/output error")
+
+    def flush(self):
+        raise OSError(errno.EIO, "Input/output error")
+
+
+class TheRootSideLogCannotRaise(unittest.TestCase):
+
+    def test_quiet_swallows_a_log_that_is_gone(self):
+        def gone(*_a):
+            raise OSError(errno.EIO, "Input/output error")
+        privsep._quiet(gone)("[privsep] anything")      # must not raise
+
+    def test_quiet_passes_lines_through(self):
+        said = []
+        privsep._quiet(said.append)("[privsep] a line")
+        self.assertEqual(said, ["[privsep] a line"])
+
+    def test_flushing_streams_that_are_gone_does_not_raise(self):
+        with mock.patch("sys.stdout", _GoneStream()), \
+                mock.patch("sys.stderr", None):
+            privsep._flush_stdio()
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +602,26 @@ class WhatTheAnalyzerLeavesBehind(unittest.TestCase):
         sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
 
 
+class StartParentSideWithItsLogGone(_StartCase):
+    """
+    The root half logs to its stdout. With the terminal closed, the line
+    after the gate stopped raised, and the analyzer was never reaped.
+    """
+
+    def test_the_analyzer_is_still_reaped_and_its_children_ended(self):
+        def gone(*_a):
+            raise OSError(errno.EIO, "Input/output error")
+        with mock.patch.object(privsep.os, "fork", return_value=4242), \
+                mock.patch.object(privsep.gate_server, "run_gate",
+                                  side_effect=RuntimeError("gate bug")), \
+                mock.patch.object(privsep.os, "waitpid",
+                                  return_value=(4242, 0)) as waitpid:
+            rc = privsep.start(lambda _c: 0, log=gone)
+        self.assertEqual(rc, 1)
+        waitpid.assert_called()
+        self.end_descendants.assert_called_once()
+
+
 class StartChildSide(_StartCase):
     """The analyzer half: leave the session, drop, run, and only ever _exit."""
 
@@ -623,6 +685,45 @@ class StartChildSide(_StartCase):
                              drop=privsep.PrivsepError("groups survived"))
         self.assertEqual(code, 70)
         self.assertEqual(ran, [], "the analyzer ran as root")
+
+    def child_with_stderr_gone(self, analyzer_main):
+        with mock.patch.object(privsep.os, "fork", return_value=0), \
+                mock.patch.object(privsep.os, "setsid"), \
+                mock.patch.object(privsep, "drop_privileges"), \
+                mock.patch.object(privsep.os, "_exit", side_effect=_exit), \
+                mock.patch.object(privsep.gate_server, "run_gate"), \
+                mock.patch("sys.stderr", _GoneStream()):
+            with self.assertRaises(_Exited) as ended:
+                privsep.start(analyzer_main, log=self.logged.append)
+        return ended.exception.code
+
+    def test_a_crash_with_the_terminal_gone_still_ends_in_exit(self):
+        """The crash message raised EIO, the exception left _run_analyzer,
+        and the child carried on up the parent's stack: through main()'s
+        cleanup and the atexit handlers the fork had copied."""
+        def crashes(_client):
+            raise RuntimeError("boom")
+        self.assertEqual(self.child_with_stderr_gone(crashes), 1)
+
+    def test_whatever_the_analyzer_raises_the_child_only_exits(self):
+        def odd(_client):
+            raise GeneratorExit            # a BaseException nobody expects
+        self.assertEqual(self.child_with_stderr_gone(odd), 1)
+
+    def test_a_status_that_is_not_a_number_is_a_failure(self):
+        self.assertEqual(self.child_with_stderr_gone(lambda _c: "done"), 1)
+
+    def test_the_socket_is_closed_before_the_exit(self):
+        closed = []
+        real_close = socket.socket.close
+
+        def close(sock):
+            closed.append(sock.fileno())
+            real_close(sock)
+        with mock.patch.object(socket.socket, "close", close):
+            code, _ = self.child(lambda _c: 0)
+        self.assertEqual(code, 0)
+        self.assertTrue(closed)
 
 
 # ---------------------------------------------------------------------------
@@ -1055,6 +1156,96 @@ class GateRootHubRefusals(_FakeSysfs):
         self.assertTrue(any("could not restore" in line
                             for line in self.logged))
 
+    def test_a_name_that_only_starts_like_a_root_hub_is_not_one(self):
+        """`$` also matches before a trailing newline, so match() took
+        "usb7\\n" for a root hub; every other check here used fullmatch()."""
+        odd = self.devices / "pci0" / "usb7\n"
+        odd.mkdir()
+        (odd / "authorized_default").write_text("1\n")
+        os.symlink(odd, self.busview / odd.name)
+        self.assertRefused(self.ask(odd, 0), detail="belongs to a root hub")
+        self.assertEqual((odd / "authorized_default").read_text(), "1\n")
+
+    def test_a_disk_name_with_a_trailing_newline_is_not_a_disk_name(self):
+        _node, reason = gate_server.GateServer._check_block_path(
+            str(self.dev / "sdz\n"))
+        self.assertEqual(reason, "not a SCSI disk node (sdX)")
+
+
+def _gone(*_args):
+    """A log whose terminal was closed: every line is EIO."""
+    raise OSError(errno.EIO, "Input/output error")
+
+
+class GateRestoreDoesNotDependOnItsLog(_FakeSysfs):
+    """
+    The gate's log is the root process's stdout. restore() logged from
+    inside its loops, so a line that raised -- the terminal closed, the
+    pipe's reader gone -- left it before the root hubs were reopened, with
+    the gate already on its way out.
+    """
+
+    def close_the_hub(self):
+        self.assertTrue(self.gate._do_set_default(
+            _req(protocol.REQ_SET_DEFAULT, self.hub, 0)).ok)
+        self.assertEqual((self.hub / "authorized_default").read_text(), "0")
+
+    def unbind_an_interface_that_will_not_come_back(self):
+        self.assertTrue(self.gate._do_authorize_interface(
+            _req(protocol.REQ_AUTHORIZE_INTERFACE, self.intf, 0)).ok)
+        (self.intf / "authorized").unlink()
+
+    def test_a_line_that_raises_does_not_leave_the_hub_closed(self):
+        self.unbind_an_interface_that_will_not_come_back()
+        self.close_the_hub()
+        self.gate.log = _gone
+        self.gate.restore()                 # must not raise
+        self.assertEqual((self.hub / "authorized_default").read_text(), "1")
+        self.assertEqual(self.gate._closed_defaults, {})
+
+    def test_a_step_that_raises_does_not_stop_the_next(self):
+        self.unbind_an_interface_that_will_not_come_back()
+        self.close_the_hub()
+        with mock.patch.object(gate_server.GateServer, "_write_authorized_at",
+                               side_effect=RuntimeError("not an OSError")):
+            self.gate.restore()
+        self.assertEqual((self.hub / "authorized_default").read_text(), "1")
+        self.assertTrue(any("could not re-authorize" in line
+                            for line in self.logged), self.logged)
+
+    def test_a_device_that_raises_does_not_keep_the_next_switched_on(self):
+        second = self.hub / "1-3"
+        second.mkdir()
+        (second / "authorized").write_text("0\n")
+        os.symlink(second, self.busview / "1-3")
+        for device in (self.usb, second):
+            self.assertTrue(self.gate._do_authorize(_req(
+                protocol.REQ_AUTHORIZE, device, 1,
+                instance=self.instance(device))).ok)
+        real = gate_server.GateServer._do_authorize
+
+        def first_one_raises(gate, req):
+            if req.path == str(self.usb):
+                raise RuntimeError("not a Response")
+            return real(gate, req)
+        with mock.patch.object(gate_server.GateServer, "_do_authorize",
+                               first_one_raises):
+            self.gate.restore()
+        self.assertEqual((second / "authorized").read_text(), "0")
+        self.assertTrue(any("could not re-block" in line
+                            for line in self.logged), self.logged)
+
+    def test_nothing_is_logged_until_everything_is_put_back(self):
+        """A line that never returns must find the work already done."""
+        self.unbind_an_interface_that_will_not_come_back()
+        self.close_the_hub()
+        seen = []
+        self.gate.log = lambda line: seen.append(
+            (line, (self.hub / "authorized_default").read_text()))
+        self.gate.restore()
+        self.assertTrue(seen)
+        self.assertEqual({default for _line, default in seen}, {"1"})
+
 
 class GateOpenRefusals(_FakeSysfs):
 
@@ -1369,6 +1560,21 @@ class GateServeLoopSurvivesItsPeer(unittest.TestCase):
         ping = protocol.Request(protocol.REQ_PING).encode()
         peer = self.Peer(b"not json", ping)
         self.serve(peer)
+        self.assertEqual([r.status for r, _ in peer.sent],
+                         [protocol.ERROR, protocol.OK])
+
+    def test_a_log_that_raises_does_not_end_the_gate(self):
+        """A handler that raised is logged and answered with an error. With
+        the log gone the line itself raised, out of the loop: the gate
+        stopped serving over a message it could not print."""
+        broken = protocol.Request(protocol.REQ_AUTHORIZE, path="/x",
+                                  value=1).encode()
+        ping = protocol.Request(protocol.REQ_PING).encode()
+        peer = self.Peer(broken, ping)
+        gate = gate_server.GateServer(peer, log=_gone)
+        with mock.patch.object(gate_server.GateServer, "_do_authorize",
+                               side_effect=RuntimeError("a handler bug")):
+            gate.serve_forever()
         self.assertEqual([r.status for r, _ in peer.sent],
                          [protocol.ERROR, protocol.OK])
 

@@ -756,6 +756,14 @@ def main(argv=None) -> int:
         print("Both dialogs work — the agent will function here.")
         return 0
 
+    # What the agent prints is its log, and as a user service that goes to a
+    # pipe, where Python buffers by the block: a line is due when written.
+    # The shipped unit sets PYTHONUNBUFFERED; this covers every other way of
+    # starting it.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError, OSError):
+        pass
     return Agent(args.socket).run()
 
 

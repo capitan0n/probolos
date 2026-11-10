@@ -1302,5 +1302,295 @@ class LedgerTextReachesNoTerminalRaw(unittest.TestCase):
         self.assertIn("1-4\\x1b]0;pwned", refused[0].explanation)
 
 
+class ALedgerThatCannotBeReachedDoesNotStopTheGate(unittest.TestCase):
+    """
+    Path.exists() swallows only "not there". A state directory the analyzer
+    cannot traverse (made 0700 under a restrictive umask, or never handed
+    over) raised EACCES out of Ledger.__init__, before the gate had closed:
+    the analyzer died at startup and the gate with it. TrustStore.load()
+    already failed closed here; the ledger did not.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "state" / "ledger.json"
+
+    def test_eacces_is_a_load_error(self):
+        denied = PermissionError(13, "Permission denied", str(self.path))
+        with mock.patch.object(Path, "exists", side_effect=denied):
+            led = Ledger(self.path)                 # must not raise
+        self.assertIn("cannot reach the ledger", led.load_error)
+        self.assertEqual(led.entries, {})
+
+    def test_the_daemon_goes_on_without_history(self):
+        denied = PermissionError(13, "Permission denied", str(self.path))
+        with mock.patch.object(Path, "exists", side_effect=denied):
+            led = Ledger(self.path)
+        ids = [f.rule_id for f in analyzers.run(
+            analyzers.Context(device=make_device(), ledger=led))]
+        self.assertIn("ledger-unavailable", ids)
+
+    @unittest.skipUnless(os.geteuid() == 0, "needs root, to stop being it")
+    def test_for_real_as_an_account_that_cannot_traverse_the_directory(self):
+        locked = Path(self._tmp.name) / "locked"
+        locked.mkdir(mode=0o700)
+        os.chmod(self._tmp.name, 0o755)
+        target = locked / "state" / "ledger.json"
+        read_end, write_end = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            answer = b"raised"
+            try:
+                os.close(read_end)
+                os.setgroups([])
+                os.setgid(65534)
+                os.setuid(65534)
+                led = Ledger(target)
+                answer = (led.load_error or "loaded").encode()
+            except BaseException as exc:   # noqa: BLE001 -- reported below
+                answer = f"raised {type(exc).__name__}".encode()
+            finally:
+                os.write(write_end, answer)
+                os._exit(0)
+        os.close(write_end)
+        with os.fdopen(read_end, "rb") as pipe:
+            answer = pipe.read().decode()
+        os.waitpid(pid, 0)
+        # Up to Python 3.13 Path.exists() raises EACCES here, and the reason
+        # becomes the load error. From 3.14 it answers "not there", and the
+        # ledger simply starts empty. Either way the constructor returned.
+        self.assertTrue(answer == "loaded"
+                        or "cannot reach the ledger" in answer, answer)
+
+
+class AnIncompleteLedgerIsStillConsulted(unittest.TestCase):
+    """
+    LedgerAnalyzer returned as soon as the ledger had a load error, and the
+    error stands for the whole run. One malformed entry, or a file refused
+    outright, switched descriptor-drift and previously-rejected off for
+    every device until the next start: those whose entries had loaded, and
+    those refused since, in the same run.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "ledger.json"
+        self.stick = make_device()
+        self.reflashed = make_device(descriptor_blob(
+            (0x08, 0x06, 0x50), (0x03, 0x01, 0x01)))
+
+    def findings(self, led, device=None):
+        return {f.rule_id: f for f in analyzers.run(
+            analyzers.Context(device=device or self.stick, ledger=led))}
+
+    def with_one_broken_entry(self, decision, approved=False):
+        led = Ledger(self.path)
+        led.record(self.stick, decision, approved=approved)
+        self.assertIsNone(led.save())
+        data = json.loads(self.path.read_text())
+        data["entries"]["dead:beef:-"] = {"identity": 7}
+        self.path.write_text(json.dumps(data))
+        led = Ledger(self.path)
+        self.assertIn("1 malformed ledger entry", led.load_error)
+        return led
+
+    def test_a_refusal_that_loaded_still_brings_the_countdown(self):
+        found = self.findings(self.with_one_broken_entry("user rejected"))
+        self.assertIn("ledger-unavailable", found)
+        self.assertEqual(found["previously-rejected"].severity,
+                         rules.Severity.CRITICAL)
+
+    def test_drift_from_a_baseline_that_loaded_is_still_critical(self):
+        led = self.with_one_broken_entry("user approved", approved=True)
+        found = self.findings(led, self.reflashed)
+        self.assertEqual(found["descriptor-drift"].severity,
+                         rules.Severity.CRITICAL)
+
+    def test_a_refusal_made_in_this_run_counts_after_a_failed_load(self):
+        self.path.write_text("{not json")
+        led = Ledger(self.path)
+        self.assertIsNotNone(led.load_error)
+        self.assertNotIn("previously-rejected", self.findings(led))
+        led.record(self.stick, "user rejected")
+        self.assertIn("previously-rejected", self.findings(led))
+
+    def test_the_notice_says_which_of_the_two_it_was(self):
+        led = self.with_one_broken_entry("user rejected")
+        known = self.findings(led)["ledger-unavailable"].explanation
+        self.assertIn("was still used for this device", known)
+        other = make_device(serial="NEVER-SEEN")
+        unknown = self.findings(led, other)["ledger-unavailable"].explanation
+        self.assertIn("without any knowledge", unknown)
+
+    def test_a_device_with_no_entry_gets_the_notice_and_nothing_else(self):
+        led = self.with_one_broken_entry("user rejected")
+        other = make_device(serial="NEVER-SEEN")
+        self.assertEqual(list(self.findings(led, other)),
+                         ["ledger-unavailable"])
+
+
+class TheLedgerFileStaysReadable(unittest.TestCase):
+    """
+    Every list inside an entry was bounded; the number of entries was not,
+    and a new serial number is a new entry. A device re-enumerating under a
+    fresh serial each time (recorded at once as "held" behind a locked
+    screen) grew the file past the 8 MiB the next start will read: that
+    start refused it, and its first save replaced it. Every refusal and
+    every drift baseline on record was gone.
+    """
+
+    BUDGET = 40_000
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "ledger.json"
+        patcher = mock.patch.object(ledger_mod, "MAX_FILE_BYTES", self.BUDGET)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.refused = make_device(serial="REFUSED")
+        self.approved = make_device(serial="APPROVED")
+
+    def flood(self, led, count=400, decision="held: screen locked"):
+        for n in range(count):
+            led.record(make_device(serial=f"FLOOD{n:06d}"), decision)
+            self.assertIsNone(led.save())
+
+    def test_a_flood_of_new_serials_cannot_outgrow_the_file(self):
+        led = Ledger(self.path)
+        self.flood(led)
+        self.assertLessEqual(self.path.stat().st_size, self.BUDGET)
+        again = Ledger(self.path)
+        self.assertIsNone(again.load_error)
+        self.assertEqual(len(again.entries), len(led.entries))
+        self.assertLess(len(again.entries), 400)
+
+    def test_what_a_person_decided_outlives_the_flood(self):
+        led = Ledger(self.path)
+        led.record(self.refused, "user rejected")
+        led.record(self.approved, "user approved", approved=True)
+        self.assertIsNone(led.save())
+        self.flood(led)
+        again = Ledger(self.path)
+        self.assertIn(ledger_mod.identity_of(self.refused), again.entries)
+        self.assertIn(ledger_mod.identity_of(self.approved), again.entries)
+        ids = [f.rule_id for f in analyzers.run(
+            analyzers.Context(device=self.refused, ledger=again))]
+        self.assertIn("previously-rejected", ids)
+
+    def test_the_oldest_undecided_entries_go_first(self):
+        led = Ledger(self.path)
+        self.flood(led, count=40)
+        newest = ledger_mod.identity_of(make_device(serial="FLOOD000039"))
+        oldest = ledger_mod.identity_of(make_device(serial="FLOOD000000"))
+        for n, entry in enumerate(led.entries.values()):
+            entry.last_seen = float(n)
+        self.assertTrue(led._shed())
+        self.assertNotIn(oldest, led.entries)
+        self.assertIn(newest, led.entries)
+        self.assertEqual(len(led.entries), 30)
+
+    def test_decided_entries_go_only_when_nothing_else_is_left(self):
+        led = Ledger(self.path)
+        for n in range(8):
+            led.record(make_device(serial=f"MINE{n}"), "user approved",
+                       approved=True)
+        for n, entry in enumerate(led.entries.values()):
+            entry.last_seen = float(n)
+        self.assertTrue(led._shed())
+        self.assertEqual(len(led.entries), 6)
+        self.assertNotIn(ledger_mod.identity_of(make_device(serial="MINE0")),
+                         led.entries)
+
+    def test_an_empty_ledger_has_nothing_to_shed(self):
+        self.assertFalse(Ledger(self.path)._shed())
+
+    def test_losing_entries_is_said_once(self):
+        led = Ledger(self.path)
+        self.assertIsNone(led.take_shed_note())
+        self.flood(led)
+        note = led.take_shed_note()
+        self.assertIn("size limit", note)
+        self.assertIn("forgotten", note)
+        self.assertIsNone(led.take_shed_note(), "said twice")
+
+    def test_a_stand_in_ledger_has_no_note(self):
+        self.assertIsNone(ledger_mod.shed_note(mock.Mock()))
+        self.assertIsNone(ledger_mod.shed_note(object()))
+
+    def test_a_file_already_over_the_budget_is_cut_at_the_first_save(self):
+        with mock.patch.object(ledger_mod, "MAX_FILE_BYTES", 10 ** 9):
+            led = Ledger(self.path)
+            led.record(self.refused, "user rejected")
+            for n in range(300):
+                led.record(make_device(serial=f"OLD{n:05d}"), "no answer")
+            self.assertIsNone(led.save())
+        self.assertGreater(self.path.stat().st_size, self.BUDGET)
+        led = Ledger(self.path)
+        led.record(make_device(serial="ONE-MORE"), "no answer")
+        self.assertIsNone(led.save())
+        self.assertLessEqual(self.path.stat().st_size, self.BUDGET)
+        self.assertIn(ledger_mod.identity_of(self.refused), led.entries)
+
+    def test_the_daemon_prints_the_note(self):
+        from probolos import daemon as daemon_mod
+        led = Ledger(self.path)
+        engine = daemon_mod.Probolos(ledger=led)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            for n in range(400):
+                engine._record(daemon_mod.Decision(
+                    make_device(serial=f"FLOOD{n:06d}"), False,
+                    "held: screen locked", time.time()))
+        self.assertIn("reached its size limit", out.getvalue())
+        self.assertLess(out.getvalue().count("size limit"), 40,
+                        "said for every device instead of once per cut")
+
+
+class TheLedgerBudgetFitsTheReadLimit(unittest.TestCase):
+
+    def test_a_file_at_the_budget_can_still_grow_by_one_save_and_load(self):
+        """The file is cut after the save that took it over the budget, so
+        the budget has to leave room for that save under the read limit."""
+        from probolos import securefs
+        self.assertLessEqual(ledger_mod.MAX_FILE_BYTES * 2,
+                             securefs.MAX_STATE_BYTES)
+
+    def test_a_file_over_the_read_limit_is_still_refused_whole(self):
+        from probolos import securefs
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.json"
+            with mock.patch.object(securefs, "MAX_STATE_BYTES", 64):
+                path.write_text(json.dumps({"schema": 1, "entries": {},
+                                            "pad": "x" * 200}))
+                self.assertIn("input limit", Ledger(path).load_error)
+
+
+class ASaveErrorThatComesBackIsReportedAgain(unittest.TestCase):
+    """
+    A repeated save error is reported once, so one condition is one line.
+    The memory of it was never cleared, though: after a save had succeeded
+    again, the same error returning later stayed unreported for the rest of
+    the run, and the history silently stopped being kept.
+    """
+
+    def test_reported_once_while_it_lasts_and_again_when_it_returns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            led = Ledger(Path(tmp) / "ledger.json")
+            led.record(make_device(), "no answer")
+            full = OSError(28, "No space left on device")
+            with mock.patch.object(ledger_mod.atomicio, "write_json_atomic",
+                                   side_effect=full):
+                self.assertIn("No space left", led.save())
+                self.assertIsNone(led.save(), "the same condition, twice")
+            self.assertIsNone(led.save())               # space was freed
+            with mock.patch.object(ledger_mod.atomicio, "write_json_atomic",
+                                   side_effect=full):
+                self.assertIn("No space left", led.save(),
+                              "full again, and nobody was told")
+
+
 if __name__ == "__main__":
     unittest.main()

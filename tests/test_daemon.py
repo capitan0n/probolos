@@ -43,7 +43,7 @@ from probolos import (
 )
 from probolos import daemon as daemon_mod
 from probolos import ledger as ledger_mod
-from tests._support import ServiceStdin
+from tests._support import FakeSysfs, ServiceStdin
 
 
 def make_device(name="3-9", kinds=None):
@@ -2731,6 +2731,238 @@ class AStallTheWatchdogEndedIsAFailure(unittest.TestCase):
 
     def test_the_panic_file_ends_normally(self):
         self._serve(panicked=True)
+
+
+class RefusingADeviceThatWasPulledOutIsNotAnAlarm(unittest.TestCase):
+    """
+    Pulling a device out while its question is open, and then answering no
+    (or letting the question time out), is about the most ordinary thing a
+    person does. The write that keeps it blocked then fails, because there
+    is nothing to write to, and the daemon answered with its loudest alarm:
+    "COULD NOT DEAUTHORIZE ... may still be live. Unplug it now".
+    """
+
+    def setUp(self):
+        self.fake = FakeSysfs()
+        self.addCleanup(self.fake.destroy)
+
+    def device(self, name="1-4", authorized="1"):
+        directory = self.fake.add_device(name, authorized=authorized)
+        dev = mock.Mock(spec=sysfs.UsbDevice)
+        dev.name = name
+        dev.syspath = self.fake.bus / name
+        return dev, directory
+
+    def switch_off(self, dev):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            daemon.Probolos._switch_off(dev)
+        return out.getvalue()
+
+    def pull_out(self, dev, directory):
+        shutil.rmtree(directory)
+        dev.syspath.unlink()
+
+    def test_a_device_that_is_gone_is_said_to_be_gone(self):
+        dev, directory = self.device()
+        self.pull_out(dev, directory)
+        said = self.switch_off(dev)
+        self.assertNotIn("COULD NOT DEAUTHORIZE", said)
+        self.assertNotIn("may still be live", said)
+        self.assertIn("1-4 was removed", said)
+
+    def test_the_gates_refusal_for_a_device_that_is_gone_is_quiet_too(self):
+        """Under --privsep the same write is refused by the gate instead."""
+        dev, directory = self.device()
+        self.pull_out(dev, directory)
+        refused = gate_client.GateError(
+            "authorize failed: denied: not a peripheral USB device")
+        with mock.patch.object(sysfs, "set_authorized", side_effect=refused):
+            said = self.switch_off(dev)
+        self.assertNotIn("COULD NOT DEAUTHORIZE", said)
+
+    def test_a_device_still_there_that_will_not_switch_off_is_still_loud(self):
+        dev, directory = self.device()
+        (directory / "authorized").unlink()
+        (directory / "authorized").mkdir()      # the write cannot land
+        said = self.switch_off(dev)
+        self.assertIn("COULD NOT DEAUTHORIZE 1-4", said)
+        self.assertIn("may still be live", said)
+
+    def test_a_device_that_is_there_is_switched_off_without_a_word(self):
+        dev, directory = self.device()
+        self.assertEqual(self.switch_off(dev), "")
+        self.assertEqual((directory / "authorized").read_text(), "0")
+
+
+class APromptWithNoStdinIsNoInput(unittest.TestCase):
+    """
+    With descriptor 0 closed before Python starts, sys.stdin is None, and a
+    stdin can also be closed or gone later. The terminal prompt then raised
+    (AttributeError, ValueError, EIO) out of _on_add as an "unhandled
+    error", and no decision was recorded. It is the same "no input" as an
+    end-of-file.
+    """
+
+    def ask(self, stdin, timeout=0.0):
+        engine = daemon.Probolos(observe=0, timeout=timeout)
+        out = io.StringIO()
+        with mock.patch("sys.stdin", stdin), redirect_stdout(out):
+            approved = engine._ask(make_device())
+        return approved, engine._answered, out.getvalue()
+
+    def test_no_stdin_at_all(self):
+        for timeout in (0.0, 5.0):
+            with self.subTest(timeout=timeout):
+                approved, answered, said = self.ask(None, timeout)
+                self.assertFalse(approved)
+                self.assertFalse(answered, "recorded as a person's refusal")
+                self.assertIn("no input", said)
+
+    def test_a_stdin_that_was_closed(self):
+        closed = io.StringIO("y\n")
+        closed.close()
+        approved, answered, said = self.ask(closed)
+        self.assertFalse(approved)
+        self.assertFalse(answered)
+        self.assertIn("no input", said)
+
+    def test_a_stdin_whose_terminal_is_gone(self):
+        gone = mock.Mock()
+        gone.fileno.side_effect = OSError(errno.EIO, "Input/output error")
+        gone.readline.side_effect = OSError(errno.EIO, "Input/output error")
+        approved, answered, _said = self.ask(gone)
+        self.assertFalse(approved)
+        self.assertFalse(answered)
+
+    def test_an_answer_on_a_working_stdin_still_counts(self):
+        approved, answered, _said = self.ask(io.StringIO("y\n"))
+        self.assertTrue(approved)
+        self.assertTrue(answered)
+
+
+class _Terminal:
+    """A terminal that can be closed mid-run: from then on every write to
+    it fails with EIO, as stdout and stderr do after a hangup."""
+
+    def __init__(self):
+        self.gone = False
+        self.written = []
+
+    def write(self, text):
+        if self.gone:
+            raise OSError(errno.EIO, "Input/output error")
+        self.written.append(text)
+        return len(text)
+
+    def flush(self):
+        if self.gone:
+            raise OSError(errno.EIO, "Input/output error")
+
+
+class TheWayOutDoesNotDependOnTheTerminal(unittest.TestCase):
+    """
+    serve() with a real gate over three root hubs, and a terminal that goes
+    away while it runs. The watchdog printed before it restored, and the
+    shutdown path printed before the gate reopened: with stdout gone, both
+    raised first, and all but one of the hubs stayed closed.
+    """
+
+    HUBS = [Path(f"/sys/bus/usb/devices/usb{n}") for n in (1, 2, 3)]
+
+    def serve(self, run, *, link=None):
+        captured = {}
+
+        class Dog:
+            def __init__(self, _timeout, on_stall, _policy, **_k):
+                captured["on_stall"] = on_stall
+                self.fired, self.panicked = False, False
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        policy = safety.SafetyPolicy(panic_file=Path(tmp.name) / "panic")
+        self.terminal = _Terminal()
+        self.written = []
+        kwargs = {}
+        patches = [
+            mock.patch.object(daemon_mod, "pyudev", object()),
+            mock.patch.object(daemon_mod.sysfs, "list_root_hubs",
+                              return_value=self.HUBS),
+            mock.patch.object(daemon_mod.sysfs, "get_authorized_default",
+                              return_value=1),
+            mock.patch.object(daemon_mod.sysfs, "set_authorized_default",
+                              side_effect=lambda hub, value:
+                              self.written.append((hub.name, value))),
+            mock.patch.object(daemon_mod.safety, "Watchdog", Dog),
+            mock.patch.object(daemon_mod.Probolos, "snapshot"),
+            mock.patch.object(daemon_mod.Probolos, "run", autospec=True,
+                              side_effect=lambda engine: run(engine,
+                                                             captured)),
+            mock.patch("sys.stdout", self.terminal),
+            mock.patch("sys.stderr", self.terminal),
+        ]
+        if link is not None:
+            patches.append(mock.patch.object(daemon_mod.agentlink,
+                                             "AgentLink", return_value=link))
+            kwargs = {"agent_socket": Path(tmp.name) / "s.sock",
+                      "agent_uid": 1000}
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            daemon_mod.serve(policy=policy, watchdog_timeout=60,
+                             lock_policy=session.POLICY_IGNORE, **kwargs)
+
+    def reopened(self):
+        return [name for name, value in self.written if value == 1]
+
+    def test_the_watchdog_reopens_every_hub_when_it_cannot_say_so(self):
+        seen = {}
+
+        def run(engine, captured):
+            self.terminal.gone = True
+            captured["on_stall"]("no progress for 61.0s")
+            seen["stopped"] = engine.stop_event.is_set()
+            seen["reopened"] = self.reopened()
+            self.terminal.gone = False
+        self.serve(run)
+        self.assertEqual(seen["reopened"], [hub.name for hub in self.HUBS])
+        self.assertTrue(seen["stopped"])
+
+    def test_the_watchdog_still_says_why_when_it_can(self):
+        def run(_engine, captured):
+            captured["on_stall"]("no progress for 61.0s")
+        self.serve(run)
+        said = "".join(self.terminal.written)
+        self.assertIn("WATCHDOG: no progress for 61.0s", said)
+        self.assertLess(said.index("WATCHDOG"), said.index("usb1: restored"))
+
+    def test_a_run_ended_by_its_terminal_going_away_reopens_every_hub(self):
+        link = mock.Mock(**{"start.return_value": True,
+                            "is_live.return_value": False})
+
+        def run(_engine, _captured):
+            self.terminal.gone = True
+            # What the loop's next print raises once the terminal is gone.
+            raise OSError(errno.EIO, "Input/output error")
+        with self.assertRaises(OSError):
+            self.serve(run, link=link)
+        self.assertEqual(self.reopened(), [hub.name for hub in self.HUBS])
+        link.stop.assert_called_once_with()
+
+    def test_an_ordinary_exit_reopens_the_gate_and_says_so(self):
+        self.serve(lambda _engine, _captured: None)
+        self.assertEqual(self.reopened(), [hub.name for hub in self.HUBS])
+        said = "".join(self.terminal.written)
+        self.assertIn("[*] Reopening the gate:", said)
+        self.assertLess(said.index("Reopening the gate"),
+                        said.index("usb1: restored"))
+
 
 if __name__ == "__main__":
     unittest.main()

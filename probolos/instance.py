@@ -37,7 +37,11 @@ def acquire(path=None) -> int:
     """
     from .securefs import open_directory
     path = Path(path or LOCK_PATH)
-    directory_fd = open_directory(path.parent, create=True)
+    # 0755 if this call makes it, whatever the umask: this is the directory
+    # the --privsep analyzer passes through to read the trust store and to
+    # reach its own state/ below. Made 0700 under root's umask of 077, it
+    # shut the analyzer out of both (see securefs.open_directory).
+    directory_fd = open_directory(path.parent, create=True, mode=0o755)
     try:
         # Read-only is enough for flock, and it means an inherited descriptor
         # (the --privsep analyzer is forked from this process) cannot write.

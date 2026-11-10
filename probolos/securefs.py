@@ -5,12 +5,18 @@ import stat
 from pathlib import Path
 
 
+# The largest state file read_json_file will read. A writer that lets its
+# file grow past this has written something the next start refuses whole;
+# ledger.MAX_FILE_BYTES keeps the one file a device can make grow well inside.
+MAX_STATE_BYTES = 8 * 1024 * 1024
+
+
 def _owners(owners):
     """The uids a secure check accepts: root and this process, by default."""
     return (0, os.geteuid()) if owners is None else tuple(owners)
 
 
-def open_directory(path, create=False, secure=False, owners=None):
+def open_directory(path, create=False, secure=False, owners=None, mode=None):
     """Open a directory without following a symlink in ANY component.
 
     Keep the parent descriptor until the child is open. A rename or symlink
@@ -18,6 +24,16 @@ def open_directory(path, create=False, secure=False, owners=None):
     Callers decide which dedicated directories may be created or modified.
     With `secure`, every component must be owned by one of `owners` (root
     and this process unless given) and not writable by group or others.
+
+    `mode` is the mode of each directory THIS CALL CREATES; one that already
+    exists is left exactly as it is. Without it a new directory gets 0755
+    less the caller's umask, which is right for a user's own state directory
+    and wrong for one another account has to pass through: the root side
+    made /var/lib/probolos, and under a umask of 077 or 027 it came out as
+    0700 or 0750 -- the --privsep analyzer could then reach neither the trust
+    store nor its own state directory below it, and the desktop user could
+    not reach the agent socket in a /run/probolos made the same way. Those
+    callers say what they need. The descriptor, not the name, is changed.
     """
     allowed = _owners(owners)
     path = Path(os.path.abspath(path))
@@ -25,14 +41,18 @@ def open_directory(path, create=False, secure=False, owners=None):
     fd = os.open(path.anchor, flags)
     try:
         for part in path.parts[1:]:
+            created = False
             if create:
                 try:
                     os.mkdir(part, 0o755, dir_fd=fd)
+                    created = True
                 except FileExistsError:
                     pass
             child = os.open(part, flags, dir_fd=fd)
             os.close(fd)
             fd = child
+            if created and mode is not None:
+                os.fchmod(fd, mode)
             if secure:
                 st = os.fstat(fd)
                 sticky_root = st.st_uid == 0 and st.st_mode & stat.S_ISVTX
@@ -59,8 +79,8 @@ def read_json_file(path, trusted=False, owners=None):
             raise OSError("untrusted state file owner or permissions")
         with os.fdopen(fd, "rb") as fh:
             fd = None
-            data = fh.read(8 * 1024 * 1024 + 1)
-        if len(data) > 8 * 1024 * 1024:
+            data = fh.read(MAX_STATE_BYTES + 1)
+        if len(data) > MAX_STATE_BYTES:
             raise ValueError("state file exceeds the 8 MiB input limit")
         return json.loads(data)
     finally:

@@ -145,6 +145,25 @@ Run by hand without root, the history defaults to the XDG state directory.
 - The trust store is re-read whenever it changes, so `--remove-trusted`
   reaches a running daemon. The history is not; `--remove-all` refuses while a
   daemon runs.
+- **A history that did not load cleanly is still used.** A malformed entry
+  is dropped and reported, and a file that cannot be read at all (or a
+  directory that cannot be reached) starts an empty history: either way
+  every device gets the `ledger-unavailable` notice, and `descriptor-drift`
+  and `previously-rejected` still fire from whatever was read and from what
+  the run has recorded since.
+- **The history file is bounded.** Each entry's lists are capped, and the
+  file is kept under 4 MiB, half of the 8 MiB a start will read. A new serial
+  number is a new entry, so a device can add entries without anyone's help;
+  when the file would pass the limit, a quarter of the entries are forgotten,
+  those nobody ever answered a question about first and the longest unseen
+  among them first. An entry carrying an approval, a refusal or a trusted
+  admission goes only when no other kind is left. The daemon says so when it
+  happens.
+- **Directories the root side creates** on the way to its state and to the
+  agent socket (`/var/lib/probolos`, `/run/probolos`) are `0755` whatever
+  root's umask is: the analyzer and the desktop user have to pass through
+  them. One that already exists is never re-moded, and a user's own state
+  directory (a run without root) follows that user's umask.
 
 **Fingerprints.** The history's drift check compares a normalized SHA-256
 over the parsed descriptors: vendor and product IDs, `bcdDevice`, the device
@@ -293,7 +312,10 @@ reach the terminal, the dialogs, the JSON log, the trust store and the ledger.
   the watchdog is paused. Both are needed: a timeout alone counts the read as a
   stall, a pause alone turns a stall into a permanent freeze. The child resets
   the inherited signal handlers, and only the process that closed the gate may
-  reopen it, so a killed child cannot open the gate. Kernel operations stuck in
+  reopen it, so a killed child cannot open the gate. What is waited for is the
+  child's report, not its exit: the device is switched off again as soon as
+  the report arrives, and a child that has answered but does not exit is
+  killed without its report being lost. Kernel operations stuck in
   uninterruptible sleep cannot be bounded from Python.
 - **Why it is only context.** A device decides when its block node appears: in
   testing, a replug fell back to identity-only at a 1 s poll and was read at
@@ -345,6 +367,12 @@ reach the terminal, the dialogs, the JSON log, the trust store and the ledger.
 - **Restore paths:** the context manager, handlers for `SIGTERM`, `SIGINT` and
   `SIGHUP`, and `atexit`. Only `SIGKILL` and a kernel panic defeat them, hence
   the manual one-liner in the README.
+- **Writes first, words after.** Every root hub is written before a line is
+  logged about any of them, in the gate, in the root half and in the
+  watchdog, and a line that cannot be printed stops nothing. When the
+  terminal a run was started from is closed, stdout and stderr fail on every
+  write, and that is exactly when the restore runs; a pipe nobody reads any
+  more blocks instead of failing. Neither can keep a hub closed.
 - **Startup:** an `authorized_default` already at 0 (a crashed run) is not
   taken as the original value; 1 is restored. A device found at
   `authorized=0` is queued for a decision rather than taken as baseline.

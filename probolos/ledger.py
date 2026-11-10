@@ -201,6 +201,20 @@ MAX_KNOWN_TYPES = 32
 # digits, and from then on save() raised, and so did LedgerAnalyzer, whose
 # CRITICAL drift finding became a NOTICE that the analyzer had failed.
 MAX_TIMES_SEEN = 2 ** 53
+# The most the ledger file may be once a save has finished: half of what
+# load() will read back (securefs.MAX_STATE_BYTES).
+#
+# Every list INSIDE an entry is bounded above, but the number of entries was
+# not, and an identity is whatever the device says: a new serial number is a
+# new entry. A device that re-enumerates under a fresh serial each time -- it
+# needs nobody's hands for that, and behind a locked screen every sighting is
+# recorded at once as "held" -- added about 700 bytes per attempt, in a file
+# rewritten in full after every decision. Past 8 MiB (some 12 000 attempts)
+# the NEXT start refused to read the file at all, and its first save replaced
+# it: every drift baseline and every refusal on record was gone, which is the
+# erasure the bounds above exist to prevent, reached by the one route they
+# did not cover. Half the read limit leaves room for any single save to grow.
+MAX_FILE_BYTES = 4 * 1024 * 1024
 
 
 @dataclass
@@ -518,6 +532,17 @@ def _bounded(items: List[str], limit: int) -> List[str]:
 # The decision the previously-rejected rule looks for (analyzers.py).
 REJECTED = "user rejected"
 
+# Decisions that rest on a person's answer: an approval, a refusal, or an
+# admission on the strength of an earlier "always". A device cannot produce
+# one of these by being plugged in, which is what makes an entry carrying one
+# worth more than an entry nobody ever answered for (see Ledger._shed).
+_DECIDED_BY_A_PERSON = frozenset({"user approved", REJECTED, "trusted"})
+
+
+def _decided(entry) -> bool:
+    """True if a person's decision is on record for this entry."""
+    return any(d in _DECIDED_BY_A_PERSON for d in entry.decisions)
+
 
 def _bounded_decisions(decisions: List[str]) -> List[str]:
     """
@@ -535,6 +560,16 @@ def _bounded_decisions(decisions: List[str]) -> List[str]:
     if REJECTED in decisions and REJECTED not in tail:
         tail = [REJECTED] + tail[1:]
     return tail
+
+
+def shed_note(ledger) -> Optional[str]:
+    """
+    ledger.take_shed_note(), for a caller that may be holding a stand-in:
+    anything that is not a real note is no note.
+    """
+    take = getattr(ledger, "take_shed_note", None)
+    note = take() if callable(take) else None
+    return note if isinstance(note, str) else None
 
 
 def identity_of(dev) -> str:
@@ -563,6 +598,9 @@ class Ledger:
         self.media: Dict[str, List[str]] = {}
         self.load_error: Optional[str] = None
         self._last_save_error: Optional[str] = None
+        # Entries forgotten to keep the file inside MAX_FILE_BYTES and not
+        # yet reported (see take_shed_note).
+        self._shed_count = 0
         self.load()
 
     # ---------- persistence ----------
@@ -571,7 +609,22 @@ class Ledger:
         self.entries.clear()
         self.media.clear()
         self.load_error = None
-        if not self.path.exists():
+        try:
+            if not self.path.exists():
+                return
+        except OSError as exc:
+            # Path.exists() swallows only "not there". EACCES -- a state
+            # directory this process cannot traverse -- raised out of the
+            # constructor, before the gate had closed: the analyzer ended at
+            # startup and took the gate with it, and under the service that
+            # is a restart loop with the ports open. It happens to the
+            # --privsep analyzer when the directory was made 0700 under a
+            # restrictive umask, or was not handed over (the launcher
+            # refuses when the file there is a symlink or has two links,
+            # which any process with the previous owner's uid can arrange).
+            # TrustStore.load() already answered this way; the ledger did
+            # not. No history is an inconvenience, no gate is not.
+            self.load_error = f"cannot reach the ledger: {exc}"
             return
         try:
             from .securefs import read_json_file
@@ -664,33 +717,94 @@ class Ledger:
                     f"{'baseline' if skipped == 1 else 'baselines'} ignored")
         return None
 
+    def _payload(self) -> dict:
+        return {
+            "schema": SCHEMA_VERSION,
+            # Marker for the descriptor-fingerprint algorithm used by
+            # every entry in this file. "normalized-v1" is the current
+            # scheme: it hashes the parsed device / interface identity
+            # and drops the bus-negotiated fields (bcdUSB, bMaxPower,
+            # endpoint packet sizes, SuperSpeed companion descriptors)
+            # so a controller swap does not fire the drift alarm.
+            # A file written without this key is treated as the old
+            # raw-blob scheme -- see Entry.from_raw for the migration.
+            "fingerprint_scheme": "normalized-v1",
+            "entries": {k: asdict(v) for k, v in self.entries.items()},
+            "media": self.media,
+        }
+
+    def _shed(self) -> bool:
+        """
+        Forget a quarter of the entries so the file fits again; False when
+        there is nothing left to forget.
+
+        Entries nobody ever decided anything about go first, the longest
+        unseen first: only when there are none of those is an entry a person
+        answered for touched. That order is the point. What fills a ledger
+        is sightings that cost nothing to make (see MAX_FILE_BYTES), and
+        none of them can carry an approval or a refusal, so they are also
+        what leaves -- not the refusal that makes a returning device
+        CRITICAL, and not the baseline of a device its owner approved.
+        """
+        if not self.entries:
+            return False
+
+        def oldest_first(keys):
+            return sorted(keys, key=lambda k: self.entries[k].last_seen)
+
+        undecided = oldest_first(k for k, e in self.entries.items()
+                                 if not _decided(e))
+        count = max(1, len(self.entries) // 4)
+        victims = (undecided or oldest_first(self.entries))[:count]
+        for key in victims:
+            del self.entries[key]
+        self._shed_count += len(victims)
+        return True
+
+    def take_shed_note(self) -> Optional[str]:
+        """
+        Say, once, that entries were forgotten to keep the file within its
+        limit; None when none were. For the caller to print: a history that
+        loses entries without a word is what this file is careful never to
+        be anywhere else.
+        """
+        count, self._shed_count = self._shed_count, 0
+        if not count:
+            return None
+        return (f"the device history reached its size limit "
+                f"({MAX_FILE_BYTES // (1024 * 1024)} MiB); {count} "
+                f"{'entry was' if count == 1 else 'entries were'} forgotten, "
+                f"starting with devices nobody ever answered a question "
+                f"about. That many different devices is not ordinary use: "
+                f"something may be re-plugging itself under changing serial "
+                f"numbers")
+
     def save(self) -> Optional[str]:
         """
         Write atomically. Returns an error string, or None on success.
 
         A repeated failure is reported only once: an unwritable ledger is a
         single condition, and printing it for every device attachment would
-        bury the findings the user actually needs to read.
+        bury the findings the user actually needs to read. Once a save has
+        succeeded the condition is over, and the same error coming back
+        later is news again (it used to stay unreported for the rest of the
+        run).
+
+        The file is kept within MAX_FILE_BYTES: one written larger is cut
+        down (see _shed) and written again before this returns.
         """
         try:
-            payload = {
-                "schema": SCHEMA_VERSION,
-                # Marker for the descriptor-fingerprint algorithm used by
-                # every entry in this file. "normalized-v1" is the current
-                # scheme: it hashes the parsed device / interface identity
-                # and drops the bus-negotiated fields (bcdUSB, bMaxPower,
-                # endpoint packet sizes, SuperSpeed companion descriptors)
-                # so a controller swap does not fire the drift alarm.
-                # A file written without this key is treated as the old
-                # raw-blob scheme -- see Entry.from_raw for the migration.
-                "fingerprint_scheme": "normalized-v1",
-                "entries": {k: asdict(v) for k, v in self.entries.items()},
-                "media": self.media,
-            }
-            # Symlink-safe atomic write: the state dir is nobody-owned under
-            # --privsep, so the staging path must not be followable. See
-            # atomicio for the full rationale.
-            atomicio.write_json_atomic(self.path, payload)
+            while True:
+                # Symlink-safe atomic write: the state dir is nobody-owned
+                # under --privsep, so the staging path must not be
+                # followable. See atomicio for the full rationale.
+                written = atomicio.write_json_atomic(self.path,
+                                                     self._payload())
+                size = getattr(written, "st_size", 0)
+                if (not isinstance(size, int) or size <= MAX_FILE_BYTES
+                        or not self._shed()):
+                    break
+            self._last_save_error = None
             return None
         except (OSError, ValueError, TypeError) as exc:
             # ValueError and TypeError are json.dumps refusing a value in the

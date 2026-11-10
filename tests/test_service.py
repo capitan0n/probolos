@@ -146,6 +146,47 @@ class TheUnitCommandLine(unittest.TestCase):
         self.assertIsNone(served["agent_uid"])
 
 
+@unittest.skipUnless(shutil.which("bash"), "needs bash")
+class TheInstallerExplainsItself(unittest.TestCase):
+    """
+    `sudo ./install.sh --help` printed "sed: can't read ./install.sh" and
+    failed: the script has changed to / by then, and read itself through a
+    relative $0. Without sudo it only said "run as root". --help changes
+    nothing, so it is safe to run here, as whoever runs the suite.
+    """
+
+    def help(self, argv0, cwd):
+        return subprocess.run(["bash", argv0, "--help"], cwd=cwd,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_help_works_by_the_relative_path_people_type(self):
+        result = self.help("./install.sh", ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Run Probolos as a background service", result.stdout)
+        self.assertIn("--uninstall", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_help_works_by_an_absolute_path_from_elsewhere(self):
+        with tempfile.TemporaryDirectory() as elsewhere:
+            result = self.help(str(INSTALL), elsewhere)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--user NAME", result.stdout)
+
+    def test_root_is_asked_for_only_after_the_options_are_read(self):
+        script = INSTALL.read_text()
+        options = script.index('case "$1" in')
+        root = script.index('[ "$(id -u)" -eq 0 ]')
+        self.assertLess(options, root,
+                        "--help and a mistyped option answered 'run as root'")
+
+    def test_the_help_is_the_header_of_the_script(self):
+        """--help prints lines 2 to 16; they have to be the header."""
+        lines = INSTALL.read_text().splitlines()
+        self.assertTrue(all(line.startswith("#") for line in lines[1:16]),
+                        lines[1:16])
+        self.assertFalse(lines[16].startswith("#"), lines[16])
+
+
 @unittest.skipUnless(os.geteuid() == 0 and shutil.which("systemd-sysusers"),
                      "needs root and systemd-sysusers")
 class SysusersMakesALockedSystemAccount(unittest.TestCase):

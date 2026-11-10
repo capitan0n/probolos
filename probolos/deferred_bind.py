@@ -209,11 +209,17 @@ def emergency_restore() -> None:
             sysfs.set_drivers_autoprobe(value)
         except Exception as exc:  # noqa: BLE001 - last line of defence
             import sys
-            print(f"\n!! FAILED to restore drivers_autoprobe: {exc}\n"
-                  f"!! No USB device will bind a driver until you run, as "
-                  f"root:\n"
-                  f"!!   echo {value} > {sysfs.DRIVERS_AUTOPROBE}\n",
-                  file=sys.stderr)
+            # Said if it can be, and never raised: this runs at the top of
+            # AuthorizationGate.restore, before the hubs are written, and a
+            # stderr that is gone (a closed terminal) must not stop them.
+            try:
+                print(f"\n!! FAILED to restore drivers_autoprobe: {exc}\n"
+                      f"!! No USB device will bind a driver until you run, "
+                      f"as root:\n"
+                      f"!!   echo {value} > {sysfs.DRIVERS_AUTOPROBE}\n",
+                      file=sys.stderr)
+            except Exception:   # noqa: BLE001, S110 -- nowhere left to say it
+                pass
 
 
 atexit.register(emergency_restore)

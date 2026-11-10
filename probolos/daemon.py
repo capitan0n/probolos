@@ -60,6 +60,20 @@ class Decision:
     timestamp: float
 
 
+def _say(*args) -> None:
+    """
+    print(), for the way out: it cannot raise.
+
+    Used where a line that fails to print must not cost anything else. When
+    the terminal the daemon was started from is closed, every write to
+    stdout fails, and that is also exactly when the shutdown path runs.
+    """
+    try:
+        print(*args)
+    except Exception:   # noqa: BLE001, S110 -- nowhere left to say it
+        pass
+
+
 def _gate_keeps_trust(store) -> bool:
     """
     Whether the privileged gate would keep "always" for this process.
@@ -968,6 +982,21 @@ class Probolos:
         try:
             sysfs.set_authorized(dev.syspath, 0)
         except OSError as exc:
+            # A device that is no longer there cannot still be live, and
+            # being pulled out while its question is open is the most
+            # ordinary reason for this write to fail. It used to get the
+            # alarm below all the same -- "may still be live. Unplug it
+            # now", about a device already in the person's hand -- and an
+            # alarm that cries over an unplug is one people learn to skip.
+            # _inspect_medium already told the two apart.
+            try:
+                gone = not dev.syspath.exists()
+            except OSError:
+                gone = False            # cannot tell: say the loud thing
+            if gone:
+                print(f"  ({dev.name} was removed; there is nothing left "
+                      f"to switch off)")
+                return
             # Never swallowed. Failing to switch off a device that just
             # typed at you is the most dangerous outcome in this program.
             print(f"\n[!!] COULD NOT DEAUTHORIZE {dev.name}: {exc}")
@@ -1621,8 +1650,19 @@ class Probolos:
         sys.stdout.write(prompt)
         sys.stdout.flush()
 
+        # No stdin at all (Python leaves sys.stdin as None when descriptor 0
+        # was closed before it started), or one that is closed or gone, is
+        # "no input" like an end-of-file. It used to be an exception instead
+        # (AttributeError, ValueError, EIO): out of _on_add as an "unhandled
+        # error", with no decision recorded for the device.
+        no_stdin = (AttributeError, TypeError, ValueError, OSError)
+
         if self.timeout > 0:
-            ready, _, _ = select.select([sys.stdin], [], [], self.timeout)
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], self.timeout)
+            except no_stdin:
+                print("\n  (no input — denied)")
+                return False
             if not ready:
                 print("\n  (timed out — denied)")
                 return False
@@ -1631,6 +1671,9 @@ class Probolos:
             answer = sys.stdin.readline()
         except (KeyboardInterrupt, EOFError):
             print("\n  (interrupted — denied)")
+            return False
+        except no_stdin:
+            print("\n  (no input — denied)")
             return False
 
         if not answer:  # EOF
@@ -1712,6 +1755,9 @@ class Probolos:
             error = self.ledger.save()
             if error:
                 print(f"[!] could not write ledger: {error}")
+            note = ledger_mod.shed_note(self.ledger)
+            if note:
+                print(f"[!] {note}.")
 
         # Audit trail first, pretty output second.
         if not self.json_log:
@@ -1898,9 +1944,15 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
         stop_event = threading.Event()
         if watchdog_timeout > 0 and not dry_run:
             def on_stall(reason: str) -> None:
-                print(f"\n[!!] WATCHDOG: {reason} — reopening the gate now")
-                opened.restore()
+                # The flag and the hubs before a word is said. The line used
+                # to be printed first, and this is the last resort for a
+                # daemon that is stuck: with its output stuck too (a pipe
+                # nobody reads) or gone, the print never returned or raised,
+                # and the gate the watchdog exists to reopen stayed closed.
+                # restore() says the line itself, after the writes.
                 stop_event.set()
+                opened.restore(announce=f"\n[!!] WATCHDOG: {reason} — "
+                                        f"reopening the gate now")
             dog = safety.Watchdog(watchdog_timeout, on_stall, policy)
             dog.start()
             print(f"  - watchdog armed ({watchdog_timeout:.0f}s), "
@@ -1925,18 +1977,29 @@ def serve(dry_run: bool = False, timeout: float = 0.0,
                   f"are NOT gated")
         elif watch_media:
             print("  - media watch: off in --dry-run")
-        engine.snapshot()
         try:
+            # Inside the try with the loop: a snapshot that raised left the
+            # watchdog running and the agent socket in place on the way out.
+            engine.snapshot()
             engine.run()
         except KeyboardInterrupt:
-            print("\n[*] Interrupted.")
+            _say("\n[*] Interrupted.")
         finally:
             if dog:
                 dog.stop()
-            engine.report_blocked_on_exit()
+            # The gate first, and nothing below can stop the rest. The
+            # report of what stays blocked used to be printed before the
+            # gate reopened: when the run ended because its output had gone
+            # (a closed terminal), that print raised, the agent socket was
+            # left behind, and reopening was left to the last line of
+            # defence. restore() writes every hub, then says so.
+            opened.restore(announce="[*] Reopening the gate:")
             if link:
                 link.stop()
-            print("[*] Reopening the gate:")
+            try:
+                engine.report_blocked_on_exit()
+            except Exception:   # noqa: BLE001, S110 -- a report, not the gate
+                pass
 
     # A stall the watchdog ended is a failure, and the exit status says so.
     # It used to be 0, so systemd's Restart=on-failure never started the gate

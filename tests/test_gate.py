@@ -7,7 +7,11 @@ Covers probolos.gate and probolos.safety.
 
 from __future__ import annotations
 
+import errno
+import io
 import os
+import signal
+import sys
 import tempfile
 import threading
 import time
@@ -507,6 +511,237 @@ class GateLifecycle(unittest.TestCase):
             obj.restore()
             self.assertEqual(write.call_count, 2)
             self.assertFalse(obj._armed)
+
+
+class _GoneTerminal:
+    """stdout or stderr after the terminal was closed: every write is EIO."""
+
+    def write(self, _text):
+        raise OSError(errno.EIO, "Input/output error")
+
+    def flush(self):
+        raise OSError(errno.EIO, "Input/output error")
+
+
+def _dead_log(*_args):
+    raise OSError(errno.EIO, "Input/output error")
+
+
+class RestoringDoesNotDependOnBeingAbleToSaySo(unittest.TestCase):
+    """
+    Each hub was written and then logged inside one `try`, and the signal
+    handler logged before it restored. With the terminal closed -- the
+    SIGHUP case the handler is there for -- every line raised EIO: the
+    handler never reached restore(), the first hub's "restored" line was
+    taken for a failed write, and its error message on stderr raised out of
+    the loop. Every root hub but the first stayed at authorized_default=0
+    after the process had gone.
+    """
+
+    HUBS = [Path(f"/sys/bus/usb/devices/usb{n}") for n in range(1, 6)]
+
+    def armed(self, log=_dead_log):
+        obj = gate.AuthorizationGate(log=log)
+        obj._armed = True
+        obj._original = {hub: 1 for hub in self.HUBS}
+        return obj
+
+    def run_with_dead_output(self, action):
+        """Run `action` with stdout and stderr gone; return the hubs written."""
+        written = []
+        with mock.patch.object(sysfs, "set_authorized_default",
+                               side_effect=lambda hub, v: written.append(
+                                   (hub.name, v))), \
+                mock.patch("sys.stdout", _GoneTerminal()), \
+                mock.patch("sys.stderr", _GoneTerminal()):
+            action()
+        return written
+
+    def test_every_hub_is_written_when_no_line_can_be_printed(self):
+        obj = self.armed()
+        written = self.run_with_dead_output(obj.restore)
+        self.assertEqual(written, [(hub.name, 1) for hub in self.HUBS])
+        self.assertFalse(obj._armed)
+        self.assertEqual(obj._original, {})
+
+    def test_the_default_log_is_print_and_a_gone_stdout_stops_nothing(self):
+        obj = self.armed(log=print)
+        written = self.run_with_dead_output(obj.restore)
+        self.assertEqual(len(written), len(self.HUBS))
+
+    def test_the_hangup_handler_restores_before_it_speaks(self):
+        obj = self.armed()
+
+        def hangup():
+            with self.assertRaises(SystemExit) as ended:
+                obj._on_signal(signal.SIGHUP, None)
+            self.assertEqual(ended.exception.code, 0)
+        written = self.run_with_dead_output(hangup)
+        self.assertEqual(len(written), len(self.HUBS),
+                         "the handler's own log line stopped the restore")
+
+    def test_a_failed_write_cannot_be_reported_and_the_next_hub_is_still_tried(self):
+        obj = self.armed()
+        attempted = []
+
+        def write(hub, value):
+            attempted.append(hub.name)
+            if hub.name == "usb2":
+                raise OSError(errno.ENODEV, "No such device")
+        with mock.patch.object(sysfs, "set_authorized_default",
+                               side_effect=write), \
+                mock.patch("sys.stdout", _GoneTerminal()), \
+                mock.patch("sys.stderr", _GoneTerminal()):
+            obj.restore()
+        self.assertEqual(attempted, [hub.name for hub in self.HUBS])
+        self.assertEqual(list(obj._original), [self.HUBS[1]],
+                         "only the hub whose write failed is still owed")
+        self.assertTrue(obj._armed)
+
+    def test_nothing_is_said_until_every_hub_is_written(self):
+        """A line that never returns (a pipe nobody reads) must find the
+        work already done, so the words come after the last write."""
+        events = []
+        obj = self.armed(log=lambda line: events.append(("said", line)))
+        with mock.patch.object(sysfs, "set_authorized_default",
+                               side_effect=lambda hub, v: events.append(
+                                   ("wrote", hub.name))):
+            obj.restore(announce="[signal SIGTERM] shutting down")
+        kinds = [kind for kind, _ in events]
+        self.assertEqual(kinds, ["wrote"] * len(self.HUBS)
+                         + ["said"] * (len(self.HUBS) + 1))
+        self.assertEqual(events[len(self.HUBS)],
+                         ("said", "[signal SIGTERM] shutting down"))
+
+    def test_a_working_log_still_gets_every_line(self):
+        said = []
+        obj = self.armed(log=said.append)
+        with mock.patch.object(sysfs, "set_authorized_default"):
+            obj.restore()
+        self.assertEqual(said, [f"  - {hub.name}: restored "
+                                f"authorized_default=1" for hub in self.HUBS])
+
+    def test_a_failed_write_is_still_reported_when_it_can_be(self):
+        obj = self.armed(log=lambda *_: None)
+        err = io.StringIO()
+        with mock.patch.object(sysfs, "set_authorized_default",
+                               side_effect=OSError("busy")), \
+                mock.patch("sys.stderr", err):
+            obj.restore()
+        self.assertIn("FAILED to restore usb1", err.getvalue())
+        self.assertIn("echo 1 > /sys/bus/usb/devices/usb1/authorized_default",
+                      err.getvalue())
+
+
+class ClosingTheTerminalReopensEveryHub(unittest.TestCase):
+    """
+    The same defect end to end, on a real pseudo-terminal: a gate closed in
+    a child whose terminal is then closed, as when the window `sudo python
+    -m probolos` runs in is closed or its SSH session drops.
+    """
+
+    def test_all_root_hubs_are_reopened_after_a_hangup(self):
+        import pty
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        devices = Path(tmp.name) / "devices"
+        devices.mkdir()
+        hubs = [devices / f"usb{n}" for n in range(1, 6)]
+        for hub in hubs:
+            hub.mkdir()
+            (hub / "authorized_default").write_text("1\n")
+        repo = Path(__file__).resolve().parent.parent
+        code = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(repo)!r})\n"
+            "from pathlib import Path\n"
+            "from probolos import gate, sysfs\n"
+            f"sysfs.USB_DEVICES = Path({str(devices)!r})\n"
+            "with gate.AuthorizationGate():\n"
+            "    print('[*] Listening.', flush=True)\n"
+            "    while True:\n"
+            "        time.sleep(0.05)\n")
+
+        def state():
+            return [(hub / "authorized_default").read_text().strip()
+                    for hub in hubs]
+
+        try:
+            pid, master = pty.fork()
+        except OSError as exc:
+            self.skipTest(f"no pseudo-terminal here: {exc}")
+        if pid == 0:
+            try:
+                # A fresh interpreter on the pseudo-terminal: an argument
+                # vector, no shell, and nothing of the test runner's state.
+                os.execv(sys.executable,                    # noqa: S606
+                         [sys.executable, "-B", "-c", code])
+            finally:
+                os._exit(127)
+        try:
+            seen = b""
+            deadline = time.monotonic() + 30
+            while b"Listening" not in seen and time.monotonic() < deadline:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+            self.assertIn(b"Listening", seen, "the child never closed the gate")
+            self.assertEqual(state(), ["0"] * len(hubs))
+        finally:
+            os.close(master)                # the terminal goes away
+        deadline = time.monotonic() + 30
+        ended = False
+        while time.monotonic() < deadline:
+            done, _status = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                ended = True
+                break
+            time.sleep(0.02)
+        if not ended:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            self.fail("the gate did not exit after its terminal was closed")
+        self.assertEqual(state(), ["1"] * len(hubs),
+                         "root hubs were left closed after the terminal "
+                         "the gate ran in went away")
+
+
+class TheWatchdogOutlivesALogThatIsGone(unittest.TestCase):
+    """
+    The watchdog thread is also what checks for the panic file, and it logs
+    when it refuses an invalid one. A log that raised (stdout gone) ended the
+    thread: no stall was noticed after that and the panic file did nothing.
+    """
+
+    def test_a_pass_that_raises_is_not_the_last_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o700)
+            panic = Path(tmp) / "probolos.panic"
+            panic.symlink_to("/etc/hostname")       # invalid: logged, refused
+            policy = safety.SafetyPolicy(panic_file=panic,
+                                         panic_file_uid=os.getuid())
+            fired = threading.Event()
+            reasons = []
+
+            def on_stall(reason):
+                reasons.append(reason)
+                fired.set()
+            dog = safety.Watchdog(1000.0, on_stall, policy, interval=0.01,
+                                  log=_dead_log)
+            dog.start()
+            try:
+                time.sleep(0.1)             # several passes, each one raising
+                panic.unlink()
+                panic.touch()               # the operator's real panic file
+                self.assertTrue(fired.wait(10),
+                                "the watchdog thread died on its log line")
+            finally:
+                dog.stop()
+        self.assertIn("panic file", reasons[0])
 
 
 if __name__ == "__main__":
