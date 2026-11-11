@@ -1,0 +1,100 @@
+% =====================================================================
+\chapter{Εγκατάσταση και Χρήση}
+\label{app:install}
+% =====================================================================
+
+\section{Απαιτήσεις}
+
+\begin{itemize}
+  \item \en{Linux} με εξουσιοδότηση \en{USB} στο \en{sysfs}
+        (\code{/sys/bus/usb/devices/*/authorized}).
+  \item \en{Python} 3.10+ και \en{pyudev}.
+  \item Προαιρετικά: \en{PyYAML} για \code{--rules FILE}· \en{kdialog},
+        \en{zenity} ή \en{tkinter} για γραφικούς διαλόγους.
+\end{itemize}
+
+\section{Γρήγορη εκκίνηση (\en{Manjaro} / \en{Arch Linux})}
+
+\begin{lstlisting}[language=shell,caption={Εκτέλεση από τον πηγαίο κώδικα.}]
+git clone https://github.com/capitan0n/probolos
+cd probolos
+sudo pacman -S python-pyudev
+sudo python3 -m probolos            # Ctrl-C stops it and reopens the gate
+\end{lstlisting}
+
+\begin{warnbox}[Διατηρήστε έναν τρόπο επιστροφής]
+Κατά τις δοκιμές, κρατήστε ανοιχτή μια συνεδρία \en{SSH} ή χρησιμοποιήστε το
+ενσωματωμένο πληκτρολόγιο του φορητού (συχνά \en{PS/2}, το οποίο το \Probolos{}
+δεν αγγίζει).
+\end{warnbox}
+
+\section{Διαχωρισμός προνομίων και διάλογοι επιφάνειας εργασίας}
+
+\begin{lstlisting}[language=shell,caption={Εκτέλεση με \code{--privsep} και πράκτορα.}]
+sudo python3 -m probolos --privsep --agent --agent-user "$USER"
+python3 -m probolos.agent           # in your desktop session
+\end{lstlisting}
+
+\section{Εγκατάσταση ως υπηρεσία}
+
+\begin{lstlisting}[language=shell,caption={Εγκατάσταση και απεγκατάσταση υπηρεσίας \en{systemd}.}]
+sudo ./install.sh              # install and start
+sudo ./install.sh --uninstall  # remove (device history is kept)
+sudo probolos --history -v     # every device seen
+sudo probolos --trusted        # remembered devices
+\end{lstlisting}
+
+\section{Αποτροπή αυτόματης προσάρτησης}
+
+\begin{lstlisting}[language=shell,caption={Κανόνας \en{udev} για το στάδιο 4 και το \code{--watch-media}.}]
+sudo tee /etc/udev/rules.d/60-probolos-inhibit-automount.rules <<'EOF'
+SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{UDISKS_IGNORE}="1"
+EOF
+sudo udevadm control --reload
+\end{lstlisting}
+
+\section{Βασικές επιλογές γραμμής εντολών}
+
+\begin{longtable}{@{}p{5.2cm}p{8.6cm}@{}}
+\toprule
+\textbf{Επιλογή} & \textbf{Λειτουργία}\\
+\midrule
+\endhead
+\code{--observe SEC} & διάρκεια καραντίνας (προεπ. 3· \code{0} παραλείπει το στάδιο 3)\\
+\code{--no-storage-scan} & παράλειψη του σταδίου 4\\
+\code{--privsep}, \code{--privsep-user U} & διαχωρισμός προνομίων και λογαριασμός αναλυτή\\
+\code{--agent} & ερωτήσεις μέσω γραφικών διαλόγων\\
+\code{--timeout SEC} & άρνηση μετά από SEC δευτερόλεπτα χωρίς απάντηση\\
+\code{--lock-policy queue|deny|ignore} & συμπεριφορά με κλειδωμένη οθόνη\\
+\code{--watch-media} & παρακολούθηση καρτών σε εγκεκριμένους αναγνώστες\\
+\code{--media-policy log|deauthorize} & ενέργεια για κρίσιμη κάρτα\\
+\code{--allow-port PORT} & θύρα διάσωσης, ποτέ υπό έλεγχο\\
+\code{--dry-run} & μόνο αναφορά· δεν φράζει και δεν εγκρίνει τίποτα\\
+\code{--history [-v]} & ιστορικό συσκευών\\
+\code{--remove-trusted N|PATTERN|all} & διαγραφή εμπιστευμένων συσκευών\\
+\code{--capture-payload} & καταγραφή του τι πληκτρολόγησε συσκευή σε καραντίνα\\
+\code{--log FILE} & καταγραφή κάθε απόφασης σε \en{JSON lines}\\
+\code{--rules FILE} & αρχείο \en{YAML} για απενεργοποίηση/αναβαθμολόγηση κανόνων\\
+\code{--release} & ανάκτηση: ενεργοποίηση φραγμένων συσκευών και άνοιγμα πύλης\\
+\bottomrule
+\end{longtable}
+
+\section{Ανάκτηση}
+
+\begin{lstlisting}[language=shell,caption={Διαδικασίες ανάκτησης σε περίπτωση προβλήματος.}]
+sudo probolos --release                  # after install.sh
+sudo touch /run/probolos.panic           # force the gate open (watchdog)
+# Last resort, without Probolos:
+for hub in /sys/bus/usb/devices/usb*/authorized_default; do
+    echo 1 | sudo tee "$hub"
+done
+\end{lstlisting}
+
+\section{Εκτέλεση των ελέγχων}
+
+\begin{lstlisting}[language=shell,caption={Σουίτα ελέγχων και στατική ανάλυση.}]
+python3 -m unittest discover -b -s tests -t .
+HYPOTHESIS_PROFILE=deep python3 -m unittest tests.test_properties
+ruff check .
+python3 -m mypy
+\end{lstlisting}

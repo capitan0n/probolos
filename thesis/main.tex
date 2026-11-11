@@ -1,0 +1,79 @@
+% =====================================================================
+%  Μεταπτυχιακή Διπλωματική Εργασία
+%  «Probolos: Πύλη Αποδοχής Συσκευών USB με Προεπιλεγμένη Άρνηση
+%   για το Λειτουργικό Σύστημα Linux»
+%
+%  Μεταγλώττιση (XeLaTeX + Biber):
+%      latexmk -xelatex main.tex
+%  ή χειροκίνητα:
+%      xelatex main && biber main && xelatex main && xelatex main
+% =====================================================================
+\documentclass[12pt,a4paper,oneside,openany]{book}
+
+\input{preamble}
+
+% ---------------------------------------------------------------------
+%  Στοιχεία εργασίας — ΣΥΜΠΛΗΡΩΣΤΕ ΤΑ ΔΙΚΑ ΣΑΣ
+% ---------------------------------------------------------------------
+\newcommand{\University}{[Όνομα Πανεπιστημίου]}
+\newcommand{\School}{Πολυτεχνική Σχολή}
+\newcommand{\Department}{Τμήμα Ηλεκτρολόγων Μηχανικών και Μηχανικών Υπολογιστών}
+\newcommand{\Division}{Τομέας Πληροφορικής}
+\newcommand{\Programme}{Πρόγραμμα Μεταπτυχιακών Σπουδών\\«[Τίτλος ΠΜΣ, π.χ. Ασφάλεια Πληροφοριακών Συστημάτων]»}
+\newcommand{\ThesisTitle}{Probolos: Πύλη Αποδοχής Συσκευών USB\\με Προεπιλεγμένη Άρνηση για το Linux}
+\newcommand{\ThesisTitleEN}{Probolos: A Deny-by-Default USB Admission Gate for Linux}
+\newcommand{\Author}{[Ονοματεπώνυμο Φοιτητή/τριας]}
+\newcommand{\AuthorEN}{[Student Name]}
+\newcommand{\StudentID}{[Α.Μ.]}
+\newcommand{\Supervisor}{[Ονοματεπώνυμο], [Βαθμίδα, π.χ. Καθηγητής]}
+\newcommand{\MemberA}{[Ονοματεπώνυμο], [Βαθμίδα]}
+\newcommand{\MemberB}{[Ονοματεπώνυμο], [Βαθμίδα]}
+\newcommand{\City}{[Πόλη]}
+\newcommand{\ThesisDate}{[Μήνας] 2026}
+
+\begin{document}
+
+% ------------------------- Προκαταρκτικό μέρος ------------------------
+\frontmatter
+\input{frontmatter/cover}
+\input{frontmatter/titlepage}
+\input{frontmatter/declaration}
+\input{frontmatter/dedication}
+\input{frontmatter/acknowledgements}
+\input{frontmatter/abstract_el}
+\input{frontmatter/abstract_en}
+
+\tableofcontents
+\cleardoublepage\phantomsection\addcontentsline{toc}{chapter}{\listfigurename}
+\listoffigures
+\cleardoublepage\phantomsection\addcontentsline{toc}{chapter}{\listtablename}
+\listoftables
+\cleardoublepage\phantomsection\addcontentsline{toc}{chapter}{\lstlistlistingname}
+\lstlistoflistings
+\input{frontmatter/acronyms}
+
+% ------------------------------ Κύριο μέρος ---------------------------
+\mainmatter
+\input{chapters/01_introduction}
+\input{chapters/02_background}
+\input{chapters/03_related_work}
+\input{chapters/04_design}
+\input{chapters/05_implementation}
+\input{chapters/06_evaluation}
+\input{chapters/07_discussion}
+\input{chapters/08_conclusions}
+
+% ----------------------------- Παραρτήματα ----------------------------
+\appendix
+\input{appendices/A_installation}
+\input{appendices/B_rules}
+\input{appendices/C_examples}
+
+% ----------------------------- Βιβλιογραφία ---------------------------
+\backmatter
+\cleardoublepage
+\phantomsection
+\addcontentsline{toc}{chapter}{Βιβλιογραφία}
+\printbibliography[title={Βιβλιογραφία}]
+
+\end{document}

@@ -1,0 +1,369 @@
+% =====================================================================
+\chapter{Υλοποίηση}
+\label{ch:implementation}
+% =====================================================================
+
+\section{Τεχνολογικές επιλογές}
+\label{sec:impl-tech}
+
+Το \Probolos{} υλοποιήθηκε σε \en{Python}~3.10+ για τρεις λόγους. Πρώτον, η
+\en{Python} είναι γλώσσα με ασφάλεια μνήμης: η ανάλυση μη έμπιστων δυαδικών
+δεδομένων (περιγραφείς, τομείς δίσκου) δεν μπορεί να οδηγήσει σε υπερχείλιση
+ενδιαμέσου. Δεύτερον, η βιβλιοθήκη προτύπων καλύπτει όλες τις απαιτούμενες
+κλήσεις συστήματος (\code{socket.sendmsg} με \code{SCM\_RIGHTS},
+\code{fcntl.ioctl}, \code{os.setgroups}, \code{prctl} μέσω \code{ctypes}).
+Τρίτον, η μόνη εξωτερική εξάρτηση είναι το \en{pyudev} (απαίτηση~\ref{req:portable}),
+ενώ το \en{PyYAML} είναι προαιρετικό για αρχεία κανόνων.
+
+\section{Οργάνωση του κώδικα}
+\label{sec:impl-modules}
+
+Ο κώδικας παραγωγής αποτελείται από 35 αρχεία-μονάδες (\en{modules}) και περίπου 17\,700
+γραμμές. Ο Πίνακας~\ref{tab:modules} συνοψίζει τις κυριότερες, ομαδοποιημένες
+ανά ρόλο.
+
+\begin{longtable}{@{}p{3.6cm}rp{8.6cm}@{}}
+\caption{Οι κύριες μονάδες του \Probolos{} (γραμμές κώδικα στην έκδοση 1.0.0b2).}
+\label{tab:modules}\\
+\toprule
+\textbf{Μονάδα} & \textbf{Γραμμές} & \textbf{Ευθύνη}\\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Μονάδα} & \textbf{Γραμμές} & \textbf{Ευθύνη}\\
+\midrule
+\endhead
+\multicolumn{3}{@{}l}{\emph{Έμπιστη βάση (\en{root})}}\\
+\code{gate.py}          &  266 & κύκλος ζωής της καθολικής πύλης, επαναφορά\\
+\code{gate\_server.py}  & 1409 & η προνομιούχος πύλη υπό \code{--privsep}\\
+\code{protocol.py}      &  185 & το συμβόλαιο μηνυμάτων πύλης--αναλυτή\\
+\code{privsep.py}       &  652 & \code{fork}, απόρριψη προνομίων, \en{subreaper}\\
+\code{securefs.py}      &  160 & ασφαλείς λειτουργίες αρχείων (\code{O\_NOFOLLOW})\\
+\code{safety.py}        &  384 & \en{watchdog}, αρχείο πανικού, εξαιρέσεις θυρών\\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Ανάλυση (αναλυτής)}}\\
+\code{daemon.py}        & 2011 & ο κεντρικός βρόχος γεγονότων και η ροή αποφάσεων\\
+\code{sysfs.py}         &  869 & ανάγνωση του \en{sysfs}, καρφιτσωμένοι κατάλογοι\\
+\code{descriptors.py}   &  334 & ανάλυση περιγραφέων \en{USB}\\
+\code{descriptors\_\-safe.py} & 358 & αμυντικός περιηγητής αλυσίδας περιγραφέων\\
+\code{usbclass.py}      &  288 & ταξινόμηση κλάσεων και λειτουργιών\\
+\code{rules.py}         & 1057 & όλοι οι κανόνες και η διαμόρφωσή τους (\en{YAML})\\
+\code{analyzers.py}     &  355 & ενορχήστρωση των σταδίων ανάλυσης\\
+\code{quarantine.py}    &  369 & στάδιο 3: \code{EVIOCGRAB}, καταγραφή γεγονότων\\
+\code{storage.py}       &  956 & στάδιο 4: \en{MBR}/\en{GPT}, συστήματα αρχείων\\
+\code{mediawatch.py}    &  683 & παρακολούθηση καρτών μνήμης\\
+\code{textsafe.py}      &  347 & καθαρισμός εχθρικού κειμένου\\
+\code{ledger.py}        &  956 & βιβλίο ιστορικού, αποτυπώματα, μετάλλαξη\\
+\code{trust.py}         &  588 & χώρος εμπιστοσύνης\\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Διεπαφή χρήστη}}\\
+\code{\_\_main\_\_.py}  &  830 & γραμμή εντολών\\
+\code{agentlink.py}     &  885 & υποδοχή (\en{socket}) πράκτορα, έλεγχος \code{SO\_PEERCRED}\\
+\code{agent.py}         &  771 & πράκτορας επιφάνειας εργασίας\\
+\code{dialogs.py}       &  531 & \en{kdialog}, \en{zenity}, \en{tkinter}\\
+\code{report.py}        &  273 & μορφοποίηση αναφοράς\\
+\bottomrule
+\end{longtable}
+
+\section{Ο κύκλος ζωής της πύλης}
+\label{sec:impl-gate}
+
+Η κλάση \code{AuthorizationGate} υλοποιεί την πύλη ως διαχειριστή περιβάλλοντος
+(\en{context manager}). Το Απόσπασμα~\ref{lst:gate-enter} δείχνει τον πυρήνα της
+μεθόδου \code{\_\_enter\_\_}: πρώτα εγκαθίστανται οι χειριστές σημάτων και το
+\code{atexit} — \emph{πριν} κλείσει οποιοσδήποτε διανομέας — ώστε να μην
+υπάρχει στιγμή όπου η πύλη είναι κλειστή χωρίς διαδρομή επαναφοράς.
+
+\begin{lstlisting}[language=Python,caption={Απλοποιημένη μορφή της μεθόδου εισόδου της πύλης (\code{gate.py}).},label=lst:gate-enter]
+def __enter__(self) -> "AuthorizationGate":
+    hubs = sysfs.list_root_hubs()
+    if not hubs:
+        raise RuntimeError("no USB root hubs found")
+    self._armed = True
+    self._owner_pid = os.getpid()     # only this process may reopen
+    self._install_handlers()          # SIGTERM, SIGINT, SIGHUP
+    atexit.register(self.restore)     # restore paths exist BEFORE closing
+    for hub in hubs:
+        current = sysfs.get_authorized_default(hub)
+        if current is None:
+            continue
+        # A hub already at 0 is residue of a crashed run, not a choice:
+        # restore 1, never 0, or the lockout becomes permanent.
+        self._original[hub] = 1 if current == 0 else current
+        sysfs.set_authorized_default(hub, 0)
+    return self
+\end{lstlisting}
+
+Μια λεπτή περίπτωση αφορά τη διεργασία-παιδί του σταδίου~4. Η ανάγνωση του δίσκου
+γίνεται σε διεργασία που δημιουργείται με \code{fork()}, η οποία κληρονομεί το
+οπλισμένο αντικείμενο πύλης \emph{και} τους χειριστές σημάτων. Σε μια πρώιμη
+έκδοση, όταν ο γονέας τερμάτιζε ένα «κολλημένο» παιδί με \code{SIGTERM}, ο
+χειριστής του παιδιού έγραφε \code{authorized\_default=1} σε όλους τους
+διανομείς, ενώ ο γονέας πίστευε ότι η πύλη ήταν κλειστή — ένα σφάλμα
+\emph{αποτυχίας-ανοιχτά} (\en{fail-open}) το οποίο μια εχθρική συσκευή θα
+μπορούσε να χρονομετρήσει. Η διόρθωση είναι το πεδίο \code{\_owner\_pid}: μόνο η
+διεργασία που έκλεισε την πύλη μπορεί να την ανοίξει (βλ.~§\ref{sec:eval-qa}).
+
+\section{Ανάλυση περιγραφέων}
+\label{sec:impl-descriptors}
+
+Το αρχείο \code{descriptors} του \en{sysfs} περιέχει τον περιγραφέα συσκευής
+ακολουθούμενο από τις πλήρεις αλυσίδες διαμορφώσεων. Ο αναλυτής
+(\code{descriptors\_safe.py}) διασχίζει την αλυσίδα αμυντικά: κάθε περιγραφέας
+αρχίζει με \code{bLength} και \code{bDescriptorType}· μηδενικό ή υπερβολικό
+μήκος, αλυσίδα συντομότερη από το \code{wTotalLength}, ή λιγότερες διαμορφώσεις
+από όσες δηλώνει το \code{bNumConfigurations}, δεν προκαλούν εξαίρεση αλλά
+\emph{ευρήματα} (\code{descriptor-chain-truncated}, \code{configurations-missing},
+\code{descriptor-length-overstated}).
+
+\section{Η μηχανή κανόνων}
+\label{sec:impl-rules}
+
+Κάθε κανόνας είναι ένα τμήμα κώδικα που, δεδομένου του περιβάλλοντος
+(\code{Context}) της συσκευής, προσθέτει ένα εύρημα (\code{Finding}) με
+αναγνωριστικό, σοβαρότητα, τίτλο και επεξήγηση. Η σοβαρότητα περνά από τη
+διαμόρφωση του χρήστη (\code{cfg.severity}), ώστε ένα αρχείο \en{YAML}
+(\code{--rules}) να μπορεί να απενεργοποιήσει ή να αναβαθμίσει/υποβαθμίσει κανόνες
+των σταδίων 2–4. Οι κανόνες ιστορικού και ο \code{payload-captured} δεν
+τροποποιούνται.
+
+\begin{lstlisting}[language=Python,caption={Ο κανόνας της «υπογραφής \en{BadUSB}» (\code{probolos/rules.py}).},label=lst:rule-badusb]
+# -- 1. The BadUSB signature ------------------------------------------
+if has_keyboard and CLS_MASS_STORAGE in classes:
+    add("storage-with-keyboard", Severity.CRITICAL,
+        "Storage device that can also type",
+        "This device presents itself as both a disk and a keyboard. The "
+        "storage half provides the alibi while the keyboard half can enter "
+        "commands on your behalf. Legitimate flash drives never need a "
+        "keyboard interface. This is the classic BadUSB layout.")
+
+# -- 2. Keystroke injection plus a network path ------------------------
+if has_keyboard and (classes & {CLS_CDC, CLS_CDC_DATA, CLS_WIRELESS}):
+    add("network-with-keyboard", Severity.CRITICAL, ...)
+\end{lstlisting}
+
+Το Απόσπασμα~\ref{lst:rule-timing} δείχνει την υλοποίηση του κριτηρίου
+\eqref{eq:machine} του σταδίου~3.
+
+\begin{lstlisting}[language=Python,caption={Διάκριση μηχανικής πληκτρολόγησης (\code{probolos/rules.py}).},label=lst:rule-timing]
+_ACCIDENT_THRESHOLD = 5      # a lean on the keyboard, not a payload
+_MACHINE_INTERVAL = 0.050    # 50 ms between keys: faster than sustained human
+_MACHINE_REGULARITY = 0.20   # coefficient of variation below this is inhuman
+
+intervals = obs.intervals()          # kernel timestamps, not Python's
+mean_gap = _mean(intervals)
+cv = _coefficient_of_variation(intervals)
+machine_like = (
+    len(keys) >= 3
+    and mean_gap is not None and mean_gap < _MACHINE_INTERVAL
+    and cv is not None and cv < _MACHINE_REGULARITY
+)
+if machine_like:
+    add("machine-generated-keystrokes", Severity.CRITICAL, ...)
+elif len(keys) >= _ACCIDENT_THRESHOLD:
+    add("unprompted-typing", Severity.CRITICAL, ...)
+else:
+    add("unexpected-keystrokes", Severity.WARNING, ...)
+\end{lstlisting}
+
+\section{Η καραντίνα (στάδιο 3)}
+\label{sec:impl-quarantine}
+
+Η καραντίνα ζητά από την πύλη την ενεργοποίηση της συσκευής \emph{ανά
+στιγμιότυπο}, και στη συνέχεια αναζητά τους κόμβους εισόδου της καθώς
+εμφανίζονται, δεσμεύοντάς τους αμέσως με \code{EVIOCGRAB}. Νέοι κόμβοι
+αναζητούνται καθ' όλη τη διάρκεια του παραθύρου. Μια αποτυχημένη δέσμευση
+τερματίζει την παρατήρηση. Οι ενδιάμεσες μνήμες γεγονότων είναι φραγμένες, ώστε
+μια συσκευή που «πλημμυρίζει» με γεγονότα να μην εξαντλεί τη μνήμη.
+
+Χωρίς τη σημαία \code{--capture-payload}, ένα πάτημα πλήκτρου καταγράφεται
+\emph{μόνο ως χρονοσφραγίδα}, όχι ως ταυτότητα πλήκτρου. Με τη σημαία, οι
+πληκτρολογήσεις ανακατασκευάζονται σε απομαγνητοφώνηση τύπου
+\en{DuckyScript} (διάταξη \en{US QWERTY}, έως περίπου 4096 χαρακτήρες), χρήσιμη
+για ψηφιακή εγκληματολογία. Οι έλεγχοι εγγυώνται ότι (α) συσκευές που υπήρχαν
+πριν από την εκκίνηση δεν επιθεωρούνται ποτέ και (β) μια εγκεκριμένη συσκευή δεν
+καταγράφεται ποτέ — σημαντικό και για τη συμμόρφωση με τον \en{GDPR}.
+
+\section{Επιθεώρηση αποθήκευσης (στάδιο 4)}
+\label{sec:impl-storage}
+
+Το Απόσπασμα~\ref{lst:mbr} δείχνει την ανάλυση του πίνακα \en{MBR}. Η ίδια
+προσέγγιση εφαρμόζεται για την κεφαλίδα και τις εγγραφές \en{GPT}, ενώ οι
+υπογραφές συστημάτων αρχείων αναγνωρίζονται από σταθερό σύνολο, χωρίς χρήση
+του \en{libblkid}. Για τα \en{ISO~9660} και \en{UDF} απαιτείται και έλεγχος
+δομής, όχι μόνο «μαγικός αριθμός».
+
+\begin{lstlisting}[language=Python,caption={Ανάλυση των πρωτευόντων διαμερισμάτων \en{MBR} (\code{storage.py}).},label=lst:mbr]
+def parse_mbr(data: bytes) -> List[Partition]:
+    if len(data) < SECTOR:
+        return []
+    if struct.unpack_from("<H", data, 510)[0] != MBR_SIGNATURE:
+        return []
+    partitions = []
+    for i in range(4):
+        offset = 446 + i * 16
+        status, _c1, _c2, _c3, ptype, _c4, _c5, _c6, start, sectors = \
+            struct.unpack_from("<BBBBBBBBII", data, offset)
+        if ptype == 0 or sectors == 0:
+            continue        # empty slot
+        partitions.append(Partition(index=i, bootable=bool(status & 0x80),
+                                    type_byte=ptype, start_lba=start,
+                                    sectors=sectors))
+    return partitions
+\end{lstlisting}
+
+Η ανάγνωση εκτελείται σε διεργασία-παιδί με αυστηρό χρονικό όριο, ενώ ο
+\en{watchdog} τίθεται σε παύση. Και τα δύο είναι απαραίτητα: το όριο μόνο του θα
+μετρούσε την ανάγνωση ως «κόλλημα» του δαίμονα, ενώ η παύση μόνη της θα
+μετέτρεπε ένα κόλλημα σε μόνιμο πάγωμα. Ο γονέας περιμένει την \emph{αναφορά}
+του παιδιού και όχι την έξοδό του· η συσκευή απενεργοποιείται αμέσως μόλις
+φτάσει η αναφορά.
+
+\section{Διαχωρισμός προνομίων}
+\label{sec:impl-privsep}
+
+\subsection{Το πρωτόκολλο}
+
+Το \code{protocol.py} ορίζει το πλήρες σύνολο αιτημάτων που μπορεί να εκτελέσει
+η πύλη (Πίνακας~\ref{tab:protocol}). Κάθε μήνυμα είναι αντικείμενο \en{JSON} σε
+ένα \en{datagram} \code{SEQPACKET}· το \code{SEQPACKET} διατηρεί τα όρια των
+μηνυμάτων, ώστε να μη χρειάζεται πρόθεμα μήκους — μια ολόκληρη κατηγορία σφαλμάτων
+ανάλυσης εξαλείφεται από την προνομιούχο διεργασία.
+
+\begin{table}[htbp]
+\centering
+\caption{Τα αιτήματα του πρωτοκόλλου πύλης--αναλυτή. Ό,τι δεν περιλαμβάνεται
+απορρίπτεται.}
+\label{tab:protocol}
+\begin{tabular}{@{}lp{10.2cm}@{}}
+\toprule
+\textbf{Αίτημα} & \textbf{Ενέργεια}\\
+\midrule
+\code{AUTHORIZE}   & θέτει \code{authorized=1/0} σε μία διαδρομή συσκευής ή διεπαφής\\
+\code{SET\_DEFAULT} & θέτει \code{authorized\_default} σε έναν ριζικό διανομέα (επαναφορά μόνο στην καταγεγραμμένη τιμή)\\
+\code{OPEN\_INPUT} & ανοίγει κόμβο \code{/dev/input/eventN} μόνο για ανάγνωση και επιστρέφει τον περιγραφέα\\
+\code{OPEN\_BLOCK} & ανοίγει ολόκληρο δίσκο \code{/dev/sdX} μόνο για ανάγνωση και επιστρέφει τον περιγραφέα\\
+\code{TRUST}       & προσθέτει εγγραφή εμπιστοσύνης, μόνο για συσκευή που μόλις ενεργοποίησε η πύλη και μόνο με το δικό της αποτύπωμα\\
+\code{PING}        & έλεγχος ζωντάνιας\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Η απόρριψη προνομίων}
+
+Το Απόσπασμα~\ref{lst:drop} δείχνει τη συνάρτηση \code{drop\_privileges}. Η
+σειρά (ομάδες $\rightarrow$ \en{gid} $\rightarrow$ \en{uid}) είναι η μόνη ορθή:
+μετά το \code{setuid}, η διεργασία δεν θα είχε πλέον δικαίωμα να αλλάξει
+ομάδες. Η επαλήθευση των συμπληρωματικών ομάδων προστέθηκε μετά από έλεγχο
+κώδικα που εντόπισε ότι, σε ορισμένα περιβάλλοντα (\en{user namespaces}), μια
+ομάδα μπορεί να επιβιώσει του \code{setgroups([])}.
+
+\begin{lstlisting}[language=Python,caption={Επαληθευμένη απόρριψη προνομίων (\code{probolos/privsep.py}, χωρίς σχόλια).},label=lst:drop]
+def drop_privileges(uid: int, gid: int) -> None:
+    if os.getuid() != 0:
+        return
+    os.setgroups([])           # supplementary groups first
+    os.setgid(gid)             # then group
+    os.setuid(uid)             # then user, last of all
+    if os.getuid() != uid or os.geteuid() != uid:
+        raise PrivsepError("uid did not drop as expected")
+    if os.getgid() != gid or os.getegid() != gid:
+        raise PrivsepError("gid did not drop as expected")
+    remaining = set(os.getgroups()) - {gid}
+    if remaining:
+        raise PrivsepError(f"supplementary groups survived: {sorted(remaining)}")
+    try:
+        os.setuid(0)
+        raise PrivsepError("regained root after drop -- refusing to continue")
+    except PermissionError:
+        pass  # exactly what we want: root is unreachable now
+\end{lstlisting}
+
+\subsection{Κλειδί εμπιστοσύνης}
+
+Το κλειδί εμπιστοσύνης (Απόσπασμα~\ref{lst:trustkey}) συνδυάζει ταυτότητα και
+\en{SHA-256} των ακατέργαστων περιγραφέων. Μια συσκευή της οποίας οι περιγραφείς
+δεν διαβάστηκαν δεν έχει κλειδί και, εκ κατασκευής, δεν μπορεί να γίνει έμπιστη.
+
+\begin{lstlisting}[language=Python,caption={Υπολογισμός του κλειδιού εμπιστοσύνης (\code{probolos/trust.py}).},label=lst:trustkey]
+def descriptor_hash(dev) -> Optional[str]:
+    raw = getattr(dev, "raw_descriptors", None)
+    return hashlib.sha256(raw).hexdigest() if raw else None
+
+def identity_of(dev) -> str:
+    serial = getattr(dev, "serial", None) or "-"
+    return f"{dev.vendor_id}:{dev.product_id}:{serial}"
+
+def key_for(dev) -> Optional[str]:
+    digest = descriptor_hash(dev)
+    if not digest:
+        return None          # unreadable => untrustable by construction
+    return f"{identity_of(dev)}#{digest}"
+\end{lstlisting}
+
+\section{Ασφαλής διαχείριση αρχείων κατάστασης}
+\label{sec:impl-state}
+
+Ο Πίνακας~\ref{tab:state-files} δείχνει τα αρχεία κατάστασης. Η εμπιστοσύνη και
+το ιστορικό βρίσκονται σκόπιμα σε \emph{διαφορετικούς καταλόγους}: δικαίωμα
+εγγραφής σε κατάλογο επιτρέπει την αντικατάσταση οποιουδήποτε αρχείου του,
+ανεξάρτητα από τον ιδιοκτήτη του αρχείου. Μόνο ο \code{state/} παραδίδεται στον
+αναλυτή.
+
+\begin{table}[htbp]
+\centering
+\caption{Αρχεία κατάστασης, ιδιοκτησία και δικαιώματα.}
+\label{tab:state-files}
+\begin{tabular}{@{}p{5.6cm}p{3.6cm}p{4.2cm}@{}}
+\toprule
+\textbf{Διαδρομή} & \textbf{Περιεχόμενο} & \textbf{Ιδιοκτήτης / δικαιώματα}\\
+\midrule
+\pth{/var/lib/probolos/trusted.json} & εμπιστευμένες συσκευές & \en{root}· \code{0600} (\code{0644} υπό \code{--privsep})\\
+\pth{/var/lib/probolos/state/ledger.json} & ιστορικό & αναλυτής· \code{0600}\\
+\pth{/var/lib/probolos/instance.lock} & μία πύλη τη φορά & \en{root}\\
+\pth{/run/probolos/agent.sock} & υποδοχή πράκτορα & \code{0660}, κατάλογος \code{2750}\\
+\pth{/run/probolos.panic} & διακόπτης πανικού & πρέπει να το δημιουργήσει ο \en{root}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Όλες οι εγγραφές γίνονται με \code{O\_NOFOLLOW | O\_CREAT | O\_EXCL} σε
+προσωρινό αρχείο με απρόβλεπτο όνομα και στη συνέχεια ατομική μετονομασία
+(\code{rename}), ώστε ένας συμβολικός σύνδεσμος να μην μπορεί να ανακατευθύνει
+την εγγραφή. Κάθε αρχείο επικυρώνεται κατά τη φόρτωση· αρχεία άνω των 8\,\en{MiB},
+ειδικά αρχεία ή μη έγκυρο \en{JSON} απορρίπτονται. Το ιστορικό διατηρείται κάτω
+από 4\,\en{MiB}: όταν ξεπεραστεί, ξεχνιέται το ένα τέταρτο των εγγραφών,
+ξεκινώντας από συσκευές για τις οποίες δεν απαντήθηκε ποτέ ερώτηση, ώστε μια
+συσκευή που αλλάζει σειριακό αριθμό σε κάθε σύνδεση να μην μπορεί να «ξεπλύνει»
+μια πραγματική απόρριψη.
+
+\section{Ο πράκτορας επιφάνειας εργασίας}
+\label{sec:impl-agent}
+
+Ο πράκτορας (\code{agent.py}) εκτελείται στη συνεδρία του χρήστη και συνδέεται
+στην υποδοχή \code{/run/probolos/agent.sock}. Ο αναλυτής ελέγχει το \en{uid} του
+συνδεόμενου μέσω \code{SO\_PEERCRED}. Ο κατάλογος έχει δικαιώματα \code{2750}
+και ιδιοκτήτη τον \en{root}· η υποδοχή δεσμεύεται από τον \en{root}
+\emph{πριν} από την απόρριψη προνομίων και ο αναλυτής την κληρονομεί. Έτσι καμία
+άλλη διεργασία με το ίδιο \en{uid} με τον αναλυτή δεν μπορεί να αντικαταστήσει
+την υποδοχή και να «υποδυθεί» τον αναλυτή.
+
+Οι διάλογοι υλοποιούνται με \en{kdialog} (\en{KDE}), \en{zenity} (\en{GNOME}) ή
+\en{tkinter}. Μόνο οι \emph{δικές τους} απαντήσεις μετρούν: ένα κουμπί ή το
+κλείσιμο του παραθύρου είναι απάντηση, ενώ ένας διάλογος που τερματίστηκε από
+σήμα, κατέρρευσε ή έληξε είναι «καμία απάντηση». Η αντίστοιχη απεικόνιση
+κωδικών εξόδου κάθε εργαλείου αποτέλεσε πηγή σφαλμάτων· χαρακτηριστικά, μια
+έκδοση αντιστοίχιζε το «Όχι» του \en{tkinter} σε «Αποδοχή πάντα» (σφάλμα P1,
+§\ref{sec:eval-qa}).
+
+\section{Υπηρεσία \en{systemd}}
+\label{sec:impl-systemd}
+
+Το σενάριο \code{install.sh} εγκαθιστά τον κώδικα στο \code{/opt/probolos}
+(ιδιοκτησίας \en{root}), δημιουργεί τον λογαριασμό \code{probolos} μέσω
+\en{sysusers.d} και δύο μονάδες \en{systemd}: την πύλη ως υπηρεσία συστήματος
+(\code{--privsep --agent}) με περιορισμούς απομόνωσης (π.χ.
+\code{ProtectSystem=strict}, περιορισμένο σύνολο \en{capabilities}) και τον
+πράκτορα ως υπηρεσία χρήστη. Όταν η επιφάνεια εργασίας δεν είναι διαθέσιμη
+(οθόνη σύνδεσης), οι νέες συσκευές κρατούνται και ερωτώνται μόλις ο πράκτορας
+επανασυνδεθεί.

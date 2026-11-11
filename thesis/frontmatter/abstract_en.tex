@@ -1,0 +1,40 @@
+% -------------------------------- Abstract --------------------------------
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+\thispagestyle{plain}
+
+\begin{english}
+USB peripherals are among the most widely exploitable physical-access attack
+vectors. A device that claims to be a flash drive can also present itself to the
+operating system as a keyboard and type commands within milliseconds (BadUSB
+attacks). On Linux, the kernel binds a driver to every new device as soon as it
+appears, without asking the user.
+
+This thesis presents the design, implementation and evaluation of
+\textsf{Probolos}, a deny-by-default USB admission gate for Linux. Probolos uses
+the kernel's USB authorization interface (\texttt{authorized\_default}) so that
+every new device arrives \emph{switched off}. While the device waits, it is
+examined in up to four stages: (a) identity, from its descriptors; (b)
+consistency, with 21 rules that detect contradictory claims such as a storage
+device that also declares a keyboard; (c) behaviour, by briefly enabling the
+device with its input exclusively grabbed (\texttt{EVIOCGRAB}) and analysing
+keystroke timing; and (d) storage, by reading the partition table read-only,
+without mounting. The final decision always belongs to a human, through the
+terminal or desktop dialogs whose friction scales with risk. The system keeps a
+device history with descriptor fingerprints to detect descriptor drift, applies
+privilege separation between a small root gate and an unprivileged analyzer,
+and guarantees that the gate reopens on every exit path so that the user is
+never locked out.
+
+The evaluation used emulated USB devices (dummy\_hcd and raw\_gadget), a suite of
+1413 automated tests, property-based testing, coverage-guided fuzzing and
+repeated code audits. 106 defects were logged and fixed, four of them of the
+highest priority (P0). The thesis concludes that a deny-by-default gate combined
+with consistency checks substantially reduces the BadUSB attack surface at a low
+usability cost, and documents the limits of the approach.
+
+\vspace{0.8cm}
+\noindent\textbf{Keywords:} USB security, BadUSB, keystroke injection, Linux,
+sysfs, device authorization, privilege separation, peripheral security, anomaly
+detection.
+\end{english}

@@ -1,0 +1,479 @@
+% =====================================================================
+\chapter{Πειραματική Αξιολόγηση}
+\label{ch:evaluation}
+% =====================================================================
+
+Η αξιολόγηση απαντά σε τέσσερα ερωτήματα:
+
+\begin{description}
+  \item[ΕΕ1 -- Ανίχνευση.] Εντοπίζει το \Probolos{} τις τυπικές μορφές επιθέσεων
+        \en{USB} χωρίς ψευδώς θετικά σε συνηθισμένες συσκευές;
+  \item[ΕΕ2 -- Συμπεριφορά.] Πώς ταξινομεί το στάδιο~3 διαφορετικά πρότυπα
+        πληκτρολόγησης, συμπεριλαμβανομένων όσων μιμούνται άνθρωπο;
+  \item[ΕΕ3 -- Κόστος.] Ποιο είναι το υπολογιστικό κόστος της ανάλυσης;
+  \item[ΕΕ4 -- Ορθότητα.] Πόσο αξιόπιστη είναι η υλοποίηση και ποιες τεχνικές
+        επαλήθευσης αποδείχθηκαν αποτελεσματικές;
+\end{description}
+
+\section{Μεθοδολογία και περιβάλλον}
+\label{sec:eval-method}
+
+Η αξιολόγηση έγινε κυρίως με \emph{εξομοιωμένες} συσκευές, για τρεις λόγους: (α)
+η επαναληψιμότητα — κάθε σενάριο εκτελείται πανομοιότυπα όσες φορές χρειαστεί·
+(β) η ασφάλεια — καμία πραγματική κακόβουλη συσκευή δεν συνδέεται σε σταθμό
+εργασίας· και (γ) η πληρότητα — μπορούν να κατασκευαστούν αλλοιωμένοι
+περιγραφείς που δεν θα παρήγαγε κανένα εμπορικό εργαλείο.
+
+\begin{table}[htbp]
+\centering
+\caption{Περιβάλλον αξιολόγησης.}
+\label{tab:env}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Στοιχείο} & \textbf{Τιμή}\\
+\midrule
+Έκδοση λογισμικού      & \Probolos{} 1.0.0b2\\
+Γλώσσα                 & \en{Python} 3.10–3.13 (μετρήσεις χρόνου: 3.11, \en{x86\_64})\\
+Διανομή ανάπτυξης      & \en{Manjaro Linux} (\en{KDE Plasma})\\
+Εξομοίωση συσκευών     & \en{dummy\_hcd} + \en{raw\_gadget} (πυρήνας \en{Linux})\\
+Έλεγχοι ιδιοτήτων      & \en{Hypothesis}~\cite{maciver2019hypothesis}\\
+Στατική ανάλυση        & \en{ruff}, \en{mypy}, \en{CodeQL}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Το πλαίσιο εξομοίωσης (\en{testbed})}
+\label{sec:eval-testbed}
+
+Ο κατάλογος \code{testbed/} δημιουργεί συσκευές \en{USB} λογισμικού και τις
+«συνδέει» στον τοπικό πυρήνα μέσω \en{dummy\_hcd} και \en{raw\_gadget}. Για
+κάθε προκαθορισμένο σενάριο (\en{preset}) υπάρχει και λειτουργία πρόβλεψης
+(\code{--preview}) που αναλύει τους περιγραφείς τοπικά, χωρίς \en{root}, και
+τυπώνει τι πρέπει να συμπεράνει το \Probolos. Η σύγκριση πρόβλεψης και
+πραγματικής εκτέλεσης διαχωρίζει σφάλματα των κανόνων από σφάλματα της
+απαρίθμησης.
+
+\begin{lstlisting}[language=shell,caption={Επίδειξη κρίσιμου ευρήματος με εξομοιωμένη συσκευή \en{BadUSB}.},label=lst:demo]
+sudo modprobe -a dummy_hcd raw_gadget
+sudo python3 -m probolos --dry-run        # terminal 1: report only
+sudo python3 -m testbed.spawn badusb      # terminal 2: plug in the fake
+python3 -m testbed.spawn badusb --preview # no root: predicted verdict
+\end{lstlisting}
+
+\section{Σενάρια και αποτελέσματα ανίχνευσης (ΕΕ1)}
+\label{sec:eval-scenarios}
+
+Ο Πίνακας~\ref{tab:scenarios} συνοψίζει τα αποτελέσματα για τα έξι σενάρια του
+πλαισίου εξομοίωσης. Σε όλα, η ετυμηγορία ταυτίζεται με την αναμενόμενη.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Αποτελέσματα σταδίων 1–2 στα σενάρια εξομοίωσης.}
+\label{tab:scenarios}
+\begin{tabular}{@{}p{2.9cm}p{3.3cm}p{5.2cm}c@{}}
+\toprule
+\textbf{Σενάριο} & \textbf{Δηλώνει} & \textbf{Ευρήματα} & \textbf{Ετυμηγορία}\\
+\midrule
+\code{flashdrive}  & \en{Mass Storage} & — & \textcolor{okgreen}{\textbf{καθαρή}}\\
+\code{keyboard}    & πληκτρολόγιο & \code{keyboard-at-high-speed} & \sevN\\
+\code{overpowered} & πληκτρολόγιο, 800\,\en{mA} & \code{power-exceeds-bus-limit}, \code{keyboard-at-high-speed} & \sevW\\
+\code{badusb}      & \en{Mass Storage} + πληκτρολόγιο & \code{storage-with-keyboard}, \code{self-contradictory-identity}, \code{multiple-distinct-functions}, \code{keyboard-at-high-speed} & \sevC\\
+\code{drift-innocent} & \en{Mass Storage} & — (εγκρίνεται) & \textcolor{okgreen}{\textbf{καθαρή}}\\
+\code{drift-weaponized} & ίδια ταυτότητα + πληκτρολόγιο & ό,τι το \code{badusb} \emph{και} \code{descriptor-drift} & \sevC\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Παράδειγμα 1: «Στικάκι» που πληκτρολογεί}
+\label{sec:example-badusb}
+
+Το σενάριο \code{badusb} εμφανίζεται ως \en{«SanDisk Cruzer Blade»}, με
+\en{VID:PID} \code{0781:5567} — αναγνωριστικά ενός πραγματικού, δημοφιλούς
+στικακιού — αλλά δηλώνει δύο διεπαφές: μαζική αποθήκευση (\code{08/06/50}) και
+πληκτρολόγιο εκκίνησης (\code{03/01/01}). Το Απόσπασμα~\ref{lst:report-badusb}
+δείχνει την αναφορά που παράγει το \Probolos. Παρατηρούμε ότι:
+
+\begin{itemize}
+  \item η αναφορά ξεκινά με τις \emph{δηλωμένες λειτουργίες} (\en{Mass Storage}
+        \textbf{+} \en{KEYBOARD}) και όχι με το όνομα της συσκευής·
+  \item οι συμβολοσειρές της συσκευής εμφανίζονται σε εισαγωγικά, ως
+        «μαρτυρία» της συσκευής και όχι ως κρίση του εργαλείου·
+  \item τα ευρήματα ταξινομούνται κατά σοβαρότητα και καθένα συνοδεύεται από
+        επεξήγηση σε απλή γλώσσα.
+\end{itemize}
+
+\begin{lstlisting}[caption={Αναφορά τερματικού για το σενάριο \code{badusb} (έξοδος της μονάδας \code{report.py}, χωρίς χρώματα).},label=lst:report-badusb]
+NEW USB DEVICE · blocked, awaiting decision
+──────────────────────────────────────────────────────────────
+  Mass Storage (SCSI)
+  + KEYBOARD
+  "SanDisk" "Cruzer Blade"
+  serial "TB-STICK-1"
+  0781:5567 · bus 1 port 1-4 · 480 Mbps · 200 mA bus-powered
+
+  ✖ CRITICAL · Storage device that can also type
+      This device presents itself as both a disk and a
+      keyboard. The storage half provides the alibi while the
+      keyboard half can enter commands on your behalf.
+      Legitimate flash drives never need a keyboard interface.
+      This is the classic BadUSB layout.
+
+  ⚠ WARNING · Calls itself storage, presents an input
+  interface
+      The device names itself 'SanDisk Cruzer Blade', which
+      describes a storage product, yet it declares a keyboard
+      interface. ...
+
+  • NOTICE · Device combines several different functions
+  • NOTICE · Keyboard on a high-speed connection
+──────────────────────────────────────────────────────────────
+  checked: identity + consistency. Stages 3 & 4 follow.
+\end{lstlisting}
+
+Επειδή υπάρχει εύρημα \sevC, η αποδοχή απαιτεί πληκτρολόγηση της λέξης
+\code{authorize} στο τερματικό ή αναμονή 10\,\en{s} στον διάλογο, και η επιλογή
+«πάντα» δεν προσφέρεται.
+
+\subsection{Παράδειγμα 2: Νόμιμο στικάκι}
+
+Η ίδια ταυτότητα χωρίς τη διεπαφή πληκτρολογίου (σενάριο \code{flashdrive}) δεν
+παράγει κανένα εύρημα: «\code{✓ no inconsistencies in what it claims}». Στη
+λειτουργία πράκτορα, μια τέτοια συσκευή χρειάζεται \emph{έναν} διάλογο. Στη
+συνέχεια, το στάδιο~4 διαβάζει τον πίνακα διαμερισμάτων· ένα τυπικό στικάκι με
+ένα διαμέρισμα \en{FAT32} ή \en{exFAT} από τον τομέα 2048 δεν παράγει ευρήματα.
+
+\subsection{Παράδειγμα 3: Μετάλλαξη περιγραφέων}
+\label{sec:example-drift}
+
+Το σενάριο ελέγχει την ανίχνευση συσκευής που εγκρίθηκε και στη συνέχεια
+«οπλίστηκε». Πρώτα συνδέεται η \code{drift-innocent} (μόνο αποθήκευση, σειριακός
+\code{TB-DRIFT-1}) και ο χρήστης την εγκρίνει. Έπειτα συνδέεται η
+\code{drift-weaponized}: ίδιος κατασκευαστής, προϊόν και σειριακός αριθμός, αλλά
+με πρόσθετη διεπαφή πληκτρολογίου. Το κανονικοποιημένο αποτύπωμα $F(D)$
+διαφέρει, άρα ενεργοποιείται ο \code{descriptor-drift} (\sevC) — \emph{επιπλέον}
+των κανόνων συνέπειας. Ακόμη κι αν ένας επιτιθέμενος κατάφερνε να αποφύγει τους
+κανόνες του σταδίου~2, η αλλαγή αυτή καθαυτή θα αρκούσε.
+
+\begin{lstlisting}[language=shell,caption={Εκτέλεση του σεναρίου μετάλλαξης.},label=lst:drift]
+sudo python3 -m testbed.spawn drift-innocent     # approve it
+sudo python3 -m testbed.spawn drift-weaponized   # same serial, now a keyboard
+sudo python3 -m probolos --history -v            # the ledger shows both
+\end{lstlisting}
+
+\subsection{Παράδειγμα 4: Εχθρικές συμβολοσειρές}
+
+Μια συσκευή \en{HID} που ονομάζεται \code{"Logitech\textbackslash x1b[2J USB Keyboard"}
+θα καθάριζε την οθόνη του τερματικού αν το όνομά της τυπωνόταν αυτούσιο, ενώ
+ένας χαρακτήρας \code{U+202E} (\en{RIGHT-TO-LEFT OVERRIDE}) θα αντέστρεφε την
+εμφάνιση του κειμένου που ακολουθεί~\cite{boucher2023trojansource}. Το
+\Probolos{} εμφανίζει τέτοιους χαρακτήρες με διαφυγή (\code{\textbackslash x1b},
+\code{\textbackslash u202e}) και, επειδή η συσκευή μπορεί να πληκτρολογεί,
+ενεργοποιεί τον \code{crafted-strings-hid} (\sevC). Ο έλεγχος δεν αφορά μόνο
+το τερματικό: ο καθαρισμός γίνεται στο σημείο εισόδου, ώστε και ένα μεταγενέστερο
+\code{cat probolos.jsonl} να είναι ασφαλές.
+
+\subsection{Παράδειγμα 5: Κάρτα μνήμης με κρυφό διαμέρισμα}
+
+Με \code{--watch-media}, όταν εισάγεται κάρτα σε ήδη εγκεκριμένο αναγνώστη, το
+\Probolos{} διαβάζει τη διάταξή της. Μια κάρτα με διαμέρισμα τύπου \code{0xEF}
+(\en{EFI System}) ή με «κρυφό» τύπο \en{MBR} (π.χ. \code{0x1C}) παράγει
+\code{media-efi-system-partition} ή \code{media-hidden-partition} (\sevC). Με
+\code{--media-policy deauthorize}, ολόκληρος ο αναγνώστης απενεργοποιείται.
+
+\section{Ανάλυση συμπεριφοράς πληκτρολόγησης (ΕΕ2)}
+\label{sec:eval-behaviour}
+
+Για να μελετηθεί η συμπεριφορά των κανόνων του σταδίου~3 ανεξάρτητα από το
+υλικό, οι πραγματικές συναρτήσεις του \Probolos{} (\code{rules.behaviour\_findings})
+τροφοδοτήθηκαν με συνθετικές παρατηρήσεις: ακολουθίες $n$ πατημάτων με
+διαστήματα από κανονική κατανομή $\mathcal{N}(\mu, \sigma)$ και χρόνο πρώτου
+πατήματος $t_0$. Κάθε σενάριο εκτελέστηκε 1000 φορές (σπόρος 42). Τα
+αποτελέσματα φαίνονται στον Πίνακα~\ref{tab:behaviour}.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption[Ευρήματα σταδίου 3 σε συνθετικά πρότυπα πληκτρολόγησης]{Ευρήματα σταδίου 3 σε συνθετικά πρότυπα πληκτρολόγησης (1000 επαναλήψεις
+ανά σενάριο). \code{MGK}: \code{machine-generated-keystrokes},
+\code{UT}: \code{unprompted-typing}, \code{UK}: \code{unexpected-keystrokes},
+\code{IA}: \code{immediate-activity}.}
+\label{tab:behaviour}
+\begin{tabular}{@{}p{4.1cm}cccccccc@{}}
+\toprule
+\textbf{Πρότυπο} & $n$ & $\mu$ (\en{ms}) & $\sigma$ (\en{ms}) & $t_0$ (\en{s}) & \code{MGK} & \code{UT} & \code{UK} & \code{IA}\\
+\midrule
+\en{Ducky}, σταθερός ρυθμός   & 40 & 10  & 0{,}5 & 0{,}05 & 1000 & 0    & 0   & 1000\\
+\en{Ducky} με τυχαιότητα       & 40 & 10  & 4     & 0{,}05 & 0    & 1000 & 0   & 1000\\
+Ωφέλιμο φορτίο 30\,\en{ms}     & 20 & 30  & 9     & 0{,}05 & 46   & 954  & 0   & 1000\\
+Μίμηση τύπου \en{Malboard}     & 40 & 150 & 60    & 0{,}30 & 0    & 1000 & 0   & 1000\\
+Ανθρώπινος ρυθμός              & 40 & 180 & 80    & 0{,}40 & 0    & 1000 & 0   & 1000\\
+Τυχαίο άγγιγμα (3 πλήκτρα)     & 3  & 120 & 50    & 1{,}20 & 1    & 0    & 999 & 0\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Τα αποτελέσματα επιβεβαιώνουν τη σχεδιαστική επιλογή της §\ref{sec:design-stage3}:
+
+\begin{itemize}
+  \item Ο κανόνας ρυθμού (\code{MGK}) πιάνει μόνο το «αφελές» ωφέλιμο φορτίο με
+        σταθερό ρυθμό. Με μικρή τεχνητή τυχαιότητα ($\sigma=4$\,\en{ms}, $CV\approx0{,}4$)
+        ή με μίμηση ανθρώπου, παρακάμπτεται πλήρως.
+  \item Ωστόσο, \emph{κάθε} σενάριο με $n\ge5$ καταλήγει σε εύρημα \sevC{} μέσω
+        του \code{UT}, ανεξάρτητα από τον ρυθμό. Η άμυνα δεν στηρίζεται στη
+        διάκριση ανθρώπου--μηχανής, αλλά στο ότι κανείς δεν πρέπει να
+        πληκτρολογεί.
+  \item Το τυχαίο άγγιγμα τριών πλήκτρων αναφέρεται ως \sevW{} (\code{UK}) και
+        όχι ως επίθεση, μειώνοντας τα ψευδώς θετικά· σε 1 από τις 1000
+        επαναλήψεις τα τυχαία διαστήματα έτυχε να είναι αρκετά κανονικά ώστε να
+        δώσουν \code{MGK}.
+\end{itemize}
+
+\begin{warnbox}[Περιορισμός]
+Μια συσκευή που \emph{δεν} πληκτρολογεί κατά τη διάρκεια της καραντίνας (π.χ.
+περιμένει 10\,\en{s}, ή ενεργοποιείται μόνο όταν ανιχνεύσει αδράνεια του
+χρήστη) δεν εντοπίζεται από το στάδιο~3. Αυτό είναι εγγενές όριο κάθε
+παρατήρησης περιορισμένου χρόνου και συζητείται στο Κεφάλαιο~\ref{ch:discussion}.
+\end{warnbox}
+
+\section{Υπολογιστικό κόστος (ΕΕ3)}
+\label{sec:eval-cost}
+
+Ο Πίνακας~\ref{tab:perf} δείχνει τον χρόνο ανάλυσης περιγραφέων και αξιολόγησης
+κανόνων των σταδίων 1–2 ανά σενάριο (5000 επαναλήψεις, \en{Python} 3.11,
+\en{x86\_64}). Ο διάμεσος χρόνος είναι 18–32\,\textmu\en{s} και το 99ο
+εκατοστημόριο κάτω από 150\,\textmu\en{s}: η ανάλυση είναι αμελητέα σε σχέση με
+τον χρόνο απαρίθμησης μιας συσκευής (εκατοντάδες \en{ms}) και πολύ περισσότερο
+σε σχέση με τον χρόνο αντίδρασης του ανθρώπου.
+
+\begin{table}[htbp]
+\centering
+\caption{Χρόνος σταδίων 1–2 (ανάλυση περιγραφέων + κανόνες).}
+\label{tab:perf}
+\begin{tabular}{@{}lrrc@{}}
+\toprule
+\textbf{Σενάριο} & \textbf{Διάμεσος (\textmu\en{s})} & \textbf{99\% (\textmu\en{s})} & \textbf{Ευρήματα}\\
+\midrule
+\code{flashdrive}       & 17{,}7 & 104{,}2 & 0\\
+\code{keyboard}         & 22{,}2 & 119{,}0 & 1\\
+\code{overpowered}      & 24{,}0 & 126{,}2 & 2\\
+\code{badusb}           & 31{,}4 & 126{,}7 & 4\\
+\code{drift-innocent}   & 18{,}5 & 116{,}0 & 0\\
+\code{drift-weaponized} & 31{,}4 & 147{,}1 & 4\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Το κυρίαρχο κόστος βρίσκεται στα στάδια 3 και 4, και είναι \emph{σκόπιμο}: η
+καραντίνα διαρκεί \code{--observe} δευτερόλεπτα (προεπιλογή 3), ενώ η ανάγνωση
+αποθήκευσης εξαρτάται από το πότε η συσκευή εκθέτει τον κόμβο μπλοκ (σε δοκιμές,
+1–3\,\en{s}). Ο χρήστης μπορεί να τα απενεργοποιήσει
+(\code{--observe 0 --no-storage-scan}) για αυστηρότερη απομόνωση και μηδενικό
+χρόνο αναμονής.
+
+\paragraph{Κενό έκθεσης.} Σε πραγματικό υλικό, ο χρόνος από την εξουσιοδότηση
+έως την πρώτη επιτυχή δέσμευση \code{EVIOCGRAB} μετρήθηκε στα
+41–85\,\en{ms}. Ο χρόνος αυτός \emph{δεν} είναι ο αριθμός πλήκτρων που
+διέφυγαν· ο ακριβής αριθμός απαιτεί το πείραμα διαρροής του
+\code{testbed/hidexp} (§\ref{sec:eval-pending}).
+
+\section{Επαλήθευση της υλοποίησης (ΕΕ4)}
+\label{sec:eval-verification}
+
+\subsection{Αυτοματοποιημένοι έλεγχοι}
+
+Η σουίτα περιλαμβάνει 1413 ελέγχους μονάδας και ενσωμάτωσης (6 παραλείπονται
+όταν δεν υπάρχουν \en{AF\_UNIX sockets}), που εκτελούνται σε περίπου 39\,\en{s}
+χωρίς \en{root}, χωρίς υλικό και χωρίς \en{pyudev} (απαίτηση~\ref{req:testable}).
+Το \en{sysfs} προσομοιώνεται με πραγματικούς καταλόγους και συμβολικούς
+συνδέσμους σε προσωρινό σύστημα αρχείων (\code{FakeSysfs}). Οι έλεγχοι
+παλινδρόμησης από ελέγχους κώδικα ονομάζονται με βάση το ελάττωμα που
+«καρφιτσώνουν» (π.χ. \code{AnalyzerHasNoControllingTerminal}). Η κατανομή ανά
+περιοχή φαίνεται στο Σχήμα~\ref{fig:tests}.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  xbar, width=12cm, height=9.5cm,
+  xlabel={Πλήθος ελέγχων}, xmin=0,
+  symbolic y coords={testbed,interrogate,service,properties,textsafe,sysfs,gate,descriptors,cli,trust,quarantine,rules,ledger,boundary,agent,daemon,privsep,storage},
+  ytick=data, y tick label style={font=\scriptsize\ttfamily},
+  nodes near coords, nodes near coords style={font=\scriptsize},
+  bar width=6pt, enlarge y limits=0.04,
+]
+\addplot[fill=univblue!60, draw=univblue] coordinates {
+ (6,testbed) (10,interrogate) (11,service) (30,properties) (34,textsafe)
+ (49,sysfs) (50,gate) (51,descriptors) (56,cli) (71,trust) (77,quarantine)
+ (85,rules) (115,ledger) (129,boundary) (160,agent) (164,daemon)
+ (166,privsep) (172,storage)};
+\end{axis}
+\end{tikzpicture}
+\caption{Συναρτήσεις ελέγχου ανά αρχείο της σουίτας (\code{tests/test\_*.py}).
+Οι μεγαλύτερες ομάδες καλύπτουν τον διαχωρισμό προνομίων, την αποθήκευση και
+τον δαίμονα.}
+\label{fig:tests}
+\end{figure}
+
+\subsection{Έλεγχοι ιδιοτήτων}
+
+Ο έλεγχος βασισμένος σε ιδιότητες (\en{property-based testing})~\cite{claessen2000quickcheck,maciver2019hypothesis}
+δηλώνει \emph{αναλλοίωτες} ιδιότητες και αφήνει το πλαίσιο να παράγει εισόδους.
+Παραδείγματα ιδιοτήτων του \Probolos:
+
+\begin{itemize}
+  \item για \emph{οποιαδήποτε} ακολουθία \en{bytes}, ο αναλυτής περιγραφέων δεν
+        εγείρει εξαίρεση· είτε επιστρέφει δομή είτε σφάλμα ανάλυσης·
+  \item για \emph{οποιαδήποτε} συμβολοσειρά, η έξοδος του \code{textsafe} δεν
+        περιέχει χαρακτήρες ελέγχου, \en{bidi} ή αόρατους·
+  \item η αναφορά για οποιαδήποτε συσκευή δεν περιέχει ακολουθίες διαφυγής.
+\end{itemize}
+
+Η «βαθιά» εκτέλεση (29 έλεγχοι ιδιοτήτων $\times$ 7500 παραδείγματα) διαρκεί
+7–12 λεπτά και ήταν καθαρή σε όλες τις εκδόσεις από την 0.11.0 έως την 1.0.0b2.
+Ήδη την πρώτη ημέρα εντόπισε ένα ελάττωμα που είχε διαφύγει κάθε άλλου ελέγχου:
+η περικοπή συμβολοσειράς σε όριο 1 χαρακτήρα παρέλειπε τη διαφυγή ενός
+χαρακτήρα ελέγχου.
+
+\subsection{Ασαφής έλεγχος (\en{fuzzing})}
+
+Ο κατάλογος \code{fuzzing/} περιέχει \en{fuzzer} καθοδηγούμενο από κάλυψη
+(μόνο με τη βιβλιοθήκη προτύπων) για ό,τι αναλύει το \Probolos{} πριν από μια
+απόφαση: περιγραφείς, αναφορές \en{HID}, μέσα αποθήκευσης, το πρωτόκολλο της
+πύλης, την υποδοχή του πράκτορα, τα αρχεία κατάστασης και ολόκληρη τη διαδρομή
+ανάλυσης. Ενώ οι έλεγχοι ιδιοτήτων δοκιμάζουν περίπου 150 εισόδους ανά
+ισχυρισμό, ο \en{fuzzer} εκτελεί εκατομμύρια, κρατά όσες φτάνουν σε νέο κώδικα
+και αναφέρει και \emph{κολλήματα} και \emph{εκρήξεις μνήμης}, όχι μόνο
+εξαιρέσεις. Εντόπισε ένα ελάττωμα στον έλεγχο δομής \en{UDF}, το οποίο οδήγησε
+σε στοχευμένη επανεξέταση όλων των αναλυτών μη έμπιστης εισόδου.
+
+\subsection{Κάλυψη κώδικα}
+
+Ο Πίνακας~\ref{tab:coverage} δείχνει την κάλυψη διακλαδώσεων της έμπιστης
+βάσης. Μετά την πρώτη φάση σκλήρυνσης, η κάλυψη του ορίου προνομίων ανέβηκε από
+80\% σε 95\%, και το κατώφλι στη συνεχή ενσωμάτωση (\en{CI}) αυξήθηκε αντίστοιχα.
+
+\begin{table}[htbp]
+\centering
+\caption{Κάλυψη διακλαδώσεων της έμπιστης βάσης (ως \en{root}).}
+\label{tab:coverage}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Μονάδα} & \textbf{0.11.0} & \textbf{Μετά τη σκλήρυνση}\\
+\midrule
+\code{protocol.py}     & 97\% & 98\%\\
+\code{gate\_server.py} & 81\% & 95\%\\
+\code{gate\_client.py} & 71\% & 94\%\\
+\code{privsep.py}      & 67\% & 98\%\\
+\code{securefs.py}     & 87\% & 87\%\\
+\code{atomicio.py}     & 85\% & 85\%\\
+\midrule
+\textbf{Όριο προνομίων (σύνολο)} & \textbf{80\%} & \textbf{95\%}\\
+Σύνολο έργου          & 81\% & 85\%\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Ανάλυση του αρχείου ελαττωμάτων}
+\label{sec:eval-qa}
+
+Από το πάγωμα λειτουργιών (έκδοση 0.11.0) και μετά, κάθε ελάττωμα καταγράφηκε
+στο \code{docs/QA-LOG.md} με ημερομηνία, περιγραφή, μέθοδο εντοπισμού και
+προτεραιότητα. Η κλίμακα προτεραιότητας είναι:
+
+\begin{description}
+  \item[P0] αποτυχία-ανοιχτά (αποδοχή χωρίς ανθρώπινη απάντηση), πύλη ανοιχτή ή
+        θύρες νεκρές μετά την έξοδο, κλιμάκωση προνομίων, αδυναμία εκκίνησης
+        της υπηρεσίας·
+  \item[P1] λάθος ετυμηγορία σε κοινό υλικό, χαμένη απόφαση, φθορά αποθηκών,
+        αδυναμία ασφαλείας χωρίς γνωστή εκμετάλλευση·
+  \item[P2] σπάνιες οριακές περιπτώσεις, παραπλανητικά μηνύματα, σφάλματα
+        τεκμηρίωσης·
+  \item[P3] αισθητικά ζητήματα.
+\end{description}
+
+Καταγράφηκαν συνολικά \textbf{106 ελαττώματα}: 4 P0, 15 P1, 47 P2 και 40 P3
+(Σχήμα~\ref{fig:qa}). Επειδή το σύνολο λειτουργιών ήταν «παγωμένο», όλα αφορούν
+το \emph{ίδιο} σύστημα, κάτι που επιτρέπει τη σύγκριση των μεθόδων εντοπισμού.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  ybar stacked, width=11.5cm, height=7cm,
+  ylabel={Ελαττώματα}, ymin=0,
+  symbolic x coords={Έλεγχος κώδικα, Καθημερινή χρήση, Ιδιότητες, Fuzzing, CI},
+  xtick=data, x tick label style={font=\small, align=center, text width=2.2cm},
+  xticklabels={Έλεγχος\\κώδικα, Καθημερινή\\χρήση, Έλεγχοι\\ιδιοτήτων, \en{Fuzzing}, \en{CI}},
+  legend style={at={(0.98,0.97)}, anchor=north east, font=\small},
+  bar width=22pt, enlarge x limits=0.14,
+]
+\addplot[fill=critical, draw=critical!70!black] coordinates {(Έλεγχος κώδικα,4) (Καθημερινή χρήση,0) (Ιδιότητες,0) (Fuzzing,0) (CI,0)};
+\addplot[fill=warning, draw=warning!70!black] coordinates {(Έλεγχος κώδικα,15) (Καθημερινή χρήση,0) (Ιδιότητες,0) (Fuzzing,0) (CI,0)};
+\addplot[fill=notice!70, draw=notice] coordinates {(Έλεγχος κώδικα,41) (Καθημερινή χρήση,4) (Ιδιότητες,1) (Fuzzing,0) (CI,1)};
+\addplot[fill=gray!40, draw=gray] coordinates {(Έλεγχος κώδικα,36) (Καθημερινή χρήση,3) (Ιδιότητες,0) (Fuzzing,1) (CI,0)};
+\legend{P0, P1, P2, P3}
+\end{axis}
+\end{tikzpicture}
+\caption{Ελαττώματα ανά μέθοδο εντοπισμού και προτεραιότητα (106 συνολικά).}
+\label{fig:qa}
+\end{figure}
+
+\paragraph{Παρατηρήσεις.}
+\begin{enumerate}
+  \item \textbf{Ο συστηματικός έλεγχος κώδικα κυριαρχεί} (96 από 106), και
+        εντόπισε \emph{όλα} τα ελαττώματα P0 και P1. Οι έλεγχοι οργανώθηκαν
+        ανά «γωνία» (όριο προνομίων· χειρισμός συσκευών και αναλυτές· ροή
+        αποφάσεων· συσκευασία και τεκμηρίωση), και κάθε εύρημα επανελεγχόταν
+        από ξεχωριστό, «σκεπτικιστή» αναθεωρητή πριν από τη διόρθωση.
+  \item \textbf{Οι αυτοματοποιημένες τεχνικές βρήκαν λίγα αλλά μοναδικά
+        ελαττώματα}: ό,τι εντόπισαν οι έλεγχοι ιδιοτήτων και το \en{fuzzing} δεν
+        είχε εντοπιστεί από κανέναν έλεγχο κώδικα.
+  \item \textbf{Η καθημερινή χρήση} ανέδειξε ζητήματα αλληλεπίδρασης με την
+        επιφάνεια εργασίας (π.χ. αυτόματη προσάρτηση στο \en{KDE Plasma}) που
+        καμία εξομοίωση δεν αναπαράγει.
+\end{enumerate}
+
+\paragraph{Τα ελαττώματα P0.} Δύο από αυτά είναι χαρακτηριστικά των κινδύνων
+ενός εργαλείου που «κλείνει» το σύστημα:
+
+\begin{itemize}
+  \item Η ανάγνωση χαρακτηριστικών \en{sysfs} αποκωδικοποιούσε με την
+        κωδικοποίηση του \en{locale}· σε ορισμένα συστήματα αυτό προκαλούσε
+        \code{UnicodeDecodeError} κατά την εκκίνηση και η πύλη ξανάνοιγε καθώς
+        η διεργασία τερμάτιζε — αθόρυβη απώλεια προστασίας.
+  \item Η διεργασία ανάγνωσης του σταδίου~4 κληρονομούσε την οπλισμένη πύλη
+        (§\ref{sec:impl-gate}): ένα \code{SIGTERM} μετά από κόλλημα την έκανε να
+        ανοίξει όλους τους διανομείς, ενώ ο δαίμονας πίστευε την πύλη κλειστή.
+        Μια εχθρική συσκευή αποθήκευσης θα μπορούσε να χρονομετρήσει το κόλλημα.
+\end{itemize}
+
+Και τα δύο διορθώθηκαν με ελέγχους παλινδρόμησης που αποτυγχάνουν στον κώδικα
+πριν από τη διόρθωση και περνούν μετά.
+
+\section{Μετρήσεις σε εξέλιξη}
+\label{sec:eval-pending}
+
+Για λόγους επιστημονικής ακεραιότητας, σημειώνεται ότι οι ακόλουθες μετρήσεις
+\emph{δεν} έχουν ακόμη ολοκληρωθεί σε πραγματικό υλικό επίθεσης και
+προγραμματίζονται για την ολοκλήρωση της εργασίας (Πίνακας~\ref{tab:pending}).
+Οι κενές τιμές πρέπει να συμπληρωθούν από τον συγγραφέα πριν από την κατάθεση,
+ή η ενότητα να μεταφερθεί στη μελλοντική εργασία.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Προγραμματισμένες μετρήσεις σε πραγματικό υλικό (προς συμπλήρωση).}
+\label{tab:pending}
+\begin{tabular}{@{}p{5.6cm}p{4.6cm}p{3.0cm}@{}}
+\toprule
+\textbf{Μέτρηση} & \textbf{Μέθοδος} & \textbf{Αποτέλεσμα}\\
+\midrule
+Πλήκτρα που διαφεύγουν πριν από τη δέσμευση & \code{testbed/hidexp}, $\ge$30 επαναλήψεις & [—]\\
+Ποσοστό ανίχνευσης \en{Rubber Ducky} / \en{O.MG} & πραγματικές συσκευές & [—]\\
+Ψευδώς θετικά σε συνηθισμένες συσκευές & $\ge$30 εμπορικές συσκευές & [—]\\
+Χρόνος σταδίων 3–4 από άκρο σε άκρο & χρονοσφραγίδες \en{JSON log} & [—]\\
+Μήτρα υλικού (\en{KDE}/\en{GNOME}, \en{X11}/\en{Wayland}) & σενάρια εγκατάστασης/σύνδεσης & [—]\\
+\bottomrule
+\end{tabular}
+\end{table}

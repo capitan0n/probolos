@@ -1,0 +1,128 @@
+% =====================================================================
+\chapter{Πλήρης Κατάλογος Κανόνων}
+\label{app:rules}
+% =====================================================================
+
+Το παράρτημα παραθέτει όλους τους κανόνες του \Probolos{} 1.0.0b2. Οι κανόνες
+των σταδίων 2–4 και των καρτών μπορούν να απενεργοποιηθούν ή να αλλάξουν
+σοβαρότητα μέσω αρχείου \en{YAML} (\code{--rules}). Οι κανόνες ιστορικού και ο
+\code{payload-captured} δεν τροποποιούνται.
+
+\section{Στάδιο 2 — Συνέπεια}
+
+\begin{longtable}{@{}p{5.6cm}cp{6.0cm}@{}}
+\caption{Κανόνες συνέπειας (στάδιο 2).}\label{tab:rules-s2}\\
+\toprule
+\textbf{Κανόνας} & \textbf{Σοβαρότητα} & \textbf{Ενεργοποιείται όταν η συσκευή}\\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Κανόνας} & \textbf{Σοβαρότητα} & \textbf{Ενεργοποιείται όταν η συσκευή}\\
+\midrule
+\endhead
+\code{storage-with-keyboard} & \sevC & είναι αποθήκευση και δηλώνει και πληκτρολόγιο\\
+\code{network-with-keyboard} & \sevC & είναι δικτύου ή ραδιοσυχνοτήτων και δηλώνει και πληκτρολόγιο\\
+\code{crafted-strings-hid} & \sevC & μπορεί να πληκτρολογεί και κρύβει χαρακτήρες ελέγχου ή \en{bidi} στο όνομά της\\
+\code{storage-with-undeclared-hid} & \sevC & είναι αποθήκευση και διεπαφή εισόδου ασαφούς είδους\\
+\code{unreadable-descriptors} & \sevC & έχει περιγραφείς που δεν αναλύθηκαν\\
+\code{descriptor-chain-truncated} & \sevC & έκοψε την αλυσίδα περιγραφέων της\\
+\code{configurations-missing} & \sevC & παρέδωσε λιγότερες διαμορφώσεις από όσες δήλωσε\\
+\code{keyboard-with-unrelated-function} & \sevW & είναι πληκτρολόγιο μαζί με άσχετη λειτουργία\\
+\code{self-contradictory-identity} & \sevW & ονομάζεται αποθήκευση αλλά εκθέτει διεπαφή εισόδου\\
+\code{interface-count-mismatch} & \sevW & δηλώνει άλλο πλήθος διεπαφών από όσες έχει\\
+\code{crafted-strings} & \sevW & έχει χαρακτήρες ελέγχου ή \en{bidi} στις συμβολοσειρές της\\
+\code{network-with-undeclared-hid} & \sevW & είναι δικτύου και διεπαφή εισόδου ασαφούς είδους\\
+\code{stacked-combining-marks} & \sevW & στοιβάζει συνδυαστικά σημάδια που επικαλύπτουν την αναφορά\\
+\code{power-exceeds-bus-limit} & \sevW & ζητά περισσότερη ισχύ από όση επιτρέπει το \en{USB}\\
+\code{multiple-distinct-functions} & \sevN & συνδυάζει λειτουργίες με ασυνήθιστο τρόπο\\
+\code{no-interfaces} & \sevN & δεν δηλώνει καμία διεπαφή\\
+\code{keyboard-at-high-speed} & \sevN & είναι πληκτρολόγιο σε σύνδεση υψηλής ταχύτητας\\
+\code{invisible-string-characters} & \sevN & έχει αόρατους χαρακτήρες στις συμβολοσειρές της\\
+\code{storage-declares-negligible-power} & \sevN & είναι αποθήκευση που δηλώνει σχεδόν μηδενική κατανάλωση\\
+\code{power-varies-across-configurations} & \sevN & δηλώνει πολύ διαφορετική ισχύ ανά διαμόρφωση\\
+\code{descriptor-length-overstated} & \sevN & δηλώνει περισσότερα δεδομένα περιγραφέων από όσα παρέδωσε\\
+\bottomrule
+\end{longtable}
+
+\section{Στάδιο 3 — Συμπεριφορά}
+
+\begin{longtable}{@{}p{5.6cm}cp{6.0cm}@{}}
+\caption{Κανόνες συμπεριφοράς (στάδιο 3).}\label{tab:rules-s3}\\
+\toprule
+\textbf{Κανόνας} & \textbf{Σοβαρότητα} & \textbf{Ενεργοποιείται όταν}\\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Κανόνας} & \textbf{Σοβαρότητα} & \textbf{Ενεργοποιείται όταν}\\
+\midrule
+\endhead
+\code{unprompted-typing} & \sevC & πληκτρολόγησε ενώ ο χρήστης είχε ενημερωθεί να μην την αγγίξει\\
+\code{machine-generated-keystrokes} & \sevC & ο ρυθμός είναι υπερβολικά κανονικός για άνθρωπο (εξ.~\ref{eq:machine})\\
+\code{quarantine-not-restored} & \sevC & δεν μπόρεσε να απενεργοποιηθεί ξανά μετά την παρατήρηση\\
+\code{payload-captured} & \sevC & πληκτρολόγησε, με \code{--capture-payload}: εμφανίζεται απομαγνητοφώνηση\\
+\code{unexpected-keystrokes} & \sevW & έφτασαν λίγα ανεξήγητα πλήκτρα\\
+\code{immediate-activity} & \sevW & άρχισε να πληκτρολογεί αμέσως μόλις ενεργοποιήθηκε\\
+\code{incomplete-isolation} & \sevW & ένα κανάλι εισόδου δεν δεσμεύτηκε\\
+\code{quarantine-unavailable} & \sevN & η συμπεριφορά δεν μπόρεσε να παρατηρηθεί\\
+\bottomrule
+\end{longtable}
+
+\section{Στάδιο 4 — Αποθήκευση}
+
+\begin{longtable}{@{}p{5.6cm}cp{6.0cm}@{}}
+\caption{Κανόνες αποθήκευσης (στάδιο 4).}\label{tab:rules-s4}\\
+\toprule
+\textbf{Κανόνας} & \textbf{Σοβαρότητα} & \textbf{Ενεργοποιείται όταν}\\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Κανόνας} & \textbf{Σοβαρότητα} & \textbf{Ενεργοποιείται όταν}\\
+\midrule
+\endhead
+\code{partition-beyond-end-of-device} & \sevW & ένα διαμέρισμα τελειώνει μετά το τέλος του μέσου\\
+\code{overlapping-partitions} & \sevW & διαμερίσματα επικαλύπτονται\\
+\code{impossible-partition-geometry} & \sevW & μια εγγραφή διαμερίσματος δεν μπορεί να υπάρχει σε αυτό το μέσο\\
+\code{filesystem-type-mismatch} & \sevN & ένα διαμέρισμα περιέχει άλλο σύστημα αρχείων από το δηλωμένο\\
+\code{filesystem-signature-without-structure} & \sevN & υπογραφή συστήματος αρχείων χωρίς έγκυρη δομή\\
+\code{large-unallocated-gap} & \sevN & μεγάλη μη περιγραφόμενη περιοχή πριν από το πρώτο διαμέρισμα\\
+\code{gpt-without-protective-mbr} & \sevN & \en{GPT} χωρίς προστατευτικό \en{MBR}\\
+\code{storage-unreadable} & \sevN & το μέσο δεν διαβάστηκε (αναφέρεται ο λόγος)\\
+\bottomrule
+\end{longtable}
+
+\section{Ιστορικό και κάρτες μνήμης}
+
+\begin{longtable}{@{}p{5.6cm}cp{6.0cm}@{}}
+\caption{Κανόνες ιστορικού και καρτών μνήμης.}\label{tab:rules-hist}\\
+\toprule
+\textbf{Κανόνας} & \textbf{Σοβαρότητα} & \textbf{Ενεργοποιείται όταν}\\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Κανόνας} & \textbf{Σοβαρότητα} & \textbf{Ενεργοποιείται όταν}\\
+\midrule
+\endhead
+\code{descriptor-drift} & \sevC & γνωστή συσκευή παρουσιάζει πλέον διαφορετικούς περιγραφείς\\
+\code{previously-rejected} & \sevC & ο χρήστης έχει απορρίψει τη συσκευή στο παρελθόν\\
+\code{ledger-unavailable} & \sevN & το ιστορικό δεν διαβάστηκε (ή όχι όλο)\\
+\midrule
+\code{media-efi-system-partition} & \sevC & η κάρτα έχει διαμέρισμα συστήματος \en{EFI}\\
+\code{media-hidden-partition} & \sevC & η κάρτα έχει κρυφό διαμέρισμα\\
+\code{media-inserted-while-locked} & \sevW & η κάρτα εισήχθη με κλειδωμένη οθόνη\\
+\code{media-layout-drift} & \shortstack{\sevW\\\sevN} & η διάταξη διαφέρει από την πρώτη κάρτα της υποδοχής\\
+\bottomrule
+\end{longtable}
+
+\section{Παράδειγμα αρχείου διαμόρφωσης κανόνων}
+
+\begin{lstlisting}[caption={Αρχείο \code{rules.yaml} για \code{--rules}.},label=lst:yaml]
+# Rules the operator does not want to see
+disabled:
+  - keyboard-at-high-speed
+# Severity overrides (critical | warning | notice)
+severity:
+  multiple-distinct-functions: warning
+# Extra interface-class combinations considered routine
+benign_groups:
+  - [0x03, 0xff]      # HID + vendor-specific (e.g. gaming keyboards)
+\end{lstlisting}

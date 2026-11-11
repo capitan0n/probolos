@@ -1,0 +1,37 @@
+% ------------------------------- Εξώφυλλο -------------------------------
+\begin{titlepage}
+\newgeometry{top=2cm,bottom=2cm,left=2.5cm,right=2.5cm}
+\thispagestyle{empty}
+\begin{center}
+  % Αντικαταστήστε με το λογότυπο του Ιδρύματος:
+  % \includegraphics[width=3.2cm]{figures/logo.pdf}\\[0.6cm]
+  \begin{tikzpicture}
+    \draw[univblue,line width=1.2pt] (0,0) circle (1.25cm);
+    \node[univblue,font=\small\bfseries,align=center] at (0,0) {ΛΟΓΟΤΥΠΟ\\ΙΔΡΥΜΑΤΟΣ};
+  \end{tikzpicture}\\[0.6cm]
+
+  {\Large\scshape \University}\\[0.25cm]
+  {\large \School}\\[0.15cm]
+  {\large \Department}\\[0.15cm]
+  {\normalsize \Division}\\[0.4cm]
+  {\normalsize \Programme}\\[1.4cm]
+
+  {\color{univblue}\rule{\linewidth}{1.2pt}}\\[0.5cm]
+  {\large\scshape Μεταπτυχιακή Διπλωματική Εργασία}\\[0.6cm]
+  {\LARGE\bfseries\color{univblue} \ThesisTitle}\\[0.5cm]
+  {\large\itshape\en{\ThesisTitleEN}}\\[0.4cm]
+  {\color{univblue}\rule{\linewidth}{1.2pt}}\\[1.4cm]
+
+  {\large του/της}\\[0.25cm]
+  {\Large\bfseries \Author}\\[0.15cm]
+  {\normalsize Α.Μ.: \StudentID}\\[1.4cm]
+
+  \begin{tabular}{rl}
+    \textbf{Επιβλέπων/ουσα:} & \Supervisor
+  \end{tabular}
+
+  \vfill
+  {\large \City, \ThesisDate}
+\end{center}
+\restoregeometry
+\end{titlepage}

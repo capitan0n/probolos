@@ -1,0 +1,17 @@
+# LaTeX build artefacts (main.pdf is built with `make`)
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.lof
+*.lol
+*.lot
+*.out
+*.run.xml
+*.toc
+*.xdv
+*.synctex.gz
+main.pdf
